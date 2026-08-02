@@ -1,0 +1,117 @@
+# docx-content-review 默认配置（spec §16）
+# 用户覆盖：--config <file>，按 key 深合并。
+# apply_threshold 由程序强制为 conservative，写什么都无效（D4）。
+
+compatibility:
+  spec_version: "1.1"
+  schema_version: "3"
+  min_workspace_version: "2"    # 低于此版本的 workspace 需迁移而非直接续跑
+
+strictness: balanced            # conservative | balanced | thorough
+apply_threshold: conservative   # 固定，不可放宽
+
+chunking:
+  max_context_tokens: 45000     # 切分判据：正文+指令+术语摘要+衔接+输出预留
+  max_text_tokens: 15000
+  single_pass_limit: 22000
+  token_fallback_ratio: 1.6     # tokenizer 不可得时的保守系数
+  overlap_paragraphs: 2
+  max_issues_per_chunk: 20
+  instruction_tokens: 9000      # 技能指令 + 类型体系 + 不改清单
+  glossary_tokens: 4000         # 术语表摘要预算
+  output_reserve_tokens: 12000  # 输出预留
+  table_only_text_ratio: 0.10   # 正文段落占比低于此值即判为纯表格片
+
+logic:
+  gap_ratio: 3                  # L27 目标值与实测值差异倍数阈值
+  coverage_rules_to_comment: false   # L29–L32 默认只进报告
+  percent_tolerance: 0.5        # L09 百分比合计容差
+  entity_similar_distance: 2    # L04 写法相近判定的编辑距离上限
+
+typo_check:
+  enabled: false                # M8 能力，v1 关闭
+  max_typos_per_chunk: 100      # 独立配额，不占用 max_issues_per_chunk
+  batch_size: 50
+  require_llm_adjudication: true # 脚本候选不得直接生成修订
+
+argument_review:
+  enabled: false                # v2 能力，默认关闭
+  max_issues: 50
+
+review_memory:
+  enabled: true
+  path: null                    # null = <输出根>/docx-review/review-memory.json
+  exact_match_only: true        # 严禁自动泛化
+
+priority_score:
+  enabled: true
+  decision_use: false           # 硬性：不得参与任何自动判定
+
+verification:
+  enable_second_pass: true
+  blind_ab_test: true             # 盲测 A/B，含位置随机化
+  unsure_as_negative: true
+  edit_gate_by_category: true     # 按错误类型分别校验
+  max_edit_distance_abs: 30       # 兜底阈值，类型校验之外的最后一道
+  max_edit_distance_ratio: 0.4
+  min_span_chars: 4
+  max_span_chars: 120
+  verify_batch_size: 10
+
+workspace:
+  output_dir: null              # null = 使用 Agent 当前工作目录
+  subdir: "docx-review"
+  slug_max_chars: 40
+  hash_prefix_len: 12
+  verify_full_hash: true        # 命中目录后必须比对完整 sha256
+  keep_runs: 3
+  clean_intermediate: false
+  min_free_space_multiplier: 6
+
+concurrency:
+  parallelism: 5                # subAgent 工作池大小，建议上限 8，由压测确定
+  renew_claim_on_llm_call: true # 退避可能超出 claim TTL，调用前后必须续期
+  pipeline_pass2: false         # v1 不做 Pass1/Pass2 流水线并行
+  allow_collaboration: true     # 允许多会话分工处理同一文档（§11.3）
+  lease_minutes: 30             # 独占租约 TTL（心跳续租，不基于 pid）
+  chunk_claim_minutes: 20       # 分片 claim TTL
+  require_local_fs: true        # 非本地文件系统时关闭协作，fail-closed
+  on_conflict: ask              # ask | join | refuse
+
+glossary:
+  sources:
+    authoritative: null         # 路径；CSV/XLSX/YAML/JSON/TXT
+    fallback: null              # 兜底术语，默认 enforce=off
+  enforce_defaults:
+    authoritative: "error"
+    extracted: "warn"
+    fallback: "off"           # 必须加引号：裸 off 会被 YAML 解析为布尔 false
+  fail_on_source_conflict: true # 外部表自身矛盾时终止，不做猜测性合并
+  skip_definition_inference_for_known: true
+  min_term_freq: 3              # 预筛：候选术语最低词频
+  max_candidates: 500           # 预筛候选上限
+  cluster_distance: 2           # 概念族候选聚类的编辑距离上限
+
+style_guard:                    # D9，全部不可关闭
+  verify_style_files_hash: true
+  forbid_format_revisions: true
+  verify_rpr_per_run: true
+
+page_estimation:
+  source: auto                  # auto | app_xml | pagebreak | constant
+  fallback_chars_per_page: 400
+  app_xml_sanity_range: [100, 1200]
+
+output:
+  author_name: "内容审查"
+  max_revisions: 2000
+  emit_glossary: true
+  filename_pattern: "{stem}.reviewed.docx"
+
+skip:
+  code_blocks: true
+  tables_language_check: true    # 表格内不做语病审查，仍参与逻辑台账
+  quoted_regulations: true
+
+retry:
+  max_attempts_per_chunk: 3

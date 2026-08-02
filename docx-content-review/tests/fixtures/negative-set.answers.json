@@ -1,0 +1,203 @@
+{
+  "total": 33,
+  "samples": [
+    {
+      "idx": 1,
+      "text": "本期采用统一的接入方式，各业务线使用相同的鉴权协议。",
+      "never_flag_rule": "N1",
+      "expect": "no_issue"
+    },
+    {
+      "idx": 2,
+      "text": "我们运用成熟的开源组件构建底座，避免重复造轮子。",
+      "never_flag_rule": "N1",
+      "expect": "no_issue"
+    },
+    {
+      "idx": 3,
+      "text": "在本次评审中，我们对方案做了充分的论证。",
+      "never_flag_rule": "N1",
+      "expect": "no_issue"
+    },
+    {
+      "idx": 4,
+      "text": "为保障稳定性，灰度期间我们逐步放量。",
+      "never_flag_rule": "N2",
+      "expect": "no_issue"
+    },
+    {
+      "idx": 5,
+      "text": "逐步放量的策略，在灰度期间我们始终坚持。",
+      "never_flag_rule": "N2",
+      "expect": "no_issue"
+    },
+    {
+      "idx": 6,
+      "text": "数据出域申请由数据 owner 审批。",
+      "never_flag_rule": "N3",
+      "expect": "no_issue"
+    },
+    {
+      "idx": 7,
+      "text": "由数据 owner 对数据出域申请进行审批。",
+      "never_flag_rule": "N3",
+      "expect": "no_issue"
+    },
+    {
+      "idx": 8,
+      "text": "这事儿得先跟业务方对齐口径。",
+      "never_flag_rule": "N4",
+      "expect": "no_issue"
+    },
+    {
+      "idx": 9,
+      "text": "此事需先与业务方对齐口径。",
+      "never_flag_rule": "N4",
+      "expect": "no_issue"
+    },
+    {
+      "idx": 10,
+      "text": "平台上线。",
+      "never_flag_rule": "N5",
+      "expect": "no_issue"
+    },
+    {
+      "idx": 11,
+      "text": "平台已于本月完成全量上线，并通过了全部验收用例。",
+      "never_flag_rule": "N5",
+      "expect": "no_issue"
+    },
+    {
+      "idx": 12,
+      "text": "方案已通过评审了。",
+      "never_flag_rule": "N6",
+      "expect": "no_issue"
+    },
+    {
+      "idx": 13,
+      "text": "方案已通过评审。",
+      "never_flag_rule": "N6",
+      "expect": "no_issue"
+    },
+    {
+      "idx": 14,
+      "text": "边缘节点（edge node）在本文中简称 EN。",
+      "never_flag_rule": "N7",
+      "expect": "no_issue"
+    },
+    {
+      "idx": 15,
+      "text": "星云平台又称 Nebula，二者指同一系统。",
+      "never_flag_rule": "N7",
+      "expect": "no_issue"
+    },
+    {
+      "idx": 16,
+      "text": "本期 P0 需求共 12 项，P1 需求 27 项。",
+      "never_flag_rule": "N8",
+      "expect": "no_issue"
+    },
+    {
+      "idx": 17,
+      "text": "SRE 团队负责线上稳定性，QA 团队负责质量准入。",
+      "never_flag_rule": "N8",
+      "expect": "no_issue"
+    },
+    {
+      "idx": 18,
+      "text": "执行 kubectl get pods -n prod 查看运行状态。",
+      "never_flag_rule": "N9",
+      "expect": "no_issue"
+    },
+    {
+      "idx": 19,
+      "text": "配置项 max_retry=3 表示最多重试三次。",
+      "never_flag_rule": "N9",
+      "expect": "no_issue"
+    },
+    {
+      "idx": 20,
+      "text": "《网络安全法》第二十一条规定：国家实行网络安全等级保护制度。",
+      "never_flag_rule": "N10",
+      "expect": "no_issue"
+    },
+    {
+      "idx": 21,
+      "text": "合同第 3.2 条约定：乙方应于验收合格之日起十五个工作日内交付。",
+      "never_flag_rule": "N10",
+      "expect": "no_issue"
+    },
+    {
+      "idx": 22,
+      "text": "上表中「—」表示该季度无预算安排。",
+      "never_flag_rule": "N11",
+      "expect": "no_issue"
+    },
+    {
+      "idx": 23,
+      "text": "表头「时延/ms」为端到端时延，单位毫秒。",
+      "never_flag_rule": "N11",
+      "expect": "no_issue"
+    },
+    {
+      "idx": 24,
+      "text": "图 3-7 系统总体架构图",
+      "never_flag_rule": "N12",
+      "expect": "no_issue"
+    },
+    {
+      "idx": 25,
+      "text": "表 4-2 分年度预算安排表（单位：万元）",
+      "never_flag_rule": "N12",
+      "expect": "no_issue"
+    },
+    {
+      "idx": 26,
+      "text": "本期共完成 3 个一级模块与十二项子任务。",
+      "never_flag_rule": "N13",
+      "expect": "no_issue"
+    },
+    {
+      "idx": 27,
+      "text": "第一阶段于 2026 年 3 月启动，二期于同年 9 月启动。",
+      "never_flag_rule": "N13",
+      "expect": "no_issue"
+    },
+    {
+      "idx": 28,
+      "text": "三、风险分析与应对",
+      "never_flag_rule": "N14",
+      "expect": "no_issue"
+    },
+    {
+      "idx": 29,
+      "text": "4.2 数据层存储选型",
+      "never_flag_rule": "N14",
+      "expect": "no_issue"
+    },
+    {
+      "idx": 30,
+      "text": "附录 A 接口清单",
+      "never_flag_rule": "N14",
+      "expect": "no_issue"
+    },
+    {
+      "idx": 31,
+      "text": "本方案在保证一致性的前提下，兼顾了可用性与分区容错。",
+      "never_flag_rule": "N1",
+      "expect": "no_issue"
+    },
+    {
+      "idx": 32,
+      "text": "研发效能度量以交付周期、变更失败率、恢复时长三项为主。",
+      "never_flag_rule": "N8",
+      "expect": "no_issue"
+    },
+    {
+      "idx": 33,
+      "text": "详见 https://example.internal/docs/nebula/api 中的接口说明。",
+      "never_flag_rule": "N9",
+      "expect": "no_issue"
+    }
+  ]
+}

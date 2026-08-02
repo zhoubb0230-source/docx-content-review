@@ -1,0 +1,45 @@
+{
+  "expected_facts": {
+    "objectives": [
+      "O1",
+      "O2",
+      "O3"
+    ],
+    "initiatives": [
+      "I1",
+      "I2"
+    ],
+    "acceptance_targets": [
+      "I1"
+    ],
+    "metrics_from_table": [
+      "端到端时延",
+      "平台接入率",
+      "变更失败率",
+      "平均恢复时长"
+    ],
+    "tables": 3
+  },
+  "expected_conflicts": [
+    {
+      "rule": "L29",
+      "note": "O3 无对应举措"
+    },
+    {
+      "rule": "L30",
+      "note": "I2 无验收指标"
+    },
+    {
+      "rule": "L31",
+      "note": "可用性 99.95% 无度量方式"
+    },
+    {
+      "rule": "L32",
+      "note": "风险分析章节无风险条目"
+    },
+    {
+      "rule": "L09",
+      "note": "2026 年分项 1200+900+300=2400，与合计一致；2027 年 800+1100+400=2300 一致"
+    }
+  ]
+}

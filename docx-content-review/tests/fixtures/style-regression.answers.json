@@ -1,0 +1,20 @@
+{
+  "invariants": [
+    "styles.xml/theme1.xml/fontTable.xml/numbering.xml/settings.xml/webSettings.xml 字节哈希不变",
+    "document.xml 中不得出现 rPrChange/pPrChange/sectPrChange/tblPrChange/tcPrChange/trPrChange",
+    "未改动 run 的 rPr 序列化结果不变",
+    "新增 run 的 rPr 与来源 run 逐属性相等"
+  ],
+  "editable_spans": [
+    {
+      "category": "A1",
+      "original_text": "帐号",
+      "suggested_text": "账号"
+    },
+    {
+      "category": "A2",
+      "original_text": "严格的执行",
+      "suggested_text": "严格地执行"
+    }
+  ]
+}

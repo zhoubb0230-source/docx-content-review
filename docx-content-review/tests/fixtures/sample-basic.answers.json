@@ -1,0 +1,206 @@
+{
+  "positive": [
+    {
+      "category": "A1",
+      "original_text": "帐号",
+      "suggested_text": "账号",
+      "note": "帐/账 形近误用"
+    },
+    {
+      "category": "A1",
+      "original_text": "按装",
+      "suggested_text": "安装",
+      "note": ""
+    },
+    {
+      "category": "A1",
+      "original_text": "布署",
+      "suggested_text": "部署",
+      "note": ""
+    },
+    {
+      "category": "A2",
+      "original_text": "认真的完成",
+      "suggested_text": "认真地完成",
+      "note": "状语用地"
+    },
+    {
+      "category": "A2",
+      "original_text": "实施的很顺利",
+      "suggested_text": "实施得很顺利",
+      "note": "补语用得"
+    },
+    {
+      "category": "A2",
+      "original_text": "严格的执行",
+      "suggested_text": "严格地执行",
+      "note": ""
+    },
+    {
+      "category": "A3",
+      "original_text": "内容:架构设计",
+      "suggested_text": "内容：架构设计",
+      "note": "中英冒号混用"
+    },
+    {
+      "category": "A3",
+      "original_text": "《系统设计说明书 第三章。",
+      "suggested_text": "《系统设计说明书》第三章。",
+      "note": "书名号不配对"
+    },
+    {
+      "category": "A3",
+      "original_text": "附录A(接口清单)",
+      "suggested_text": "附录A（接口清单）",
+      "note": "中英括号混用"
+    },
+    {
+      "category": "A4",
+      "original_text": "通过本次架构升级，使系统",
+      "suggested_text": "本次架构升级使系统",
+      "note": "介词导致主语残缺"
+    },
+    {
+      "category": "A4",
+      "original_text": "进行。",
+      "suggested_text": "进行加密。",
+      "note": "缺宾语中心语"
+    },
+    {
+      "category": "A4",
+      "original_text": "能否顺利上线，取决于团队的持续投入",
+      "suggested_text": "能否顺利上线，取决于团队能否持续投入",
+      "note": "两面对一面"
+    },
+    {
+      "category": "A5",
+      "original_text": "提高研发人员的工作积极性和工作水平",
+      "suggested_text": "调动研发人员的工作积极性、提高其工作水平",
+      "note": "动宾搭配不当"
+    },
+    {
+      "category": "A5",
+      "original_text": "降低了系统的可用性和运维成本",
+      "suggested_text": "提升了系统的可用性、降低了运维成本",
+      "note": "一动带两宾搭配矛盾"
+    },
+    {
+      "category": "A5",
+      "original_text": "改善了平台的响应速度问题",
+      "suggested_text": "改善了平台的响应速度",
+      "note": ""
+    },
+    {
+      "category": "A6",
+      "original_text": "虽然当前架构存在瓶颈，因此",
+      "suggested_text": "由于当前架构存在瓶颈，因此",
+      "note": "关联词错配"
+    },
+    {
+      "category": "A6",
+      "original_text": "不但没有降低成本，而且",
+      "suggested_text": "不但没有降低成本，反而",
+      "note": ""
+    },
+    {
+      "category": "A6",
+      "original_text": "只有严格执行流程，就能",
+      "suggested_text": "只要严格执行流程，就能",
+      "note": ""
+    },
+    {
+      "category": "A7",
+      "original_text": "大约在 200 万元左右",
+      "suggested_text": "在 200 万元左右",
+      "note": "大约/左右重复"
+    },
+    {
+      "category": "A7",
+      "original_text": "目前正在开发中",
+      "suggested_text": "正在开发",
+      "note": "目前/正在/中叠用"
+    },
+    {
+      "category": "A7",
+      "original_text": "非常十分关键",
+      "suggested_text": "非常关键",
+      "note": ""
+    },
+    {
+      "category": "A8",
+      "original_text": "0.5s",
+      "suggested_text": "500ms",
+      "note": "同一 subject 单位不统一"
+    },
+    {
+      "category": "A8",
+      "original_text": "1,00,000",
+      "suggested_text": "100,000",
+      "note": "千分位错位"
+    },
+    {
+      "category": "B1",
+      "original_text": "它的接口规范尚未最终确定",
+      "suggested_text": "",
+      "note": "指代不明"
+    },
+    {
+      "category": "B2",
+      "original_text": "重要的客户数据保护措施",
+      "suggested_text": "",
+      "note": "多重定语两解"
+    },
+    {
+      "category": "B3",
+      "original_text": "为了实现在多云环境下",
+      "suggested_text": "",
+      "note": "长句主干不可辨"
+    },
+    {
+      "category": "B4",
+      "original_text": "研发人员也因此被政策所激励",
+      "suggested_text": "",
+      "note": "主客体颠倒"
+    },
+    {
+      "category": "B5",
+      "original_text": "因此团队规模保持不变",
+      "suggested_text": "",
+      "note": "无因果却用因此"
+    }
+  ],
+  "negative": [
+    {
+      "text": "本期采用统一的接入方式，各业务线使用相同的鉴权协议。",
+      "rule": "N1"
+    },
+    {
+      "text": "我们运用成熟的开源组件构建底座，避免重复造轮子。",
+      "rule": "N1"
+    },
+    {
+      "text": "在本次评审中，我们对方案做了充分的论证。",
+      "rule": "N1"
+    },
+    {
+      "text": "为保障稳定性，灰度期间我们逐步放量。",
+      "rule": "N2"
+    },
+    {
+      "text": "逐步放量的策略，在灰度期间我们始终坚持。",
+      "rule": "N2"
+    },
+    {
+      "text": "数据出域申请由数据 owner 审批。",
+      "rule": "N3"
+    },
+    {
+      "text": "由数据 owner 对数据出域申请进行审批。",
+      "rule": "N3"
+    },
+    {
+      "text": "这事儿得先跟业务方对齐口径。",
+      "rule": "N4"
+    }
+  ]
+}

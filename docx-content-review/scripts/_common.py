@@ -1,0 +1,225 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""共享底座：退出码、原子写、哈希、JSONL、CLI 骨架。
+
+被本目录下所有脚本 import。不含任何业务判定逻辑，不联网。
+"""
+from __future__ import annotations
+
+import hashlib
+import json
+import os
+import sys
+import tempfile
+import unicodedata
+from pathlib import Path
+from typing import Any, Iterable, Iterator
+
+SPEC_VERSION = "1.1"
+SCHEMA_VERSION = "3"
+SKILL_VERSION = "1.1.0"
+
+
+# --------------------------------------------------------------------------
+# 退出码（SKILL.md 的 CLI 契约表按此表转译给用户）
+# --------------------------------------------------------------------------
+class EX:
+    OK = 0
+    ERROR = 1              # 未分类失败
+    USAGE = 2              # 参数错误
+    ENV = 3                # 环境缺失（无转换器等）
+    SOURCE_GUARD = 4       # 触碰源文档 / 写出工作目录之外
+    DISK = 5               # 磁盘空间不足
+    WORKSPACE = 6          # 工作目录不合法（在技能目录内 / 不可写）
+    BUSY = 7               # 租约被他人持有
+    VALIDATE = 8           # 产物校验失败
+    NOT_OWNER = 9          # 令牌失效（spec §11.3.4 强制）
+    PARSE = 10             # 输入数据无法解析
+
+
+class SkillError(Exception):
+    """带退出码的可控失败。main() 捕获后打印中文说明并以该码退出。"""
+
+    def __init__(self, code: int, message: str, hint: str | None = None):
+        super().__init__(message)
+        self.code = code
+        self.message = message
+        self.hint = hint
+
+
+def die(code: int, message: str, hint: str | None = None) -> "NoReturn":  # type: ignore[name-defined]
+    raise SkillError(code, message, hint)
+
+
+# --------------------------------------------------------------------------
+# 文件原子性：所有产物一律「写 .tmp → os.replace()」（spec §11.3.3）
+# --------------------------------------------------------------------------
+def atomic_write_bytes(path: str | os.PathLike, data: bytes) -> Path:
+    p = Path(path)
+    p.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(dir=str(p.parent), prefix=p.name + ".", suffix=".tmp")
+    try:
+        with os.fdopen(fd, "wb") as fh:
+            fh.write(data)
+            fh.flush()
+            os.fsync(fh.fileno())
+        os.replace(tmp, p)
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+    return p
+
+
+def atomic_write_text(path: str | os.PathLike, text: str) -> Path:
+    return atomic_write_bytes(path, text.encode("utf-8"))
+
+
+def atomic_write_json(path: str | os.PathLike, obj: Any, *, indent: int = 2) -> Path:
+    return atomic_write_text(path, json.dumps(obj, ensure_ascii=False, indent=indent) + "\n")
+
+
+def atomic_write_jsonl(path: str | os.PathLike, rows: Iterable[Any]) -> Path:
+    buf = "".join(json.dumps(r, ensure_ascii=False) + "\n" for r in rows)
+    return atomic_write_text(path, buf)
+
+
+def append_jsonl(path: str | os.PathLike, row: Any) -> None:
+    """append-only 落盘（Pass 4 断点续跑依赖，spec §11.3.7b）。"""
+    p = Path(path)
+    p.parent.mkdir(parents=True, exist_ok=True)
+    with open(p, "a", encoding="utf-8") as fh:
+        fh.write(json.dumps(row, ensure_ascii=False) + "\n")
+        fh.flush()
+        os.fsync(fh.fileno())
+
+
+def read_json(path: str | os.PathLike, default: Any = None) -> Any:
+    p = Path(path)
+    if not p.exists():
+        return default
+    try:
+        return json.loads(p.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, UnicodeDecodeError):
+        return default
+
+
+def read_jsonl(path: str | os.PathLike) -> Iterator[dict]:
+    p = Path(path)
+    if not p.exists():
+        return
+    with open(p, "r", encoding="utf-8") as fh:
+        for lineno, line in enumerate(fh, 1):
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                yield json.loads(line)
+            except json.JSONDecodeError as exc:
+                raise SkillError(EX.PARSE, f"{p} 第 {lineno} 行不是合法 JSON：{exc}") from exc
+
+
+def sha256_file(path: str | os.PathLike, *, chunk: int = 1 << 20) -> str:
+    h = hashlib.sha256()
+    with open(path, "rb") as fh:
+        while True:
+            b = fh.read(chunk)
+            if not b:
+                break
+            h.update(b)
+    return h.hexdigest()
+
+
+def sha256_text(text: str) -> str:
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+
+# --------------------------------------------------------------------------
+# 文本归一化
+# --------------------------------------------------------------------------
+def normalize_ws(text: str) -> str:
+    """仅归一化空白：exact match 校验允许的唯一变形（spec §8 闸门②）。"""
+    return "".join(ch for ch in text if not ch.isspace())
+
+
+def normalize_width(text: str) -> str:
+    """全半角统一（审查记忆的键归一化，spec §11.7；不做任何语义处理）。"""
+    return unicodedata.normalize("NFKC", text)
+
+
+def normalize_key(text: str, *, case_sensitive: bool = False) -> str:
+    """术语表归一化键：去空白 + 全半角统一 + 大小写处理（spec §9.1.2）。"""
+    s = normalize_width(text).strip()
+    s = "".join(s.split())
+    return s if case_sensitive else s.lower()
+
+
+def now_iso() -> str:
+    from datetime import datetime, timezone
+
+    return datetime.now(timezone.utc).astimezone().isoformat(timespec="seconds")
+
+
+def version_header() -> dict:
+    """spec §10.6：所有产物头部写入的版本标识。"""
+    return {
+        "spec_version": SPEC_VERSION,
+        "schema_version": SCHEMA_VERSION,
+        "skill_version": SKILL_VERSION,
+    }
+
+
+def levenshtein(a: str, b: str, *, cap: int | None = None) -> int:
+    """编辑距离。cap 用于提前退出，超过 cap 时返回 cap+1。"""
+    if a == b:
+        return 0
+    if not a:
+        return len(b)
+    if not b:
+        return len(a)
+    if cap is not None and abs(len(a) - len(b)) > cap:
+        return cap + 1
+    prev = list(range(len(b) + 1))
+    for i, ca in enumerate(a, 1):
+        cur = [i]
+        best = i
+        for j, cb in enumerate(b, 1):
+            val = min(prev[j] + 1, cur[j - 1] + 1, prev[j - 1] + (ca != cb))
+            cur.append(val)
+            best = min(best, val)
+        prev = cur
+        if cap is not None and best > cap:
+            return cap + 1
+    return prev[-1]
+
+
+def is_subsequence(needle: str, haystack: str) -> bool:
+    it = iter(haystack)
+    return all(ch in it for ch in needle)
+
+
+def emit(obj: Any) -> None:
+    """脚本的唯一 stdout 出口：单行 JSON，便于 Agent 解析且不打印大对象。"""
+    sys.stdout.write(json.dumps(obj, ensure_ascii=False) + "\n")
+
+
+def warn(message: str) -> None:
+    sys.stderr.write(f"[warn] {message}\n")
+
+
+def run_cli(main_fn) -> None:
+    """统一 CLI 骨架：把 SkillError 转成中文说明 + 规范退出码。"""
+    try:
+        rc = main_fn(sys.argv[1:])
+    except SkillError as exc:
+        sys.stderr.write(f"[终止] {exc.message}\n")
+        if exc.hint:
+            sys.stderr.write(exc.hint.rstrip() + "\n")
+        emit({"ok": False, "exit_code": exc.code, "error": exc.message})
+        sys.exit(exc.code)
+    except KeyboardInterrupt:
+        sys.stderr.write("[中断] 用户终止；已完成的产物保留。\n")
+        sys.exit(EX.ERROR)
+    sys.exit(EX.OK if rc is None else rc)
