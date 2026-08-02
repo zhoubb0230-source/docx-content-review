@@ -2,20 +2,20 @@
   "positive": [
     {
       "category": "A1",
-      "original_text": "帐号",
-      "suggested_text": "账号",
+      "original_text": "通过帐号登录",
+      "suggested_text": "通过账号登录",
       "note": "帐/账 形近误用"
     },
     {
       "category": "A1",
-      "original_text": "按装",
-      "suggested_text": "安装",
+      "original_text": "自动按装依赖组件",
+      "suggested_text": "自动安装依赖组件",
       "note": ""
     },
     {
       "category": "A1",
-      "original_text": "布署",
-      "suggested_text": "部署",
+      "original_text": "系统布署完成后",
+      "suggested_text": "系统部署完成后",
       "note": ""
     },
     {
@@ -55,10 +55,10 @@
       "note": "中英括号混用"
     },
     {
-      "category": "A4",
+      "category": "A5",
       "original_text": "通过本次架构升级，使系统",
       "suggested_text": "本次架构升级使系统",
-      "note": "介词导致主语残缺"
+      "note": "介词滥用致主语残缺，修法含删除故归 A5"
     },
     {
       "category": "A4",
@@ -68,9 +68,9 @@
     },
     {
       "category": "A4",
-      "original_text": "能否顺利上线，取决于团队的持续投入",
-      "suggested_text": "能否顺利上线，取决于团队能否持续投入",
-      "note": "两面对一面"
+      "original_text": "取决于团队持续投入",
+      "suggested_text": "取决于团队能否持续投入",
+      "note": "两面对一面，纯增补"
     },
     {
       "category": "A5",
@@ -116,26 +116,26 @@
     },
     {
       "category": "A7",
-      "original_text": "目前正在开发中",
-      "suggested_text": "正在开发",
+      "original_text": "该模块目前正在开发中",
+      "suggested_text": "该模块正在开发",
       "note": "目前/正在/中叠用"
     },
     {
       "category": "A7",
-      "original_text": "非常十分关键",
-      "suggested_text": "非常关键",
+      "original_text": "一个非常十分关键的技术选型",
+      "suggested_text": "一个非常关键的技术选型",
       "note": ""
     },
     {
       "category": "A8",
-      "original_text": "0.5s",
-      "suggested_text": "500ms",
+      "original_text": "不超过 0.5s",
+      "suggested_text": "不超过 500ms",
       "note": "同一 subject 单位不统一"
     },
     {
       "category": "A8",
-      "original_text": "1,00,000",
-      "suggested_text": "100,000",
+      "original_text": "预算 1,00,000 元",
+      "suggested_text": "预算 100,000 元",
       "note": "千分位错位"
     },
     {

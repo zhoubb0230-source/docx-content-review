@@ -1,0 +1,311 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""闸门②：可验证性（spec §8 闸门②）。
+
+三件事，全部是确定性判断，不问模型：
+  1. 原文逐字校验：original_text 必须在该分片正文中 exact match（仅允许空白归一化）。
+     不匹配 = 幻觉 = 直接丢弃，不做修补。
+  2. 修改幅度校验：按错误类型分别校验，不使用统一的编辑距离阈值。
+     不通过 → 降级为批注并清空 suggested_text（不是丢弃）。
+  3. 长度校验 + 单片上限（抑制模型凑数）。
+
+用法
+  verify_span.py --run-dir <run> --chunk 0001 [--in <raw.jsonl>] [--config]
+输入：work/issues/issues-<chunk>.raw.jsonl（Pass 1 子 Agent 原始输出）
+输出：work/issues/issues-<chunk>.jsonl（过闸后）+ 同名 .gates.json（计数）
+退出码：0 成功；10 输入不可解析。
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import re
+import sys
+import unicodedata
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+
+from _common import (  # noqa: E402
+    EX, atomic_write_json, atomic_write_jsonl, die, emit, is_subsequence, levenshtein,
+    normalize_ws, read_json, read_jsonl, run_cli,
+)
+from workspace import guard_write_path, load_config, resolve_path  # noqa: E402
+
+SEVERITIES = ["Critical", "High", "Medium", "Low"]
+A_CLASSES = {"A1", "A2", "A3", "A4", "A5", "A6", "A7", "A8"}
+B_CLASSES = {"B1", "B2", "B3", "B4", "B5"}
+C_CLASSES = {"C1", "C2"}
+VALID_CATEGORIES = A_CLASSES | B_CLASSES | C_CLASSES
+
+DE_SET = set("的地得")
+CONJUNCTIONS = [
+    "虽然", "但是", "然而", "不过", "因此", "所以", "由于", "因为", "既然", "不但", "不仅",
+    "而且", "反而", "并且", "以及", "或者", "只有", "只要", "即使", "尽管", "无论", "不管",
+    "如果", "那么", "否则", "从而", "进而", "于是", "何况", "况且", "才", "就", "却", "还",
+    "仍然", "同时", "此外", "另外", "首先", "其次", "最后",
+]
+UNIT_CHARS = set("元万亿个项次人天月年秒分时台套件条张次%‰°℃")
+NUMERIC_OK = set("0123456789., 、·%/:：-—~～±<>≤≥+")
+
+
+def strip_punct(s: str) -> str:
+    return "".join(ch for ch in s if not unicodedata.category(ch).startswith("P")
+                   and ch not in "％±≤≥＜＞")
+
+
+def diff_chars(a: str, b: str) -> tuple[str, str]:
+    """去掉公共前后缀后剩余的差异片段。"""
+    i = 0
+    while i < len(a) and i < len(b) and a[i] == b[i]:
+        i += 1
+    j = 0
+    while j < len(a) - i and j < len(b) - i and a[len(a) - 1 - j] == b[len(b) - 1 - j]:
+        j += 1
+    return a[i:len(a) - j], b[i:len(b) - j]
+
+
+def _strip_conjunctions(s: str) -> str:
+    for c in sorted(CONJUNCTIONS, key=len, reverse=True):
+        s = s.replace(c, "")
+    return normalize_ws(s)
+
+
+def _only_conjunction_diff(orig: str, sugg: str) -> bool:
+    """整串剥离关联词后必须完全相同。
+
+    不能只看 diff 片段：「只有…就能」→「只要…就能」的 diff 片段是「有」→「要」，
+    两个单字都不在关联词表里，按片段判会误判为不通过。
+    """
+    return _strip_conjunctions(orig) == _strip_conjunctions(sugg)
+
+
+def _glossary_mapping_ok(orig: str, sugg: str, glossary: dict) -> bool:
+    """L25/L26：差异必须完全落在 forbidden/variants → preferred 的映射上。"""
+    for e in (glossary or {}).get("entries", []):
+        pref = e.get("preferred") or e.get("key")
+        forms = [f.get("form") if isinstance(f, dict) else f for f in (e.get("forbidden") or [])]
+        forms += list(e.get("variants") or [])
+        for form in [f for f in forms if f]:
+            if form in orig and orig.replace(form, pref) == sugg:
+                return True
+    return False
+
+
+def edit_gate(category: str, orig: str, sugg: str, cfg: dict, glossary: dict) -> tuple[bool, str]:
+    """按类别校验修改幅度。返回 (是否通过, 说明)。"""
+    if orig == sugg:
+        return False, "建议与原文相同"
+    da, db = diff_chars(orig, sugg)
+    dist = levenshtein(orig, sugg)
+
+    if category == "A1":
+        ok = abs(len(orig) - len(sugg)) <= 2 and dist <= 3
+        return ok, "A1：长度差≤2 且差异字符≤3" if ok else f"A1 超限（len差 {abs(len(orig)-len(sugg))}, 距离 {dist}）"
+    if category == "A2":
+        rest_a = set(da) - DE_SET
+        rest_b = set(db) - DE_SET
+        ok = not rest_a and not rest_b and (set(da) | set(db)) & DE_SET
+        return ok, "A2：差异仅在 的/地/得" if ok else f"A2 差异超出 的地得（{da!r}→{db!r}）"
+    if category == "A3":
+        ok = normalize_ws(strip_punct(orig)) == normalize_ws(strip_punct(sugg))
+        return ok, "A3：剥离标点后一致" if ok else "A3 剥离标点后文字仍不一致"
+    if category == "A4":
+        ok = is_subsequence(orig, sugg) and len(sugg) > len(orig)
+        return ok, "A4：只增不删" if ok else "A4 非纯增补（原文不是建议的子序列）"
+    if category == "A5":
+        limit = min(12, int(len(orig) * 0.3))
+        ok = dist <= max(limit, 1)
+        return ok, f"A5：距离 {dist} ≤ {max(limit,1)}" if ok else f"A5 距离 {dist} 超过 {max(limit,1)}"
+    if category == "A6":
+        ok = _only_conjunction_diff(orig, sugg)
+        return ok, "A6：差异仅限关联词" if ok else f"A6 差异超出关联词表（{da!r}→{db!r}）"
+    if category == "A7":
+        ok = is_subsequence(sugg, orig) and len(sugg) < len(orig)
+        return ok, "A7：只删不增" if ok else "A7 非纯删减（建议不是原文的子序列）"
+    if category == "A8":
+        bad = [ch for ch in (da + db) if ch not in NUMERIC_OK and ch not in UNIT_CHARS
+               and not ch.isascii()]
+        ok = not bad
+        return ok, "A8：差异仅限数字/单位/分隔符" if ok else f"A8 差异含非数字单位字符（{''.join(bad)[:10]}）"
+    if category in ("L25", "L26"):
+        ok = _glossary_mapping_ok(orig, sugg, glossary)
+        return ok, "术语映射命中" if ok else "差异未落在术语表登记的映射上"
+    return False, f"类别 {category} 不允许携带建议文本"
+
+
+def fallback_gate(orig: str, sugg: str, cfg: dict) -> tuple[bool, str]:
+    """兜底：任何类别的编辑距离超过 min(30, len×0.4) 一律降级。"""
+    v = cfg.get("verification") or {}
+    cap = min(int(v.get("max_edit_distance_abs") or 30),
+              int(len(orig) * float(v.get("max_edit_distance_ratio") or 0.4)))
+    cap = max(cap, 1)
+    dist = levenshtein(orig, sugg)
+    return dist <= cap, f"兜底距离 {dist} ≤ {cap}" if dist <= cap else f"兜底距离 {dist} 超过 {cap}"
+
+
+# --------------------------------------------------------------------------
+def severity_rank(s: str) -> int:
+    return SEVERITIES.index(s) if s in SEVERITIES else len(SEVERITIES)
+
+
+def process(run_dir: Path, chunk_id: str, raw_path: Path, cfg: dict) -> dict:
+    chunk_text = (resolve_path(run_dir, "chunks") / f"chunk-{chunk_id}.txt")
+    if not chunk_text.exists():
+        die(EX.ERROR, f"分片文本不存在：{chunk_text}")
+    body = chunk_text.read_text(encoding="utf-8")
+    body_norm = normalize_ws(body)
+
+    idx = read_json(resolve_path(run_dir, "chunk_index"), {}) or {}
+    meta = next((c for c in idx.get("chunks", []) if c["chunk_id"] == chunk_id), {})
+    ctx_pids = set(meta.get("context_pids") or [])
+    paras = {}
+    for p in read_jsonl(resolve_path(run_dir, "paragraphs")):
+        paras[p["pid"]] = p
+
+    glossary = read_json(resolve_path(run_dir, "glossary_merged"), {}) or {}
+    v = cfg.get("verification") or {}
+    min_len = int(v.get("min_span_chars") or 4)
+    max_len = int(v.get("max_span_chars") or 120)
+    cap = int((cfg.get("chunking") or {}).get("max_issues_per_chunk") or 20)
+
+    counters = {"raw": 0, "bad_schema": 0, "unknown_category": 0, "context_pid": 0,
+                "hallucination_drop": 0, "length_drop": 0, "edit_gate_degrade": 0,
+                "truncated": 0, "kept": 0}
+    kept = []
+    for rec in read_jsonl(raw_path):
+        counters["raw"] += 1
+        if not isinstance(rec, dict):
+            counters["bad_schema"] += 1
+            continue
+        cat = (rec.get("category") or rec.get("rule_id") or "").strip().upper()
+        orig = (rec.get("original_text") or "").strip()
+        pid = (rec.get("pid") or "").strip()
+        if cat not in VALID_CATEGORIES:
+            counters["unknown_category"] += 1     # 闸门①：无法归类的一律丢弃
+            continue
+        if not orig or not pid:
+            counters["bad_schema"] += 1
+            continue
+        if pid in ctx_pids:
+            counters["context_pid"] += 1          # 上文参考区不在审查范围
+            continue
+
+        # ① 原文逐字校验
+        if normalize_ws(orig) not in body_norm:
+            counters["hallucination_drop"] += 1
+            continue
+        para = paras.get(pid)
+        if para is not None and normalize_ws(orig) not in normalize_ws(para["text"]):
+            counters["hallucination_drop"] += 1   # pid 与原文对不上，同样按幻觉处理
+            continue
+
+        # ③ 长度校验
+        if not (min_len <= len(orig) <= max_len):
+            counters["length_drop"] += 1
+            continue
+
+        sugg = (rec.get("suggested_text") or "").strip()
+        gate_note = ""
+        if sugg:
+            if cat not in A_CLASSES and cat not in ("L25", "L26"):
+                sugg, gate_note = "", f"{cat} 类不生成修订，已清空建议"
+                counters["edit_gate_degrade"] += 1
+            else:
+                ok, gate_note = edit_gate(cat, orig, sugg, cfg, glossary)
+                if ok:
+                    ok2, note2 = fallback_gate(orig, sugg, cfg)
+                    if not ok2:
+                        ok, gate_note = False, note2
+                if not ok:
+                    sugg = ""                      # 降级为批注，不是丢弃
+                    counters["edit_gate_degrade"] += 1
+
+        sev = (rec.get("severity") or "").strip().capitalize()
+        if sev not in SEVERITIES:
+            sev = "High" if cat in A_CLASSES else "Medium"
+        ev = (rec.get("evidence") or "").strip()[:25]   # 禁止长理由
+
+        kept.append({
+            "chunk_id": chunk_id,
+            "pid": pid,
+            "category": cat,
+            "rule_id": cat,
+            "severity": sev,
+            "original_text": orig,
+            "suggested_text": sugg,
+            "evidence": ev,
+            "heading_path": (para or {}).get("heading_path", []),
+            "page_hint": (para or {}).get("page_hint"),
+            "in_table": bool((para or {}).get("in_table")),
+            "is_code": bool((para or {}).get("is_code")),
+            "gate_note": gate_note,
+            "gates": {"exact": True, "edit": "pass" if sugg else "degraded_or_na"},
+            "action": "revision" if sugg else "comment",
+        })
+
+    # 闸门③ 必须在单片上限之前执行：否则不改清单里的噪音会先占满 20 条配额，
+    # 真问题反被截断掉。filter_neverflag.py 是这些规则的唯一实现，此处复用它。
+    import filter_neverflag as nf
+
+    groups, fbterms = nf._alias_groups(glossary), nf._fallback_terms(glossary)
+    survivors, nf_hits = [], {}
+    for r in kept:
+        rule = nf.check(r, paras.get(r["pid"]), cfg, glossary, groups, fbterms)
+        if rule:
+            nf_hits[rule] = nf_hits.get(rule, 0) + 1
+            continue
+        survivors.append(r)
+    counters["neverflag_drop"] = len(kept) - len(survivors)
+    counters["neverflag_by_rule"] = nf_hits
+    kept = survivors
+
+    # ④ 单片上限：超出按 severity 排序截断
+    kept.sort(key=lambda r: (severity_rank(r["severity"]), r["pid"]))
+    truncated = False
+    if len(kept) > cap:
+        counters["truncated"] = len(kept) - cap
+        kept = kept[:cap]
+        truncated = True
+    counters["kept"] = len(kept)
+
+    # 分片内按 pid 去重（重叠区去重，保留首次出现）
+    seen = set()
+    dedup = []
+    for r in kept:
+        key = (r["pid"], r["category"], normalize_ws(r["original_text"]))
+        if key in seen:
+            continue
+        seen.add(key)
+        dedup.append(r)
+    counters["dedup_drop"] = len(kept) - len(dedup)
+
+    out = resolve_path(run_dir, "issues") / f"issues-{chunk_id}.jsonl"
+    guard_write_path(out, run_dir)
+    atomic_write_jsonl(out, dedup)
+    gates_path = resolve_path(run_dir, "issues") / f"issues-{chunk_id}.gates.json"
+    guard_write_path(gates_path, run_dir)
+    atomic_write_json(gates_path, {"chunk_id": chunk_id, "truncated": truncated, **counters})
+
+    return {"chunk_id": chunk_id, "output": str(out), "count": len(dedup),
+            "truncated": truncated, **counters}
+
+
+def main(argv: list[str]) -> int:
+    ap = argparse.ArgumentParser(prog="verify_span.py", description="闸门②可验证性")
+    ap.add_argument("--run-dir", required=True)
+    ap.add_argument("--chunk", required=True)
+    ap.add_argument("--in", dest="raw", help="原始 JSONL；默认 issues-<chunk>.raw.jsonl")
+    ap.add_argument("--config")
+    args = ap.parse_args(argv)
+    run_dir = Path(args.run_dir).resolve()
+    raw = Path(args.raw) if args.raw else resolve_path(run_dir, "issues") / f"issues-{args.chunk}.raw.jsonl"
+    if not raw.exists():
+        die(EX.PARSE, f"原始输出不存在：{raw}",
+            "子 Agent 的 Pass 1 输出应先写入该路径（一行一条 JSON，无代码围栏）。")
+    emit({"ok": True, **process(run_dir, args.chunk, raw, load_config(args.config))})
+    return EX.OK
+
+
+if __name__ == "__main__":
+    run_cli(main)
