@@ -89,12 +89,11 @@ def part_hashes(docx: Path) -> dict:
 
 
 def _rpr_key(run) -> str:
-    from lxml import etree
+    """与 ooxml.canonical 同源：不依赖命名空间作用域，可用于游离子树。"""
+    import ooxml as ox
 
     rpr = run.find(f"{{{W}}}rPr")
-    if rpr is None:
-        return ""
-    return etree.tostring(rpr, method="c14n2").decode("utf-8")
+    return "" if rpr is None else ox.canonical(rpr)
 
 
 def _mergeable(run) -> bool:
@@ -186,6 +185,13 @@ def cmd_run(args) -> int:
     }
     merge = {"merged": 0} if args.no_merge else merge_runs(doc_xml)
     baseline["merge"] = merge
+
+    # 保存合并后、回写前的 document.xml 快照。D9 的逐 run rPr 比对以它为基准：
+    # run 合并只改结构不改渲染，因此它与原文档在样式上等价，且与回写产物可逐 run 对齐。
+    snap = resolve_path(run_dir, "work") / "document.baseline.xml"
+    guard_write_path(snap, run_dir)
+    snap.write_bytes(doc_xml.read_bytes())
+    baseline["document_baseline"] = str(snap)
     out = resolve_path(run_dir, "work") / "unpack-baseline.json"
     guard_write_path(out, run_dir)
     atomic_write_json(out, baseline)
