@@ -1,0 +1,52 @@
+{
+  "_note": "planning-tables.docx 的参考事实台账。重点验证 spec §9.2 第 3 条：表格必须抽取——规划类文档的关键数字绝大多数在表格中，metrics 的主要来源是表格而非正文。同时覆盖 L29–L32 覆盖性规则。",
+  "terms": [],
+  "acronyms": [],
+  "entities": [],
+  "metrics": [
+    {"subject": "基础设施预算", "value": "1200", "unit": "万元", "qualifier": null, "scope": "2026 年", "kind": "目标", "source": "表格", "_anchor": "基础设施"},
+    {"subject": "平台研发预算", "value": "900", "unit": "万元", "qualifier": null, "scope": "2026 年", "kind": "目标", "source": "表格", "_anchor": "平台研发"},
+    {"subject": "运营支撑预算", "value": "300", "unit": "万元", "qualifier": null, "scope": "2026 年", "kind": "目标", "source": "表格", "_anchor": "运营支撑"},
+    {"subject": "端到端时延", "value": "800", "unit": "ms", "qualifier": null, "scope": "全局", "kind": "基线", "source": "表格", "_anchor": "端到端时延"},
+    {"subject": "端到端时延", "value": "200", "unit": "ms", "qualifier": null, "scope": "全局", "kind": "目标", "source": "表格", "_anchor": "端到端时延"},
+    {"subject": "平台接入率", "value": "35", "unit": "%", "qualifier": null, "scope": "全局", "kind": "基线", "source": "表格", "_anchor": "平台接入率"},
+    {"subject": "平台接入率", "value": "80", "unit": "%", "qualifier": "≥", "scope": "全局", "kind": "目标", "source": "表格", "_anchor": "平台接入率"},
+    {"subject": "变更失败率", "value": "12", "unit": "%", "qualifier": null, "scope": "全局", "kind": "基线", "source": "表格", "_anchor": "变更失败率"},
+    {"subject": "变更失败率", "value": "3", "unit": "%", "qualifier": "≤", "scope": "全局", "kind": "目标", "source": "表格", "_anchor": "变更失败率"},
+    {"subject": "平均恢复时长", "value": "45", "unit": "min", "qualifier": null, "scope": "全局", "kind": "基线", "source": "表格", "_anchor": "平均恢复时长"},
+    {"subject": "平均恢复时长", "value": "15", "unit": "min", "qualifier": "≤", "scope": "全局", "kind": "目标", "source": "表格", "_anchor": "平均恢复时长"},
+    {"subject": "三年总投入", "value": "6500", "unit": "万元", "qualifier": null, "scope": "全局", "kind": "目标", "source": "正文", "_anchor": "三年总投入 6500 万元"}
+  ],
+  "positions": [],
+  "objectives": [
+    {"obj_id": "O1", "statement": "研发效率提升 30%", "_anchor": "为实现目标 O1"},
+    {"obj_id": "O2", "statement": "运维成本下降 20%", "_anchor": "为实现目标 O2"},
+    {"obj_id": "O3", "statement": "实现全域数据资产可见可管", "_anchor": "目标 O3"}
+  ],
+  "initiatives": [
+    {"init_id": "I1", "statement": "建设统一代码平台", "serves_objective": "O1", "_anchor": "为实现目标 O1"},
+    {"init_id": "I2", "statement": "建设统一监控平台", "serves_objective": "O2", "_anchor": "为实现目标 O2"}
+  ],
+  "acceptance": [
+    {"target": "I1", "criterion": "平台接入率不低于 80%", "_anchor": "验收标准：I1 的平台接入率不低于 80%"}
+  ],
+  "dates": [
+    {"event": "一期完成", "value": "2026-03", "_anchor": "一期"},
+    {"event": "二期完成", "value": "2026-09", "_anchor": "二期"},
+    {"event": "三期完成", "value": "2027-06", "_anchor": "三期"}
+  ],
+  "versions": [],
+  "roles": [],
+  "xrefs": [],
+  "numbering": [
+    {"type": "table", "label": "表 2-1", "caption": "分年度预算安排表", "_anchor": "表 2-1"},
+    {"type": "table", "label": "表 3-1", "caption": "关键指标目标表", "_anchor": "表 3-1"},
+    {"type": "table", "label": "表 4-1", "caption": "里程碑计划表", "_anchor": "表 4-1"}
+  ],
+  "commitments": [
+    {"subject": "平台可用性", "modality": "不低于", "statement": "平台可用性不低于 99.95%", "_anchor": "平台可用性不低于 99.95%"}
+  ],
+  "statuses": [],
+  "enumerations": [],
+  "conclusions": []
+}
