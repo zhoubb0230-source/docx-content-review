@@ -261,6 +261,21 @@ python3 "$S/unpack.py" pack --run-dir "$RUN2" >/dev/null
 TMPLEFT=$(find "$TEMP" -maxdepth 4 -name '*审查版*' | wc -l)
 check "临时目录内不残留交付物" "$TMPLEFT" 0
 
+# 默认行为：不传任何目录参数时，临时根必须跟随工作目录（中间件落在 <CWD>/docx-review/）
+mkdir -p "$WORK/cwdtest" && cp "$F/sample-basic.docx" "$WORK/srcC.docx" 2>/dev/null || true
+mkdir -p "$WORK/srcC" && cp "$F/sample-basic.docx" "$WORK/srcC/doc.docx"
+DEF=$(cd "$WORK/cwdtest" && python3 "$S/workspace.py" init --source "$WORK/srcC/doc.docx")
+DEF_TEMP=$(echo "$DEF" | jget "['temp_root']")
+DEF_DLV=$(echo "$DEF" | jget "['deliver_dir']")
+DEF_RUN=$(echo "$DEF" | jget "['run_dir']")
+check "默认临时根 = 工作目录" \
+  "$([ "$DEF_TEMP" = "$WORK/cwdtest" ] && echo yes || echo no)" yes
+check "默认交付目录 = 工作目录" \
+  "$([ "$DEF_DLV" = "$WORK/cwdtest" ] && echo yes || echo no)" yes
+case "$DEF_RUN" in "$WORK/cwdtest/docx-review/"*) ok "中间件落在 <工作目录>/docx-review/ 下";;
+  *) bad "中间件落在 $DEF_RUN";; esac
+[ -d "$WORK/cwdtest/docx-review" ] && ok "工作目录下已建 docx-review/" || bad "未建 docx-review/"
+
 # 批注正文必须是中文说法，规则号只作末尾标记
 python3 "$S/apply_comments.py" plan --run-dir "$RUN2" >/dev/null
 python3 - "$RUN2" <<'PYEOF'

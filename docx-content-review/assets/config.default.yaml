@@ -63,10 +63,10 @@ workspace:
   # null = Agent 当前工作目录。优先级：--output-dir > DOCX_REVIEW_OUTPUT_DIR > 本项 > CWD
   output_dir: null
   # 临时目录根：只放中间件（副本、解包、分片、台账、冲突候选…），可整体删除。
-  # null = 按平台取默认值（见下）。优先级：--temp-dir > DOCX_REVIEW_TEMP_DIR > 本项 > 平台默认
+  # null = 跟随交付目录，即中间件落在 <工作目录>/docx-review/ 之下。
+  # 只有工作目录在网络盘、或想把大体积中间件挪到别的盘时才需要显式指定。
+  # 优先级：--temp-dir > DOCX_REVIEW_TEMP_DIR > 本项 > 交付目录
   temp_dir: null
-  temp_dir_windows: "D:\\temp_doc_review"   # Windows 默认临时根
-  temp_dir_posix: null                        # null = 系统临时目录下的 temp_doc_review
   clean_temp_on_success: false  # 全流程成功后删除本次 run 的临时目录（技能稳定后可开）
   subdir: "docx-review"
   slug_max_chars: 40

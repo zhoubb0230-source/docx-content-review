@@ -172,8 +172,8 @@ L 规则表、目录结构、配置项）不在此重复。
 - **日期**：2026-08-05
 - **决策**：`workspace.py init` 解析两个互相独立的根：
   **交付目录**（`--output-dir`，默认 Agent 当前工作目录）放最终产物；
-  **临时目录**（`--temp-dir`，Windows 默认 `D:\temp_doc_review`，其他平台系统临时目录下的
-  `temp_doc_review`）放全部中间件。`docx-review/<文档slug>-<sha12>/run-*/` 这棵树整体移到临时根之下。
+  **临时目录**（`--temp-dir`，**默认与交付目录同址**，即中间件落在 `<工作目录>/docx-review/`）
+  放全部中间件。`docx-review/<文档slug>-<sha12>/run-*/` 这棵树整体移到临时根之下。
 - **备选**：沿用 SPEC §11.1 的单一"输出根"，交付物留在 `run/output/`。
 - **理由**：SPEC 写这条时把"中间件落点"与"交付物落点"当成了同一件事。实际使用中它们的
   生命周期完全相反——中间件跑完就该能删，交付物要长期留存。混在一处的直接后果是
@@ -182,16 +182,20 @@ L 规则表、目录结构、配置项）不在此重复。
   `deliver_path` / `clean-temp`）、`report.py`、`metrics.py`、`unpack.py pack`、
   `import_decisions.py`、`assets/config.default.yaml`、`SKILL.md`。
 
-## ADR-017　平台默认临时根失败时回退，显式指定时硬失败
+## ADR-017　临时根默认跟随工作目录，不引入平台特定路径
 
-- **日期**：2026-08-05
-- **决策**：`--temp-dir` / 环境变量 / 配置项显式指定的临时根不可用 → 直接终止（退出码 6）；
-  走**平台默认值**时不可用 → 警告并回退到系统临时目录。
-- **理由**：用户指名要某个目录，悄悄换地方比失败更糟。但平台默认值是程序猜的——
-  D 盘可能不存在、可能是光驱、可能只读，为一个纯中间件目录让整个审查任务失败不合理。
-  盘符判定必须用 `ntpath.splitdrive`：`os.path` 在非 Windows 上是 posixpath，
-  解析不出盘符，会让这段逻辑既无法测试又在模拟环境下悄悄失效。
-- **影响**：`scripts/workspace.py` 的 `default_temp_root` / `resolve_temp_root`。
+- **日期**：2026-08-05（同日修订）
+- **决策**：`resolve_temp_root` 在未显式指定时**直接返回交付根**，中间件落在
+  `<工作目录>/docx-review/`。显式指定（`--temp-dir` / 环境变量 / 配置项）不可用时
+  硬失败（退出码 6），不做静默回退——用户指名要那里。
+- **被推翻的初版**：曾按平台取默认值（Windows `D:\temp_doc_review`、其他平台系统临时目录），
+  并在默认值不可用时回退。**这是对需求的误读**：用户报告的 `D:\temp_doc_review\docx-review`
+  是他观察到的现象，不是期望值；他要的是中间件也在工作目录下。
+- **理由**：中间件与交付物同处一地，用户找得到、也能一眼看出 `docx-review/` 是可删的那个。
+  引入平台特定的默认路径既增加了一处需要解释的行为，又制造了"产物散落在两个盘"的困惑。
+  跨盘的需求（工作目录在网络盘、中间件体积大）是少数情形，交给显式参数即可。
+- **影响**：`scripts/workspace.py`（删除 `default_temp_root` / `system_temp_root`）、
+  `assets/config.default.yaml`（删除 `temp_dir_windows` / `temp_dir_posix`）、`SKILL.md`。
 
 ## ADR-018　交付物统一命名 `<原文件名>审查版_<时间戳>.<后缀>`
 

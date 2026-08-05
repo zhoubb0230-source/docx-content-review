@@ -186,52 +186,22 @@ def resolve_deliver_root(cli_dir: str | None, cfg: dict, source: Path | None) ->
     return _validate_root(root, source, "交付目录", allow_source_dir=True)
 
 
-def system_temp_root() -> Path:
-    import tempfile
+def resolve_temp_root(cli_dir: str | None, cfg: dict, source: Path | None,
+                      deliver_root: Path) -> Path:
+    """临时根：只放中间件（`<临时根>/docx-review/…`），可整体删除。
 
-    return Path(tempfile.gettempdir()) / "temp_doc_review"
+    **默认就跟随交付目录**，也就是 Agent 当前工作目录——中间件与交付物同处一地，
+    用户找得到、也能一眼看出哪些是可删的。只有在显式指定时才落到别处
+    （比如工作目录在网络盘上、或想把大体积中间件放到另一块盘）。
 
-
-def default_temp_root(cfg: dict) -> Path:
-    """临时根的平台默认值。Windows 走 D:\temp_doc_review，盘不存在时直接回退。"""
-    ws = cfg.get("workspace") or {}
-    if sys.platform.startswith("win"):
-        cand = ws.get("temp_dir_windows") or "D:\\temp_doc_review"
-        # 必须用 ntpath.splitdrive：os.path 在非 Windows 上是 posixpath，解析不出盘符，
-        # 使这段逻辑既无法测试、又在模拟环境下悄悄失效
-        import ntpath
-
-        drive = ntpath.splitdrive(str(cand))[0]
-        if drive and not os.path.exists(drive + os.sep):
-            warn(f"临时目录默认盘 {drive} 不存在，回退到系统临时目录")
-            return system_temp_root()
-        return Path(cand)
-    posix = ws.get("temp_dir_posix")
-    return Path(posix).expanduser() if posix else system_temp_root()
-
-
-def resolve_temp_root(cli_dir: str | None, cfg: dict, source: Path | None) -> Path:
-    """临时根：只放中间件，可整体删除。与交付目录相互独立。
-
-    显式指定（--temp-dir / 环境变量 / 配置）不可用时是硬失败——用户指名要那里。
-    走平台默认值时不可用则回退系统临时目录：盘可能只读、可能是光驱，
-    为一个纯中间件目录让整个任务失败不合理。
+    显式指定不可用时是硬失败：用户指名要那里，悄悄换地方比失败更糟。
     """
     explicit = (cli_dir or os.environ.get("DOCX_REVIEW_TEMP_DIR")
                 or (cfg.get("workspace") or {}).get("temp_dir"))
-    if explicit:
-        root = Path(explicit).expanduser().resolve()
-        return _validate_root(root, source, "临时目录", allow_source_dir=False)
-
-    root = default_temp_root(cfg).resolve()
-    try:
-        return _validate_root(root, source, "临时目录", allow_source_dir=False)
-    except SkillError as exc:
-        fallback = system_temp_root().resolve()
-        if fallback == root:
-            raise
-        warn(f"默认临时目录不可用（{exc.message}），回退到 {fallback}")
-        return _validate_root(fallback, source, "临时目录", allow_source_dir=False)
+    if not explicit:
+        return deliver_root          # 已由 resolve_deliver_root 校验过
+    root = Path(explicit).expanduser().resolve()
+    return _validate_root(root, source, "临时目录", allow_source_dir=True)
 
 
 def _rand_suffix(n: int = 4) -> str:
@@ -691,7 +661,7 @@ def cmd_init(args) -> int:
 
     # 交付目录（最终产物）与临时目录（中间件）相互独立
     deliver_root = resolve_deliver_root(args.output_dir, cfg, src)
-    temp_root = resolve_temp_root(args.temp_dir, cfg, src)
+    temp_root = resolve_temp_root(args.temp_dir, cfg, src, deliver_root)
     base = temp_root / (ws.get("subdir") or "docx-review")
     base.mkdir(parents=True, exist_ok=True)
 
@@ -834,7 +804,8 @@ def cmd_locate(args) -> int:
     if not src.exists():
         die(EX.USAGE, f"源文档不存在：{src}")
     sha = sha256_file(src)
-    root = resolve_temp_root(args.temp_dir, cfg, src)
+    root = resolve_temp_root(args.temp_dir, cfg, src,
+                             resolve_deliver_root(None, cfg, src))
     base = root / (ws.get("subdir") or "docx-review")
     slug = slugify(src.name, int(ws.get("slug_max_chars") or 40))
     prefix = int(ws.get("hash_prefix_len") or 12)
@@ -978,7 +949,7 @@ def build_parser() -> argparse.ArgumentParser:
     p = sub.add_parser("init", help="初始化工作目录并复制源文档（Pass -1）")
     p.add_argument("--source", required=True)
     p.add_argument("--output-dir", help="交付目录（最终产物），默认 Agent 当前工作目录")
-    p.add_argument("--temp-dir", help="临时目录根（只放中间件），默认按平台取值")
+    p.add_argument("--temp-dir", help="临时目录根（只放中间件），默认跟随交付目录")
     p.add_argument("--config")
     p.add_argument("--resume", choices=["auto", "new", "reuse"], default="auto")
     p.add_argument("--seed", type=int)
