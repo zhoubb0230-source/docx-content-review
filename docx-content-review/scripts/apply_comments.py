@@ -31,7 +31,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import ooxml as ox  # noqa: E402
 from _common import (  # noqa: E402
-    EX, atomic_write_json, die, emit, read_json, read_jsonl, run_cli, version_header, warn,
+    EX, SEVERITY_PREFIX, atomic_write_json, die, emit, read_json, read_jsonl, rule_label,
+    run_cli, version_header, warn,
 )
 from workspace import (  # noqa: E402
     Heartbeat, guard_write_path, lease_verify, load_config, resolve_path,
@@ -45,7 +46,12 @@ REL_NS = "http://schemas.openxmlformats.org/package/2006/relationships"
 CT_NS = "http://schemas.openxmlformats.org/package/2006/content-types"
 REL_BASE = "http://schemas.openxmlformats.org/officeDocument/2006/relationships"
 
-SEVERITY_PREFIX = {"Critical": "[严重]", "High": "[重要]", "Medium": "[提示]", "Low": "[提示]"}
+# 两侧是对**同一事实的互斥表述**的规则——只有这些才适合问「以哪一处为准」。
+# 其余规则（区间自相矛盾、条目数不符、时序倒置、覆盖性缺失…）两侧不是竞争关系，
+# 套用同一句文案会让评审人不知道要确认什么。
+RIVAL_RULES = {"L01", "L02", "L04", "L05", "L06", "L07", "L12", "L14",
+               "L17", "L20", "L21", "L22", "L23", "L28"}
+
 CORE_PART = "word/comments.xml"
 ENHANCED = {
     "word/commentsExtended.xml": (
@@ -80,11 +86,17 @@ def build_plan(run_dir: Path, cfg: dict) -> dict:
             continue                                  # 已落笔为修订，不再重复批注
         if rec.get("action") == "report_only" and iid not in demoted:
             continue                                  # 仅风格倾向：只进报告，不入文档
-        body = rec.get("evidence") or ""
+        cat = rec.get("category") or ""
+        lines = [rule_label(cat)]
+        if rec.get("evidence"):
+            lines.append(rec["evidence"])
+        if rec.get("suggested_text"):
+            lines.append(f"建议改为：{rec['suggested_text']}")
+        lines.append(f"（检测规则 {cat}）")
         items.append({
             "comment_id": None, "pid": rec["pid"], "anchor": rec.get("original_text") or "",
             "severity": rec.get("severity") or "Medium",
-            "text": f"【{rec.get('category')}】{body}".strip(),
+            "text": "\n".join(x for x in lines if x),
             "source": "issue", "ref": iid,
         })
 
@@ -108,21 +120,38 @@ def build_plan(run_dir: Path, cfg: dict) -> dict:
                 continue
             # 文案统一：不要求模型判断哪一处是对的——它无法知道，那必然是幻觉源
             other = sides[1] if len(sides) > 1 else None
-            if other:
+            # 两侧落在同一段落时不构成"此处/彼处"，否则会出现自己跟自己冲突的怪文案
+            if other is not None and other.get("pid") == sides[0].get("pid"):
+                other = None
+            lines = [f"{rule_label(rule)} — {c.get('description','')}"]
+            if other and rule in RIVAL_RULES:
                 where = " > ".join(other.get("heading_path") or []) or "文档其他位置"
-                body = (f"{c['description']}：本处与「{where}」"
-                        f"（第 {other.get('page_hint')} 页）的描述存在冲突。"
-                        f"此处为：{sides[0].get('text','')[:60]}；"
-                        f"彼处为：{other.get('text','')[:60]}。请确认以哪一处为准。")
+                lines.append(f"本处与「{where}」（第 {other.get('page_hint')} 页）的描述不一致：")
+                lines.append(f"　此处：{sides[0].get('text','')[:80]}")
+                lines.append(f"　彼处：{other.get('text','')[:80]}")
+                # 不判断哪一处是对的——文档之外的事实不在模型视野里
+                lines.append("请确认以哪一处为准。")
             else:
-                body = f"{c['description']}：{c.get('note','')}"
+                note = c.get("note") or ""
+                subj = (c.get("subject") or "").strip()
+                # note 里已含 subject 就不重复
+                if subj and subj not in note:
+                    note = f"「{subj}」：{note}" if note else f"涉及「{subj}」"
+                if note:
+                    lines.append(note)
+                if other:
+                    where = " > ".join(other.get("heading_path") or []) or "文档其他位置"
+                    lines.append(f"相关位置：「{where}」第 {other.get('page_hint')} 页——"
+                                 f"{other.get('text','')[:60]}")
+                lines.append("请核对后确认。")
             if unsure:
-                body += "（Pass 4 裁定为不确定，待人工确认）"
+                lines.append("（自动裁定为不确定，需人工确认）")
+            lines.append(f"（检测规则 {rule}，详见审查报告）")
             items.append({
                 "comment_id": None, "pid": sides[0]["pid"],
                 "anchor": (paras.get(sides[0]["pid"], {}).get("text") or "")[:40],
                 "severity": c.get("severity") or "Medium",
-                "text": f"【{rule}】{body}", "source": "conflict", "ref": c["conflict_id"],
+                "text": "\n".join(lines), "source": "conflict", "ref": c["conflict_id"],
             })
 
     for i, it in enumerate(items, 1):
@@ -249,12 +278,15 @@ def apply_comments(run_dir: Path, cfg: dict) -> dict:
         c.set(ox.q("author"), author)
         c.set(ox.q("date"), stamp)
         c.set(ox.q("initials"), "CR")
-        p = etree.SubElement(c, ox.q("p"))
-        r = etree.SubElement(p, ox.q("r"))
-        t = etree.SubElement(r, ox.q("t"))
         prefix = SEVERITY_PREFIX.get(it.get("severity") or "Medium", "[提示]")
-        t.text = f"{prefix} {it['text']}"
-        t.set(ox.XML_SPACE, "preserve")
+        body = f"{prefix} {it['text']}"
+        # 每行一个 w:p——批注正文里的换行必须是真正的段落，否则 Word 会挤成一行
+        for line in body.split("\n"):
+            p = etree.SubElement(c, ox.q("p"))
+            r = etree.SubElement(p, ox.q("r"))
+            t = etree.SubElement(r, ox.q("t"))
+            t.text = line
+            t.set(ox.XML_SPACE, "preserve")
         if _anchor_paragraph(para, it.get("anchor") or "", cid):
             anchored += 1
             written.append(it)

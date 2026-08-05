@@ -22,7 +22,9 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from _common import EX, atomic_write_json, die, emit, run_cli, sha256_file, version_header  # noqa: E402
-from workspace import guard_write_path, resolve_path, working_docx  # noqa: E402
+from workspace import (  # noqa: E402
+    deliver_path, guard_write_path, resolve_path, working_docx,
+)
 
 W = "http://schemas.openxmlformats.org/wordprocessingml/2006/main"
 NS = {"w": W}
@@ -206,7 +208,15 @@ def cmd_pack(args) -> int:
     src = resolve_path(run_dir, "unpacked")
     if not src.exists():
         die(EX.ERROR, f"解包目录不存在：{src}")
-    target = Path(args.output) if args.output else resolve_path(run_dir, "work") / "repacked.docx"
+    # 默认直接打包到交付目录（<原文件名>审查版_<时间戳>.docx），不留在临时目录
+    target = Path(args.output) if args.output else deliver_path(run_dir, "reviewed_docx")
+    if target.exists() and not args.overwrite:
+        # 同名交付物不覆盖，追加序号
+        stem, suffix, n = target.stem, target.suffix, 2
+        while target.with_name(f"{stem}-{n}{suffix}").exists() and n < 100:
+            n += 1
+        target = target.with_name(f"{stem}-{n}{suffix}")
+    target.parent.mkdir(parents=True, exist_ok=True)
     p = pack(src, target, run_dir)
     emit({"ok": True, "docx": str(p), "size": p.stat().st_size})
     return EX.OK
@@ -219,9 +229,10 @@ def main(argv: list[str]) -> int:
     p.add_argument("--run-dir", required=True)
     p.add_argument("--no-merge", action="store_true")
     p.set_defaults(func=cmd_run)
-    p = sub.add_parser("pack", help="重新打包")
+    p = sub.add_parser("pack", help="重新打包；默认输出到交付目录")
     p.add_argument("--run-dir", required=True)
-    p.add_argument("--output")
+    p.add_argument("--output", help="留空则用交付路径 <原文件名>审查版_<时间戳>.docx")
+    p.add_argument("--overwrite", action="store_true", help="允许覆盖同名交付物")
     p.set_defaults(func=cmd_pack)
     args = ap.parse_args(argv)
     return args.func(args)

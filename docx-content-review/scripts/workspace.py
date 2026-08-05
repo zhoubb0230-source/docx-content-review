@@ -43,6 +43,7 @@ from _common import (  # noqa: E402
     sha256_file,
     sha256_text,
     version_header,
+    warn,
 )
 
 SKILL_ROOT = Path(__file__).resolve().parent.parent
@@ -80,6 +81,8 @@ KINDS = {
     "issues_verified": "work/issues-verified.jsonl",
     "typos": "work/typos",
     "patchlist": "work/patchlist.json",
+    # 以下四项是 run 内的暂存位置。**最终交付物不在这里**——
+    # 交付路径由 deliver_path() 依 manifest 的 deliver_dir 解析（见 DELIVERABLES）。
     "report": "output/report.md",
     "issues_xlsx": "output/issues.xlsx",
     "metrics": "output/metrics.json",
@@ -92,6 +95,17 @@ KINDS = {
     "latest": "../latest.json",
     # 工作根级
     "review_memory": "../../review-memory.json",
+}
+
+
+# 交付物：文件名 = filename_pattern.format(stem=原文件名, ts=时间戳, ext=下表后缀)
+# 全部落在**交付目录**（工作目录），不在临时目录内——临时目录随时可整体删除。
+DELIVERABLES = {
+    "reviewed_docx": ".docx",
+    "report":        ".report.md",
+    "issues_xlsx":   ".issues.xlsx",
+    "metrics":       ".metrics.json",
+    "glossary_out":  ".glossary.json",
 }
 
 
@@ -129,54 +143,95 @@ def _deep_merge(base: dict, over: dict) -> dict:
 # --------------------------------------------------------------------------
 # 输出根解析（spec §11.1）
 # --------------------------------------------------------------------------
-def resolve_output_root(cli_dir: str | None, cfg: dict, source: Path | None) -> Path:
-    raw = cli_dir or os.environ.get("DOCX_REVIEW_OUTPUT_DIR") or (cfg.get("workspace") or {}).get("output_dir")
-    explicit = bool(raw)
-    root = Path(raw).expanduser() if raw else Path.cwd()
-    root = root.resolve()
-
+def _validate_root(root: Path, source: Path | None, label: str, *, allow_source_dir: bool) -> Path:
+    """三项校验：不得在技能目录内、不得等于源文档目录（CWD 例外）、必须实际可写。"""
     if not root.exists():
         try:
             root.mkdir(parents=True, exist_ok=True)
         except OSError as exc:
-            die(EX.WORKSPACE, f"输出根目录无法创建：{root}（{exc}）")
+            die(EX.WORKSPACE, f"{label}无法创建：{root}（{exc}）")
     if not root.is_dir():
-        die(EX.WORKSPACE, f"输出根目录不是目录：{root}")
+        die(EX.WORKSPACE, f"{label}不是目录：{root}")
 
-    # ① 不得位于技能目录之内
+    if root == SKILL_ROOT:
+        die(EX.WORKSPACE, f"{label}不得为技能目录：{root}")
     try:
         root.relative_to(SKILL_ROOT)
-        die(
-            EX.WORKSPACE,
-            f"输出根目录位于技能目录内：{root}",
-            "技能目录在运行期只读。请用 --output-dir 指定 Agent 工作目录，或改到技能目录之外运行。",
-        )
+        die(EX.WORKSPACE, f"{label}位于技能目录内：{root}",
+            "技能目录在运行期只读。请指定技能目录之外的路径。")
     except ValueError:
         pass
-    if SKILL_ROOT == root:
-        die(EX.WORKSPACE, f"输出根目录不得为技能目录：{root}")
 
-    # ② 不得位于源文档所在目录（该目录恰好就是 CWD 时例外）
-    if source is not None:
+    if source is not None and not allow_source_dir:
         src_dir = source.resolve().parent
         if root == src_dir and root != Path.cwd().resolve():
-            die(
-                EX.WORKSPACE,
-                f"输出根目录与源文档所在目录相同：{root}",
-                "为避免污染源文档目录，请用 --output-dir 指定其他目录（当前工作目录除外）。",
-            )
+            die(EX.WORKSPACE, f"{label}与源文档所在目录相同：{root}",
+                "为避免污染源文档目录，请指定其他目录（当前工作目录除外）。")
 
-    # ③ 必须可写：实际探针，不看权限位
     probe = root / f".docx-review-probe-{os.getpid()}-{_rand_suffix()}"
     try:
         probe.write_text("probe", encoding="utf-8")
         probe.unlink()
     except OSError as exc:
-        die(EX.WORKSPACE, f"输出根目录不可写：{root}（{exc}）")
-
-    if explicit:
-        pass
+        die(EX.WORKSPACE, f"{label}不可写：{root}（{exc}）")
     return root
+
+
+def resolve_deliver_root(cli_dir: str | None, cfg: dict, source: Path | None) -> Path:
+    """交付目录：最终产物落点。默认 Agent 当前工作目录。"""
+    raw = (cli_dir or os.environ.get("DOCX_REVIEW_OUTPUT_DIR")
+           or (cfg.get("workspace") or {}).get("output_dir"))
+    root = (Path(raw).expanduser() if raw else Path.cwd()).resolve()
+    # 交付到源文档所在目录是常见且合理的用法（产物带"审查版_时间戳"后缀，不会覆盖原件）
+    return _validate_root(root, source, "交付目录", allow_source_dir=True)
+
+
+def system_temp_root() -> Path:
+    import tempfile
+
+    return Path(tempfile.gettempdir()) / "temp_doc_review"
+
+
+def default_temp_root(cfg: dict) -> Path:
+    """临时根的平台默认值。Windows 走 D:\temp_doc_review，盘不存在时直接回退。"""
+    ws = cfg.get("workspace") or {}
+    if sys.platform.startswith("win"):
+        cand = ws.get("temp_dir_windows") or "D:\\temp_doc_review"
+        # 必须用 ntpath.splitdrive：os.path 在非 Windows 上是 posixpath，解析不出盘符，
+        # 使这段逻辑既无法测试、又在模拟环境下悄悄失效
+        import ntpath
+
+        drive = ntpath.splitdrive(str(cand))[0]
+        if drive and not os.path.exists(drive + os.sep):
+            warn(f"临时目录默认盘 {drive} 不存在，回退到系统临时目录")
+            return system_temp_root()
+        return Path(cand)
+    posix = ws.get("temp_dir_posix")
+    return Path(posix).expanduser() if posix else system_temp_root()
+
+
+def resolve_temp_root(cli_dir: str | None, cfg: dict, source: Path | None) -> Path:
+    """临时根：只放中间件，可整体删除。与交付目录相互独立。
+
+    显式指定（--temp-dir / 环境变量 / 配置）不可用时是硬失败——用户指名要那里。
+    走平台默认值时不可用则回退系统临时目录：盘可能只读、可能是光驱，
+    为一个纯中间件目录让整个任务失败不合理。
+    """
+    explicit = (cli_dir or os.environ.get("DOCX_REVIEW_TEMP_DIR")
+                or (cfg.get("workspace") or {}).get("temp_dir"))
+    if explicit:
+        root = Path(explicit).expanduser().resolve()
+        return _validate_root(root, source, "临时目录", allow_source_dir=False)
+
+    root = default_temp_root(cfg).resolve()
+    try:
+        return _validate_root(root, source, "临时目录", allow_source_dir=False)
+    except SkillError as exc:
+        fallback = system_temp_root().resolve()
+        if fallback == root:
+            raise
+        warn(f"默认临时目录不可用（{exc.message}），回退到 {fallback}")
+        return _validate_root(fallback, source, "临时目录", allow_source_dir=False)
 
 
 def _rand_suffix(n: int = 4) -> str:
@@ -270,6 +325,10 @@ def guard_write_path(path: str | os.PathLike, run_dir: str | os.PathLike | None 
     allowed: list[Path] = []
     if run_dir:
         allowed.append(Path(run_dir).resolve())
+        # 交付目录由 manifest 声明，同样是本次运行的合法写入根
+        man = read_json(Path(run_dir) / "manifest.json", {}) or {}
+        if man.get("deliver_dir"):
+            allowed.append(Path(man["deliver_dir"]).resolve())
     if base_dir:
         allowed.append(Path(base_dir).resolve())
     if not allowed:
@@ -305,6 +364,29 @@ def resolve_path(run_dir: str | os.PathLike, kind: str) -> Path:
     rel = KINDS[kind]
     p = Path(run_dir).resolve()
     return (p / rel).resolve() if rel else p
+
+
+def deliver_meta(run_dir: str | os.PathLike) -> dict:
+    man = read_json(resolve_path(run_dir, "manifest"), {}) or {}
+    if not man.get("deliver_dir"):
+        die(EX.ERROR, "manifest 中缺少 deliver_dir，请重新执行 workspace.py init")
+    return man
+
+
+def deliver_path(run_dir: str | os.PathLike, kind: str, *, man: dict | None = None) -> Path:
+    """交付物的最终路径：<交付目录>/<原文件名>审查版_<时间戳><后缀>。"""
+    if kind not in DELIVERABLES:
+        die(EX.USAGE, f"未知的交付物：{kind}（可用：{', '.join(DELIVERABLES)}）")
+    man = man or deliver_meta(run_dir)
+    pattern = man.get("filename_pattern") or "{stem}审查版_{ts}{ext}"
+    name = pattern.format(stem=man.get("deliver_stem") or "document",
+                          ts=man.get("deliver_ts") or "", ext=DELIVERABLES[kind])
+    return Path(man["deliver_dir"]) / name
+
+
+def deliver_all(run_dir: str | os.PathLike) -> dict:
+    man = deliver_meta(run_dir)
+    return {k: str(deliver_path(run_dir, k, man=man)) for k in DELIVERABLES}
 
 
 def source_copy_path(run_dir: str | os.PathLike, ext: str) -> Path:
@@ -607,8 +689,10 @@ def cmd_init(args) -> int:
     if ext not in (".doc", ".docx", ".dotx", ".docm"):
         die(EX.USAGE, f"不支持的输入格式：{ext}（本技能只处理 .doc / .docx）")
 
-    root = resolve_output_root(args.output_dir, cfg, src)
-    base = root / (ws.get("subdir") or "docx-review")
+    # 交付目录（最终产物）与临时目录（中间件）相互独立
+    deliver_root = resolve_deliver_root(args.output_dir, cfg, src)
+    temp_root = resolve_temp_root(args.temp_dir, cfg, src)
+    base = temp_root / (ws.get("subdir") or "docx-review")
     base.mkdir(parents=True, exist_ok=True)
 
     # 2) 源文档 sha256 + 元数据
@@ -640,6 +724,7 @@ def cmd_init(args) -> int:
                                 "stage": man.get("stage"), "stats": man.get("stats", {})}
     if resume_candidate and args.resume == "auto":
         emit({"ok": True, "action": "resume_available", "doc_dir": str(doc_dir),
+              "deliver_dir": str(deliver_root),
               "resume": resume_candidate, "lease": lease_status(doc_dir),
               "source_sha256": sha,
               "hint": "存在未完成的 run。请询问用户：续跑（--resume reuse）还是新建（--resume new）。"})
@@ -647,10 +732,14 @@ def cmd_init(args) -> int:
     if resume_candidate and args.resume == "reuse":
         run_dir = Path(resume_candidate["run_dir"])
         _ensure_source_copy(run_dir, src, sha, ext)
+        man = read_json(resolve_path(run_dir, "manifest"), {}) or {}
+        man["deliver_dir"] = str(deliver_root)      # 交付目录可能随会话变化，续跑时刷新
+        atomic_write_json(resolve_path(run_dir, "manifest"), man)
         emit({"ok": True, "action": "resumed", "doc_dir": str(doc_dir), "run_dir": str(run_dir),
               "runid": run_dir.name, "source_sha256": sha,
               "stage": resume_candidate["stage"], "stats": resume_candidate.get("stats", {}),
-              "local_fs": is_local_fs(base)})
+              "local_fs": is_local_fs(base), "deliver_dir": str(deliver_root),
+              "deliverables": deliver_all(run_dir)})
         return EX.OK
 
     # 新建 run
@@ -684,6 +773,14 @@ def cmd_init(args) -> int:
                    "max_context_tokens": (cfg.get("chunking") or {}).get("max_context_tokens")},
         "config_hash": sha256_text(yaml.safe_dump(cfg, allow_unicode=True, sort_keys=True))[:16],
         "ab_seed": args.seed if args.seed is not None else random.randint(1, 2 ** 31 - 1),
+        # 交付元信息：交付物文件名在 init 时定死，全流程共用同一时间戳
+        "deliver_dir": str(deliver_root),
+        "deliver_stem": Path(src.name).stem,
+        "deliver_ts": datetime.now().strftime(
+            (cfg.get("output") or {}).get("timestamp_format") or "%Y%m%d_%H%M%S"),
+        "filename_pattern": (cfg.get("output") or {}).get("filename_pattern")
+        or "{stem}审查版_{ts}{ext}",
+        "temp_root": str(temp_root),
         "chunks": [],
         "stats": {"total_chunks": 0, "done": 0, "failed": 0, "pending": 0},
     }
@@ -696,7 +793,8 @@ def cmd_init(args) -> int:
         "runid": runid, "source_sha256": sha, "source_copy": str(copy_path),
         "needs_conversion": ext == ".doc", "new_doc_dir": is_new_doc,
         "local_fs": is_local_fs(base), "fs_type": fs_type(base),
-        "output_root": str(root),
+        "temp_root": str(temp_root), "deliver_dir": str(deliver_root),
+        "deliverables": deliver_all(run_dir),
     })
     return EX.OK
 
@@ -736,7 +834,7 @@ def cmd_locate(args) -> int:
     if not src.exists():
         die(EX.USAGE, f"源文档不存在：{src}")
     sha = sha256_file(src)
-    root = resolve_output_root(args.output_dir, cfg, src)
+    root = resolve_temp_root(args.temp_dir, cfg, src)
     base = root / (ws.get("subdir") or "docx-review")
     slug = slugify(src.name, int(ws.get("slug_max_chars") or 40))
     prefix = int(ws.get("hash_prefix_len") or 12)
@@ -827,6 +925,41 @@ def cmd_claim(args) -> int:
     return EX.OK
 
 
+def cmd_deliver(args) -> int:
+    run_dir = Path(args.run_dir).resolve()
+    if args.kind:
+        emit({"ok": True, "path": str(deliver_path(run_dir, args.kind))})
+    else:
+        man = deliver_meta(run_dir)
+        emit({"ok": True, "deliver_dir": man["deliver_dir"], "paths": deliver_all(run_dir)})
+    return EX.OK
+
+
+def cmd_clean_temp(args) -> int:
+    """删除本次 run 的临时目录。交付物在交付目录，不受影响。"""
+    run_dir = Path(args.run_dir).resolve()
+    man = read_json(resolve_path(run_dir, "manifest"), {}) or {}
+    stage = man.get("stage")
+    if stage != "completed" and not args.force:
+        die(EX.USAGE, f"当前阶段为 {stage}，尚未完成；删除临时目录会丢失续跑所需的中间件",
+            "确认无需续跑再加 --force。")
+    # 必须在删除之前把交付物路径读出来——manifest 就在待删目录里
+    kept = deliver_all(run_dir)
+    missing = [k for k, v in kept.items() if not Path(v).exists()]
+    if missing and not args.force:
+        die(EX.USAGE, f"交付物尚未全部产出（缺 {missing}），拒绝删除临时目录",
+            "先跑完 report.py 与打包步骤，或加 --force 强制删除。")
+    doc_dir = run_dir.parent
+    shutil.rmtree(run_dir, ignore_errors=True)
+    # 文档目录若只剩指针类文件，一并清掉
+    leftovers = [x for x in doc_dir.iterdir()
+                 if x.name not in ("latest.json", "doc.json", "owner.json", "glossary.json")]
+    if not leftovers:
+        shutil.rmtree(doc_dir, ignore_errors=True)
+    emit({"ok": True, "removed": str(run_dir), "deliverables_kept": kept})
+    return EX.OK
+
+
 def cmd_config(args) -> int:
     emit({"ok": True, "config": load_config(args.config)})
     return EX.OK
@@ -844,7 +977,8 @@ def build_parser() -> argparse.ArgumentParser:
 
     p = sub.add_parser("init", help="初始化工作目录并复制源文档（Pass -1）")
     p.add_argument("--source", required=True)
-    p.add_argument("--output-dir")
+    p.add_argument("--output-dir", help="交付目录（最终产物），默认 Agent 当前工作目录")
+    p.add_argument("--temp-dir", help="临时目录根（只放中间件），默认按平台取值")
     p.add_argument("--config")
     p.add_argument("--resume", choices=["auto", "new", "reuse"], default="auto")
     p.add_argument("--seed", type=int)
@@ -852,7 +986,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     p = sub.add_parser("locate", help="查找已有文档目录，不创建")
     p.add_argument("--source", required=True)
-    p.add_argument("--output-dir")
+    p.add_argument("--temp-dir")
     p.add_argument("--config")
     p.set_defaults(func=cmd_locate)
 
@@ -885,6 +1019,16 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--chunk")
     p.add_argument("--config")
     p.set_defaults(func=cmd_claim)
+
+    p = sub.add_parser("deliver", help="打印交付物最终路径")
+    p.add_argument("--run-dir", required=True)
+    p.add_argument("--kind", choices=sorted(DELIVERABLES))
+    p.set_defaults(func=cmd_deliver)
+
+    p = sub.add_parser("clean-temp", help="删除本次 run 的临时目录（交付物不受影响）")
+    p.add_argument("--run-dir", required=True)
+    p.add_argument("--force", action="store_true", help="即使 stage != completed 也删除")
+    p.set_defaults(func=cmd_clean_temp)
 
     p = sub.add_parser("config", help="打印生效配置")
     p.add_argument("--config")

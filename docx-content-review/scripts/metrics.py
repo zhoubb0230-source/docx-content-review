@@ -29,7 +29,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from _common import (  # noqa: E402
     EX, atomic_write_json, emit, read_json, read_jsonl, run_cli, version_header,
 )
-from workspace import guard_write_path, load_config, resolve_path  # noqa: E402
+from workspace import deliver_path, guard_write_path, load_config, resolve_path  # noqa: E402
 
 COUNTER_PATH = "work/llm-usage.json"
 
@@ -146,8 +146,9 @@ def collect(run_dir: Path, cfg: dict) -> dict:
         k: round(gates[k] / raw, 4) for k in
         ("hallucination_drop", "neverflag_drop", "edit_gate_drop", "second_pass_drop")
     }
-    path = resolve_path(run_dir, "metrics")
+    path = deliver_path(run_dir, "metrics")
     guard_write_path(path, run_dir)
+    path.parent.mkdir(parents=True, exist_ok=True)
     atomic_write_json(path, payload)
     return payload
 
@@ -177,9 +178,9 @@ def main(argv: list[str]) -> int:
     elif args.cmd == "collect":
         m = collect(run_dir, load_config(args.config))
         emit({"ok": True, "gates": m["gates"], "gate_rates": m["gate_rates"],
-              "actions": m["actions"], "path": str(resolve_path(run_dir, "metrics"))})
+              "actions": m["actions"], "path": str(deliver_path(run_dir, "metrics"))})
     else:
-        m = read_json(resolve_path(run_dir, "metrics"), {}) or {}
+        m = read_json(deliver_path(run_dir, "metrics"), {}) or {}
         emit({"ok": True, "gates": m.get("gates"), "gate_rates": m.get("gate_rates"),
               "llm_calls": m.get("llm_calls"), "actions": m.get("actions")})
     return EX.OK

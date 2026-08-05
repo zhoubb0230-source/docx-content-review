@@ -339,11 +339,15 @@ def r_L06(ctx, seq):
             buckets.setdefault(key, r)
         if len(buckets) >= 2:
             picks = list(buckets.values())[:4]
+            # 批注是给评审人看的，note 里不能出现 kind= / scope= 这类字段名
+            vals = "、".join(f"{r['value']}{r['unit'] or ''}" for r in picks)
+            where = f"（适用范围：{rs[0]['scope']}）" if rs[0].get("scope") else ""
             out.append(make("L06", ctx,
                             [ctx.side(r["pid"], {"value": r["value"], "unit": r["unit"],
                                                  "qualifier": r["qualifier"]}) for r in picks],
                             rs[0]["subject"],
-                            f"kind={kind} 范围={scope or '全局'} 下出现 {len(buckets)} 个不同数值", seq))
+                            f"「{rs[0]['subject']}」的{kind}值出现 {len(buckets)} 种：{vals}{where}",
+                            seq))
     return out
 
 

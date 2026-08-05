@@ -59,7 +59,15 @@ verification:
   verify_batch_size: 10
 
 workspace:
-  output_dir: null              # null = 使用 Agent 当前工作目录
+  # 交付目录：最终产物（审查版 docx / 报告 / issues.xlsx…）落在这里。
+  # null = Agent 当前工作目录。优先级：--output-dir > DOCX_REVIEW_OUTPUT_DIR > 本项 > CWD
+  output_dir: null
+  # 临时目录根：只放中间件（副本、解包、分片、台账、冲突候选…），可整体删除。
+  # null = 按平台取默认值（见下）。优先级：--temp-dir > DOCX_REVIEW_TEMP_DIR > 本项 > 平台默认
+  temp_dir: null
+  temp_dir_windows: "D:\\temp_doc_review"   # Windows 默认临时根
+  temp_dir_posix: null                        # null = 系统临时目录下的 temp_doc_review
+  clean_temp_on_success: false  # 全流程成功后删除本次 run 的临时目录（技能稳定后可开）
   subdir: "docx-review"
   slug_max_chars: 40
   hash_prefix_len: 12
@@ -106,7 +114,13 @@ output:
   author_name: "内容审查"
   max_revisions: 2000
   emit_glossary: true
-  filename_pattern: "{stem}.reviewed.docx"
+  # 交付物命名：{stem}=原文件名（去扩展名），{ts}=时间戳，{ext}=各产物后缀
+  filename_pattern: "{stem}审查版_{ts}{ext}"
+  timestamp_format: "%Y%m%d_%H%M%S"
+  deliver_report: true          # report.md 是否也放到交付目录
+  deliver_issues_xlsx: true
+  deliver_metrics: true
+  deliver_glossary: true
 
 skip:
   code_blocks: true

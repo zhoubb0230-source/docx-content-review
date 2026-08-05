@@ -23,9 +23,12 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from _common import (  # noqa: E402
-    EX, atomic_write_text, emit, now_iso, read_json, read_jsonl, run_cli, version_header,
+    EX, atomic_write_text, emit, now_iso, read_json, read_jsonl, rule_label, run_cli,
+    version_header,
 )
-from workspace import guard_write_path, load_config, resolve_path  # noqa: E402
+from workspace import (  # noqa: E402
+    deliver_meta, deliver_path, guard_write_path, load_config, resolve_path,
+)
 
 SEV_ORDER = {"Critical": 0, "High": 1, "Medium": 2, "Low": 3}
 SEV_CN = {"Critical": "严重", "High": "重要", "Medium": "中等", "Low": "提示"}
@@ -127,8 +130,9 @@ def write_xlsx(run_dir: Path, rows: list[dict]) -> str | None:
         for c in row:
             c.alignment = Alignment(vertical="top", wrap_text=True)
     ws.freeze_panes = "A3"
-    path = resolve_path(run_dir, "issues_xlsx")
+    path = deliver_path(run_dir, "issues_xlsx")
     guard_write_path(path, run_dir)
+    path.parent.mkdir(parents=True, exist_ok=True)
     wb.save(str(path))
     return str(path)
 
@@ -138,7 +142,7 @@ def render_markdown(run_dir: Path, rows: list[dict], cfg: dict) -> str:
     idx = read_json(resolve_path(run_dir, "chunk_index"), {}) or {}
     heads = read_json(resolve_path(run_dir, "headings"), {}) or {}
     gl = read_json(resolve_path(run_dir, "glossary_merged"), {}) or {}
-    metrics = read_json(resolve_path(run_dir, "metrics"), {}) or {}
+    metrics = read_json(deliver_path(run_dir, "metrics"), {}) or {}
     cand = read_json(resolve_path(run_dir, "glossary_candidates"), {}) or {}
     valid = read_json(resolve_path(run_dir, "work") / "validation.json", {}) or {}
     plan = read_json(resolve_path(run_dir, "patchlist"), {}) or {}
@@ -215,7 +219,8 @@ def render_markdown(run_dir: Path, rows: list[dict], cfg: dict) -> str:
         w("以下冲突无法由程序判断孰对孰错，必须人工确认以哪一处为准。")
         w()
         for r in sorted(crit, key=lambda x: (x["heading_path"], x["id"])):
-            w(f"### {r['id']}　{r.get('description') or r['rule_id']}")
+            w(f"### {r['id']}　{rule_label(r['rule_id'])}"
+              f"{'：' + r['description'] if r.get('description') else ''}")
             w()
             w(f"- 章节：{' > '.join(r['heading_path']) or '（文档开头）'}")
             for i, s in enumerate(r.get("sides") or [], 1):
@@ -227,8 +232,8 @@ def render_markdown(run_dir: Path, rows: list[dict], cfg: dict) -> str:
     # 3 分类统计
     w("## 3. 分类统计")
     w()
-    w("| 类别 | 规则 | 计数 | 主要动作 |")
-    w("|---|---|---|---|")
+    w("| 类别 | 问题类型 | 规则号 | 计数 | 主要动作 |")
+    w("|---|---|---|---|---|")
     by_rule = defaultdict(list)
     for r in rows:
         by_rule[r["rule_id"]].append(r)
@@ -236,7 +241,7 @@ def render_markdown(run_dir: Path, rows: list[dict], cfg: dict) -> str:
         rs = by_rule[rule]
         kind = "语病/语义" if rule[0] in "ABC" else "逻辑一致性"
         act = Counter(x["action"] for x in rs).most_common(1)[0][0]
-        w(f"| {kind} | {rule} | {len(rs)} | {act} |")
+        w(f"| {kind} | {rule_label(rule)} | {rule} | {len(rs)} | {act} |")
     w()
 
     # 4 按章节明细
@@ -248,12 +253,13 @@ def render_markdown(run_dir: Path, rows: list[dict], cfg: dict) -> str:
     for chap in sorted(by_chapter, key=lambda c: (len(c), c)):
         w(f"### {' > '.join(chap) or '（文档开头）'}")
         w()
-        w("| id | 严重度 | 规则 | 页 | 原文 | 建议/说明 |")
+        w("| id | 严重度 | 问题类型 | 页 | 原文 | 建议/说明 |")
         w("|---|---|---|---|---|---|")
         for r in by_chapter[chap]:
             orig = r["original_text"].replace("|", "\\|")[:60]
             tail = (r["suggested_text"] or r["note"]).replace("|", "\\|")[:80]
-            w(f"| {r['id']} | {SEV_CN.get(r['severity'])} | {r['rule_id']} | "
+            w(f"| {r['id']} | {SEV_CN.get(r['severity'])} | "
+              f"{rule_label(r['rule_id'])}（{r['rule_id']}） | "
               f"{r.get('page_hint') or '—'} | {orig} | {tail} |")
         w()
 
@@ -339,6 +345,8 @@ def render_markdown(run_dir: Path, rows: list[dict], cfg: dict) -> str:
     w(f"| 术语表来源 | {src_desc} |")
     w(f"| 运行时间 | {man.get('created_at','')} → {now_iso()} |")
     w(f"| 源文档 sha256 | `{(man.get('source_sha256') or '')[:16]}…`（全程只读，未被修改） |")
+    w(f"| 交付目录 | `{man.get('deliver_dir','')}` |")
+    w(f"| 临时目录（中间件，可删） | `{man.get('temp_root','')}` |")
     w()
     w("---")
     w()
@@ -361,22 +369,29 @@ def main(argv: list[str]) -> int:
     run_dir = Path(args.run_dir).resolve()
     cfg = load_config(args.config)
 
+    out_cfg = cfg.get("output") or {}
     rows = load_rows(run_dir, cfg)
     md = render_markdown(run_dir, rows, cfg)
-    path = resolve_path(run_dir, "report")
+
+    # 交付物一律写交付目录（工作目录），不留在临时目录内
+    path = deliver_path(run_dir, "report")
     guard_write_path(path, run_dir)
+    path.parent.mkdir(parents=True, exist_ok=True)
     atomic_write_text(path, md)
-    xlsx = write_xlsx(run_dir, rows)
+    xlsx = write_xlsx(run_dir, rows) if out_cfg.get("deliver_issues_xlsx", True) else None
 
     gl = read_json(resolve_path(run_dir, "glossary_merged"), {})
-    if gl:
-        out = resolve_path(run_dir, "glossary_out")
+    gl_path = None
+    if gl and out_cfg.get("deliver_glossary", True):
+        out = deliver_path(run_dir, "glossary_out")
         guard_write_path(out, run_dir)
         atomic_write_text(out, __import__("json").dumps(gl, ensure_ascii=False, indent=2) + "\n")
+        gl_path = str(out)
 
-    emit({"ok": True, "report": str(path), "issues_xlsx": xlsx, "rows": len(rows),
+    emit({"ok": True, "report": str(path), "issues_xlsx": xlsx, "glossary": gl_path,
+          "deliver_dir": deliver_meta(run_dir)["deliver_dir"], "rows": len(rows),
           "critical": sum(1 for r in rows if r["severity"] == "Critical"),
-          "xlsx_skipped": None if xlsx else "openpyxl 未安装，已跳过 issues.xlsx"})
+          "xlsx_skipped": None if xlsx else "openpyxl 未安装或已关闭，跳过 issues.xlsx"})
     return EX.OK
 
 

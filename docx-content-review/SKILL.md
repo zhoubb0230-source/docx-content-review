@@ -30,8 +30,19 @@ version: 1.1.0
 ### 第 0 步：初始化与续跑判定
 
 ```
-workspace.py init --source <文档路径> [--output-dir <目录>] [--config <yaml>]
+workspace.py init --source <文档路径> [--output-dir <交付目录>] [--temp-dir <临时根>] [--config <yaml>]
 ```
+
+**两个目录，分工明确**：
+
+| 目录 | 放什么 | 默认值 | 可否删除 |
+|---|---|---|---|
+| **交付目录** | 最终产物：审查版 docx、报告、issues.xlsx、metrics、术语表 | Agent 当前工作目录 | 不可，这是交付物 |
+| **临时目录** | 全部中间件：源文档副本、解包目录、分片、台账、冲突候选 | Windows `D:\temp_doc_review`；其他平台系统临时目录下的 `temp_doc_review` | 可整体删除 |
+
+交付物文件名固定为 **`<原文件名>审查版_<时间戳>.<后缀>`**（时间戳格式 `20260805_121153`，
+全流程共用 init 时生成的同一个时间戳）。取交付路径用
+`workspace.py deliver --run-dir <run>`，**不要自己拼**。
 
 返回 `action` 决定下一步：
 
@@ -155,10 +166,17 @@ validate_docx.py --run-dir <run>
 校验通过后打包与出报告：
 
 ```
-unpack.py pack --run-dir <run> --output <run>/output/<原文件名>.reviewed.docx
+unpack.py pack --run-dir <run>      # 不传 --output 即打包到交付目录，文件名自动
 state.py rebuild --run-dir <run>
 metrics.py collect --run-dir <run>
-report.py --run-dir <run>
+report.py --run-dir <run>           # 报告/xlsx/术语表同样直接写交付目录
+```
+
+全部完成后把交付目录里的文件路径报给用户。若用户要求清理中间件：
+
+```
+state.py stage --run-dir <run> --value completed
+workspace.py clean-temp --run-dir <run>     # 只删临时目录，交付物不受影响
 ```
 
 ---
@@ -171,13 +189,15 @@ report.py --run-dir <run>
 |---|---|---|---|
 | `workspace.py init` | 建工作目录、复制源文档、续跑判定 | `--source` | run_dir / action / lease |
 | `workspace.py locate` | 只查已有文档目录 | `--source` | doc_dir / stage |
-| `workspace.py resolve` | 取标准路径 | `--run-dir --kind` | path |
+| `workspace.py resolve` | 取临时目录内的标准路径 | `--run-dir --kind` | path |
+| `workspace.py deliver` | 取交付物最终路径 | `--run-dir [--kind]` | 交付目录 + 各产物路径 |
+| `workspace.py clean-temp` | 删除本次 run 的临时目录 | `--run-dir` | 已删路径 + 保留的交付物 |
 | `workspace.py lease` | 租约 status/acquire/takeover/heartbeat/verify/release | `--doc-dir --session` | owner |
 | `workspace.py claim` | 分片 next/renew/release/status | `--run-dir --session` | chunk |
 | `env_probe.py` | 环境探测 | `--require-doc` | converters / can_convert_doc |
 | `convert_doc.py` | doc→docx（输出路径显式指定） | `--run-dir` | docx |
 | `unpack.py run` | 解包 + 合并 run + 记录 D9 基线 | `--run-dir` | 合并统计 |
-| `unpack.py pack` | 重新打包 | `--run-dir --output` | docx |
+| `unpack.py pack` | 重新打包；默认写交付目录 | `--run-dir [--output]` | docx |
 | `extract.py` | 段落抽取 + 标题树 + 页码估算 | `--run-dir` | paragraphs / headings |
 | `glossary_scan.py` | 候选术语预筛 + 概念族聚类 | `--run-dir` | candidates / batches |
 | `import_glossary.py` | 术语表导入 + 自检 + 三层合并 | `--run-dir --authoritative --fallback` | entries / layers |
@@ -208,6 +228,10 @@ report.py --run-dir <run>
 **`apply_threshold` 恒为 `conservative`，用户要求放宽也不行**——告诉用户报告可以更宽，但落笔门槛不放。
 
 **修订还是批注** —— 不用你判断，脚本已决定：唯一确定的正确替换 → 修订；无唯一答案（歧义、指代不明、逻辑冲突）→ 批注；仅风格倾向 → 只进报告。
+
+**批注和报告里怎么称呼问题** —— 脚本已经把规则号译成了中文（「前后数值不一致」「的/地/得误用」），
+规则号只作为末尾的可追溯标记。**转述给用户时也用中文说法，不要念规则号**——
+评审人看到「L06」不知道是什么。
 
 **遇到 exit 9（NOT_OWNER）** —— 不重试、不降级。转达为人话：本会话写入权限已失效，该文档已被另一个会话接管；已完成的分片结果仍然有效并已保留；建议切换到另一个会话查看进度，或选择「独立重跑」。
 

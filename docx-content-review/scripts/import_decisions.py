@@ -34,7 +34,7 @@ from _common import (  # noqa: E402
     EX, atomic_write_json, atomic_write_jsonl, die, emit, normalize_width, normalize_ws,
     now_iso, read_json, read_jsonl, run_cli, sha256_text,
 )
-from workspace import guard_write_path, load_config, resolve_path  # noqa: E402
+from workspace import deliver_path, guard_write_path, load_config, resolve_path  # noqa: E402
 
 SCHEMA_VERSION = "1"
 
@@ -65,7 +65,7 @@ def cmd_import(run_dir: Path, cfg: dict, xlsx: Path | None) -> dict:
     except ImportError:
         die(EX.ENV, "读取 issues.xlsx 需要 openpyxl（pip install openpyxl）")
 
-    path = xlsx or resolve_path(run_dir, "issues_xlsx")
+    path = xlsx or deliver_path(run_dir, "issues_xlsx")
     if not path.exists():
         die(EX.USAGE, f"未找到标注后的 issues.xlsx：{path}")
     wb = load_workbook(str(path), read_only=True, data_only=True)

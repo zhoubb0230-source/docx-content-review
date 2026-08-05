@@ -31,9 +31,11 @@ jget() { python3 -c "import json,sys;d=json.load(sys.stdin);print(eval('d'+sys.a
 cleanup(){ [ "$KEEP" = 1 ] && echo "工作目录保留于 $WORK" || rm -rf "$WORK"; }
 trap cleanup EXIT
 
+DELIVER="$WORK/deliver"; TEMP="$WORK/temp"
+mkdir -p "$DELIVER" "$TEMP"
 init_run() {   # $1=fixture 名，回显 run_dir
-  python3 "$S/workspace.py" init --source "$F/$1" --output-dir "$WORK" \
-    | jget "['run_dir']"
+  python3 "$S/workspace.py" init --source "$F/$1" \
+    --output-dir "$DELIVER" --temp-dir "$TEMP" | jget "['run_dir']"
 }
 seed_facts() { # $1=run_dir  $2=facts fixture —— 按锚点文本回填 pid
   python3 - "$1" "$F/$2" <<'PY'
@@ -69,8 +71,8 @@ check "技能目录无运行期写入" \
 mkdir -p "$WORK/srcA" "$WORK/srcB"
 cp "$F/sample-basic.docx" "$WORK/srcA/dup.docx"
 cp "$F/logic-injection.docx" "$WORK/srcB/dup.docx"
-RUN_A=$(python3 "$S/workspace.py" init --source "$WORK/srcA/dup.docx" --output-dir "$WORK" | jget "['run_dir']")
-RUN_B=$(python3 "$S/workspace.py" init --source "$WORK/srcB/dup.docx" --output-dir "$WORK" | jget "['run_dir']")
+RUN_A=$(python3 "$S/workspace.py" init --source "$WORK/srcA/dup.docx" --output-dir "$DELIVER" --temp-dir "$TEMP" | jget "['run_dir']")
+RUN_B=$(python3 "$S/workspace.py" init --source "$WORK/srcB/dup.docx" --output-dir "$DELIVER" --temp-dir "$TEMP" | jget "['run_dir']")
 check "同名不同容文档产物隔离" "$([ "$(dirname "$RUN_A")" != "$(dirname "$RUN_B")" ] && echo yes || echo no)" yes
 
 echo
@@ -220,22 +222,65 @@ python3 "$S/metrics.py" collect --run-dir "$RUN2" >/dev/null
 RP=$(python3 "$S/report.py" --run-dir "$RUN2")
 ge "报告条目数" "$(echo "$RP" | jget "['rows']")" 20
 ge "严重级人工确认项" "$(echo "$RP" | jget "['critical']")" 3
-for f in report.md issues.xlsx metrics.json; do
-  [ -s "$RUN2/output/$f" ] && ok "产出 $f" || bad "缺少 $f"
+DLV=$(python3 "$S/workspace.py" deliver --run-dir "$RUN2")
+for k in report issues_xlsx metrics glossary_out; do
+  P=$(echo "$DLV" | jget "['paths']['$k']")
+  [ -s "$P" ] && ok "产出 $k" || bad "缺少 $k（$P）"
 done
-python3 -c "
+python3 - "$(echo "$DLV" | jget "['paths']['metrics']")" <<'PYEOF'
 import sys,json
-m=json.load(open('$RUN2/output/metrics.json',encoding='utf-8'))
-sys.exit(0 if 'gates' in m and 'gate_rates' in m else 1)"
+m=json.load(open(sys.argv[1],encoding="utf-8"))
+sys.exit(0 if "gates" in m and "gate_rates" in m else 1)
+PYEOF
 check "metrics.json 含四项闸门丢弃率" "$?" 0
 
 echo
-python3 "$S/workspace.py" init --source "$WORK/srcA/dup.docx" --output-dir "$WORK/srcA" >/dev/null 2>&1
-check "输出根不得等于源文档所在目录" "$?" 6
+python3 "$S/workspace.py" init --source "$WORK/srcA/dup.docx" --temp-dir "$WORK/srcA" >/dev/null 2>&1
+check "临时根不得等于源文档所在目录" "$?" 6
 
 BEFORE_ALL=$(sha256sum "$F"/*.docx | sha256sum)
 check "全部 fixture 文档 sha256 未被改动" \
   "$([ "$(sha256sum "$F"/*.docx | sha256sum)" = "$BEFORE_ALL" ] && echo yes || echo no)" yes
+
+echo
+echo "══ 8. 交付路由、命名与批注可读性 ══"
+D=$(python3 "$S/workspace.py" deliver --run-dir "$RUN2")
+DDIR=$(echo "$D" | jget "['deliver_dir']")
+check "交付目录 = 工作目录（非临时目录）" \
+  "$([ "$DDIR" = "$DELIVER" ] && echo yes || echo no)" yes
+DOCX=$(echo "$D" | jget "['paths']['reviewed_docx']")
+STEM=$(basename "$DOCX")
+echo "$STEM" | grep -qE '^logic-injection审查版_[0-9]{8}_[0-9]{6}\.docx$' \
+  && ok "交付物命名格式（$STEM）" || bad "交付物命名格式不符：$STEM"
+for k in report issues_xlsx metrics glossary_out; do
+  P=$(echo "$D" | jget "['paths']['$k']")
+  case "$P" in "$DELIVER"/*) ok "$k 落在交付目录";; *) bad "$k 落在 $P";; esac
+done
+python3 "$S/unpack.py" pack --run-dir "$RUN2" >/dev/null
+[ -s "$DOCX" ] && ok "审查版 docx 已产出到交付目录" || bad "审查版 docx 未产出"
+TMPLEFT=$(find "$TEMP" -maxdepth 4 -name '*审查版*' | wc -l)
+check "临时目录内不残留交付物" "$TMPLEFT" 0
+
+# 批注正文必须是中文说法，规则号只作末尾标记
+python3 "$S/apply_comments.py" plan --run-dir "$RUN2" >/dev/null
+python3 - "$RUN2" <<'PYEOF'
+import json,sys
+items=json.load(open(f"{sys.argv[1]}/work/commentlist.json",encoding="utf-8"))["comments"]
+bad=[i for i in items if i["text"].startswith("【L") or i["text"].startswith("【A")]
+raw=[i for i in items if "kind=" in i["text"] or "scope=" in i["text"]]
+sys.exit(0 if not bad and not raw and items else 1)
+PYEOF
+check "批注正文无裸规则号/字段名" "$?" 0
+python3 - "$RUN2" <<'PYEOF'
+import json,sys
+items=json.load(open(f"{sys.argv[1]}/work/commentlist.json",encoding="utf-8"))["comments"]
+# 「以哪一处为准」只能出现在两侧为互斥表述的规则上
+wrong=[i for i in items if "以哪一处为准" in i["text"]
+       and any(r in i["text"] for r in ("L03","L08","L10","L13","L16","L18","L19","L24",
+                                        "L29","L30","L31","L32"))]
+sys.exit(0 if not wrong else 1)
+PYEOF
+check "非互斥类规则不套用「以哪一处为准」" "$?" 0
 
 echo
 printf '通过 \033[32m%d\033[0m，失败 \033[31m%d\033[0m\n' "$PASS" "$FAIL"
