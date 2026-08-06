@@ -521,6 +521,8 @@ Token 量级：输入约 **300 万**，输出约 25 万。
 3. **长度校验**：`original_text` 长度须在 4–120 字之间。过短无法定位，过长说明模型在圈整段。
 4. **单片上限**：每片最多上报 `max_issues_per_chunk`（默认 20）。超出按 severity 排序截断，并在该片记录 `truncated: true`。此项用于抑制模型"凑数"倾向。
 
+   **但必须为 B 类保留下限席位**（`min_b_class_slots`，默认 5）。纯按 severity 截断在这里会退化成按类别截断：A 类恒 `High`、B 类恒 `Medium`，于是一片里只要 A 类满 20 条，B 类就一条都出不来——指代不明、歧义、主客体颠倒会被错别字与标点整组挤掉。这与 §9.7 论证错别字必须独立配额的机制相同（配额挤占 + 重要性排挤），只是受害者换成了 B 类；B 类与 A 类同出一次调用，拆不成独立通道，因此改为保底席位。
+
 ### 闸门③ 不改清单（脚本 + prompt 双层，`references/never-flag.md`）
 
 以下情形**明确禁止上报**，并在 prompt 中以**反例 few-shot** 形式给出（每条至少 2 个具体反例）：
@@ -1386,6 +1388,7 @@ chunking:
   token_fallback_ratio: 1.6     # tokenizer 不可得时的保守系数
   overlap_paragraphs: 2
   max_issues_per_chunk: 20
+  min_b_class_slots: 5          # 截断时为 B 类保留的下限席位（§8 闸门②）
 
 logic:
   gap_ratio: 3                  # L27 目标值与实测值差异倍数阈值

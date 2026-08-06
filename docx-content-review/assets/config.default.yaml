@@ -17,6 +17,8 @@ chunking:
   token_fallback_ratio: 1.6     # tokenizer 不可得时的保守系数
   overlap_paragraphs: 2
   max_issues_per_chunk: 20
+  min_b_class_slots: 5          # 截断时为 B 类保留的下限席位。A 类恒 High、B 类恒 Medium，
+                                # 纯按 severity 截断会让 B 类被 A 类整组挤掉（同 §9.7 的配额挤占）
   instruction_tokens: 9000      # 技能指令 + 类型体系 + 不改清单
   glossary_tokens: 4000         # 术语表摘要预算
   output_reserve_tokens: 12000  # 输出预留

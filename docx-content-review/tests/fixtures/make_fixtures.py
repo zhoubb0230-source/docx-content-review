@@ -53,10 +53,18 @@ def build_basic(outdir: Path) -> None:
     d.add_heading("1 系统概述", level=1)
     p = d.add_paragraph("本系统采用微服务架构，支撑全公司的研发协同需求。")
 
-    def pos(text, category, original, suggested, note=""):
+    def pos(text, category, original, suggested, note="", expect="revision"):
+        """expect：该条经闸门②之后应当变成什么。
+
+        `revision` = 建议能落笔；`comment` = 建议必然超出该类别的修改幅度，
+        应被降级为批注。**降级不是失败，是闸门在拒绝改写。**
+        A 类的定义是「有唯一正确答案」，凡是只能靠重写才能改对的，
+        本来就不该以修订形式落笔。
+        """
         d.add_paragraph(text)
         answers["positive"].append({"category": category, "original_text": original,
-                                    "suggested_text": suggested, "note": note})
+                                    "suggested_text": suggested, "note": note,
+                                    "expect": expect})
 
     d.add_heading("2 已知问题样本", level=1)
     # A1 错别字
@@ -74,14 +82,18 @@ def build_basic(outdir: Path) -> None:
     # A4 成分残缺
     pos("通过本次架构升级，使系统的整体吞吐能力得到显著提升。", "A5", "通过本次架构升级，使系统",
         "本次架构升级使系统", "介词滥用致主语残缺，修法含删除故归 A5")
-    pos("为了保证数据安全，必须对所有出域数据进行。", "A4", "进行。", "进行加密。", "缺宾语中心语")
+    pos("为了保证数据安全，必须对所有出域数据进行。", "A4",
+        "对所有出域数据进行。", "对所有出域数据进行加密。",
+        "缺宾语中心语；跨度取到 4 字以上才定位得住（min_span_chars=4）")
     pos("能否顺利上线，取决于团队持续投入。", "A4", "取决于团队持续投入",
         "取决于团队能否持续投入", "两面对一面，纯增补")
     # A5 搭配不当
     pos("本阶段的主要任务是提高研发人员的工作积极性和工作水平。", "A5", "提高研发人员的工作积极性和工作水平",
-        "调动研发人员的工作积极性、提高其工作水平", "动宾搭配不当")
+        "调动研发人员的工作积极性、提高其工作水平",
+        "动宾搭配不当；一个动词辖两个宾语，只能重写不能最小修改", expect="comment")
     pos("该方案降低了系统的可用性和运维成本。", "A5", "降低了系统的可用性和运维成本",
-        "提升了系统的可用性、降低了运维成本", "一动带两宾搭配矛盾")
+        "提升了系统的可用性、降低了运维成本",
+        "一动带两宾搭配矛盾；同样只能重写", expect="comment")
     pos("我们改善了平台的响应速度问题。", "A5", "改善了平台的响应速度问题", "改善了平台的响应速度", "")
     # A6 关联词
     pos("虽然当前架构存在瓶颈，因此我们启动了本次重构。", "A6", "虽然当前架构存在瓶颈，因此",

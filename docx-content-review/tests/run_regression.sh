@@ -450,5 +450,109 @@ PD=$(python3 "$S/scan_patterns.py" scan --run-dir "$RUN3")
 check "pattern_review 关闭时不产生任何候选" "$(echo "$PD" | jget "['candidates']")" 0
 
 echo
+echo "══ 10. 截断的类别偏差与答案清单的闸门期望 ══"
+
+mkdir -p "$WORK/sb"
+cp "$F/sample-basic.docx" "$WORK/sb/sample-basic.docx"
+RUN4=$(cd "$WORK/sb" && python3 "$S/workspace.py" init --source "$WORK/sb/sample-basic.docx" | jget "['run_dir']")
+for c in "unpack.py run" "extract.py" "import_glossary.py" "chunk.py"; do
+  python3 "$S/${c%% *}" ${c#* } --run-dir "$RUN4" >/dev/null 2>&1 || \
+  python3 "$S/${c%% *}" --run-dir "$RUN4" >/dev/null
+done
+
+# 把答案清单灌进闸门②：它的 expect 字段声明了每条应当变成修订还是被降级为批注
+python3 - "$RUN4" "$F/sample-basic.answers.json" <<'PYEOF'
+import json,pathlib,sys
+run,key=sys.argv[1],json.load(open(sys.argv[2],encoding="utf-8"))
+paras=[json.loads(l) for l in open(f"{run}/work/paragraphs.jsonl",encoding="utf-8")]
+rows=[]
+for e in key["positive"]:
+    pid=next((p["pid"] for p in paras if e["original_text"] in p["text"]),None)
+    if not pid:
+        print("答案清单条目在正文中找不到：", e["original_text"]); sys.exit(1)
+    rows.append({"pid":pid,"category":e["category"],"original_text":e["original_text"],
+                 "suggested_text":e.get("suggested_text",""),"evidence":"答案清单",
+                 "severity":"High" if e["category"][0]=="A" else "Medium"})
+pathlib.Path(run,"work","issues").mkdir(parents=True,exist_ok=True)
+pathlib.Path(run,"work","issues","key.raw.jsonl").write_text(
+    "".join(json.dumps(r,ensure_ascii=False)+"\n" for r in rows),encoding="utf-8")
+PYEOF
+check "答案清单每条都能在正文中逐字定位" "$?" 0
+K="$RUN4/work/issues"
+python3 "$S/verify_span.py" --run-dir "$RUN4" --chunk 0001 \
+  --in "$K/key.raw.jsonl" --out "$K/key.jsonl" --cap 99 >/dev/null
+python3 - "$K/key.jsonl" "$F/sample-basic.answers.json" <<'PYEOF'
+import json,sys
+got={ (r["category"], r["original_text"]): r for r in
+      (json.loads(l) for l in open(sys.argv[1],encoding="utf-8")) }
+key=json.load(open(sys.argv[2],encoding="utf-8"))["positive"]
+bad=[]
+for e in key:
+    r=got.get((e["category"], e["original_text"]))
+    if r is None:
+        bad.append(f'{e["category"]} {e["original_text"][:16]} 被闸门丢弃'); continue
+    want=e.get("expect","revision")
+    # expect=revision → 建议必须留下；expect=comment → 建议必须被清空（降级）
+    if want=="revision" and e.get("suggested_text") and not r["suggested_text"]:
+        bad.append(f'{e["category"]} {e["original_text"][:16]} 本应落笔却被降级：{r["gate_note"]}')
+    if want=="comment" and r["suggested_text"]:
+        bad.append(f'{e["category"]} {e["original_text"][:16]} 本应降级却落了笔')
+for b in bad: print("  ", b)
+sys.exit(1 if bad else 0)
+PYEOF
+check "闸门②对每条答案的处置与 expect 一致（含两条只能重写的 A5 被降级）" "$?" 0
+
+# 截断不得按类别整组砍：A 类恒 High、B 类恒 Medium，纯按 severity 排序会让 B 类全灭
+python3 "$S/verify_span.py" --run-dir "$RUN4" --chunk 0001 \
+  --in "$K/key.raw.jsonl" --out "$K/capped.jsonl" >/dev/null
+python3 - "$K/capped.jsonl" <<'PYEOF'
+import json,sys
+rows=[json.loads(l) for l in open(sys.argv[1],encoding="utf-8")]
+b=[r for r in rows if r["category"].startswith("B")]
+print(f"   截断后保留 {len(rows)} 条，其中 B 类 {len(b)} 条")
+sys.exit(0 if len(b)>=5 else 1)
+PYEOF
+check "28 条正例过 cap=20 后，B 类保底席位未被 A 类挤占" "$?" 0
+
+# 保底席位的边界：它是为了让少数类不被整组挤掉，不能反过来让 B 类独占配额
+python3 - "$RUN4" "$K" "$S" <<'PYEOF'
+import json,pathlib,subprocess,sys
+run,I,S=sys.argv[1],sys.argv[2],sys.argv[3]
+rows=[json.loads(l) for l in open(f"{I}/key.raw.jsonl",encoding="utf-8")]
+A=[r for r in rows if r["category"].startswith("A")]
+B=[r for r in rows if r["category"].startswith("B")]
+def case(subset, cap):
+    pathlib.Path(I,"edge.raw.jsonl").write_text(
+        "".join(json.dumps(r,ensure_ascii=False)+"\n" for r in subset),encoding="utf-8")
+    cmd=["python3",f"{S}/verify_span.py","--run-dir",run,"--chunk","0001",
+         "--in",f"{I}/edge.raw.jsonl","--out",f"{I}/edge.jsonl","--cap",str(cap)]
+    subprocess.run(cmd,capture_output=True,text=True)
+    got=[json.loads(l) for l in open(f"{I}/edge.jsonl",encoding="utf-8")]
+    return (sum(1 for r in got if r["category"].startswith("A")),
+            sum(1 for r in got if r["category"].startswith("B")))
+bad=[]
+if case(A, 20)[1] != 0:                bad.append("无 B 类时不应凭空保留 B")
+if case(A+B[:2], 20)[1] != 2:          bad.append("B 类少于席位数时应全留")
+if case(A+B, 1) != (1, 0):             bad.append("cap=1 时应让位给高严重度项，而不是给 B 类")
+a3,b3 = case(A+B, 3)
+if b3 > 1 or a3 < 2:                   bad.append(f"cap=3 时席位应压到 1（得到 A{a3}+B{b3}）")
+for x in bad: print("   ", x)
+sys.exit(1 if bad else 0)
+PYEOF
+check "保底席位边界：无 B 类/不足席位/cap 小于席位数时不反噬 A 类" "$?" 0
+
+# 负样本集：34 段合法表达，任何一条上报都是误报
+mkdir -p "$WORK/ns"
+cp "$F/negative-set.docx" "$WORK/ns/negative-set.docx"
+RUN5=$(cd "$WORK/ns" && python3 "$S/workspace.py" init --source "$WORK/ns/negative-set.docx" | jget "['run_dir']")
+python3 "$S/unpack.py" run --run-dir "$RUN5" >/dev/null
+python3 "$S/extract.py" --run-dir "$RUN5" >/dev/null
+python3 "$S/import_glossary.py" --run-dir "$RUN5" >/dev/null
+python3 "$S/chunk.py" --run-dir "$RUN5" >/dev/null
+# 错别字通道在纯合法文本上必须零候选——负样本里有「其它」「渡口」这类词表边界情形
+TN=$(python3 "$S/typo_scan.py" scan --run-dir "$RUN5")
+check "负样本集上错别字通道零候选" "$(echo "$TN" | jget "['candidates']")" 0
+
+echo
 printf '通过 \033[32m%d\033[0m，失败 \033[31m%d\033[0m\n' "$PASS" "$FAIL"
 [ "$FAIL" -eq 0 ]

@@ -277,12 +277,36 @@ def process(run_dir: Path, chunk_id: str, raw_path: Path, cfg: dict,
     counters["neverflag_by_rule"] = nf_hits
     kept = survivors
 
-    # ④ 单片上限：超出按 severity 排序截断
+    # ④ 单片上限：超出按 severity 排序截断，但为 B 类保留下限席位。
+    #
+    # 纯按 severity 截断在这里会退化成按类别截断：A 类恒 High、B 类恒 Medium，
+    # 于是一片里只要 A 类满 20 条，B 类就一条也出不来——指代不明、歧义、主客颠倒
+    # 会被错别字和标点整组挤掉。这与 spec §9.7 论证错别字必须独立配额的机制相同
+    # （配额挤占 + 重要性排挤），只是受害者换成了 B 类。
+    # B 类与 A 类同出一次调用，拆不成独立通道，因此改为保底席位。
     kept.sort(key=lambda r: (severity_rank(r["severity"]), r["pid"]))
     truncated = False
     if len(kept) > cap:
-        counters["truncated"] = len(kept) - cap
-        kept = kept[:cap]
+        floor = int((cfg.get("chunking") or {}).get("min_b_class_slots") or 0)
+        b_items = [r for r in kept if r["category"] in B_CLASSES]
+        # 席位数不得超过配额的一半：保底是为了让少数类不被整组挤掉，
+        # 不是为了反过来让它独占。cap 小于席位数时（如 --cap 1）必须让位给高严重度项。
+        reserved = min(len(b_items), floor, cap // 2)
+        head = [r for r in kept if r["category"] not in B_CLASSES][:cap - reserved]
+        head_keys = {(r["pid"], r["category"]) for r in head}
+        # 先按原顺序补满 B 类保底席位，再用剩余名额按严重度回填
+        picked = head + b_items[:reserved]
+        picked_keys = head_keys | {(r["pid"], r["category"]) for r in b_items[:reserved]}
+        for r in kept:
+            if len(picked) >= cap:
+                break
+            if (r["pid"], r["category"]) not in picked_keys:
+                picked.append(r)
+                picked_keys.add((r["pid"], r["category"]))
+        picked.sort(key=lambda r: (severity_rank(r["severity"]), r["pid"]))
+        counters["truncated"] = len(kept) - len(picked)
+        counters["b_class_reserved"] = reserved
+        kept = picked
         truncated = True
     counters["kept"] = len(kept)
 
