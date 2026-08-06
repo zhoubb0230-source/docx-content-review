@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""错别字候选扫描（spec §9.7，M8；v1 默认关闭，接口已就位）。
+"""错别字候选扫描（spec §9.7，M8）。
 
 **为什么必须是独立通道**：错别字是唯一一个存在确定性候选生成手段的类别，
 让 LLM 扫描它先天不利——
@@ -14,7 +14,13 @@
 
 子命令
   scan   扫描候选 → work/typos/typos-<chunk>.json（含供 LLM 裁定的分批 payload）
-  merge  合并裁定结果 → 追加到 issues-<chunk>.jsonl，类别记为 A1
+  merge  合并裁定结果 → work/issues/issues-<chunk>.typos.jsonl，类别记为 A1
+
+**召回率上限 = common-typos.txt 的覆盖范围。** 未登录词检测（切词后查不到的词即可疑）
+能突破这个上限，但需 5 万词级词表才有信噪比，内置词表远未达到该规模，故不启用
+（config: typo_check.oov_detection）。扩表是提升召回的唯一杠杆，且是可枚举、
+可收敛的资产——与 never-flag 同性质。**不要靠放宽闸门②的 A1 阈值来提召回。**
+
 退出码：0 成功。
 """
 from __future__ import annotations
@@ -63,11 +69,9 @@ def scan(run_dir: Path, cfg: dict, chunk_id: str | None) -> dict:
     tc = cfg.get("typo_check") or {}
     if not tc.get("enabled"):
         return {"enabled": False, "candidates": 0,
-                "note": "typo_check.enabled=false（v1 默认关闭）"}
+                "note": "typo_check.enabled=false"}
 
     typos = _load_pairs("common-typos.txt")
-    shape = _load_pairs("confusion-shape.txt")
-    pinyin = _load_pairs("confusion-pinyin.txt")
     whitelist = _load_list("typo-whitelist.txt")
     glossary = read_json(resolve_path(run_dir, "glossary_merged"), {}) or {}
 
@@ -110,11 +114,11 @@ def scan(run_dir: Path, cfg: dict, chunk_id: str | None) -> dict:
                                           else "glossary-forbidden",
                                   "reason": why, "context": text[lo:hi],
                                   "original_text": text[lo:hi]})
-            for a, b, _ in shape + pinyin:
-                if len(a) != 1 or a not in text:
-                    continue
-                # 单字混淆集只在命中常见错词表之外时作为弱候选，交由 LLM 裁定
-                continue
+            # 单字混淆集（shape / pinyin）**刻意不用于生成候选**：
+            # 按单字命中会把「度」「作」「帐」这类高频字全部拉成候选，噪音淹没一切。
+            # 它要有信噪比，前提是先做分词 + 未登录词检测——而未登录词检测需要
+            # 5 万词级词表，内置词表远未达到该规模（config: typo_check.oov_detection）。
+            # 这两份词表目前只作为写 common-typos.txt 时的人工参照，不参与运行期判定。
         cap = int(tc.get("max_typos_per_chunk") or 100)
         truncated = len(cands) > cap
         cands = cands[:cap]                    # 独立配额，不占用 max_issues_per_chunk
@@ -161,7 +165,8 @@ def merge(run_dir: Path, cfg: dict, chunk_id: str) -> dict:
     guard_write_path(out, run_dir)
     atomic_write_jsonl(out, rows)
     return {"merged": len(rows), "path": str(out),
-            "note": "需再过 verify_span.py 与 filter_neverflag.py 两道闸门"}
+            "note": "需再过 verify_span.py（--in/--out 指向本文件、--cap 用独立配额）"
+                    "与 filter_neverflag.py（--file 指向本文件）"}
 
 
 def main(argv: list[str]) -> int:

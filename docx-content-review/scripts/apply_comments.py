@@ -87,12 +87,16 @@ def build_plan(run_dir: Path, cfg: dict) -> dict:
         if rec.get("action") == "report_only" and iid not in demoted:
             continue                                  # 仅风格倾向：只进报告，不入文档
         cat = rec.get("category") or ""
-        lines = [rule_label(cat)]
+        # P 类的抬头用规则包里的范式名（「风险条目描述范式」），比通用标签具体得多；
+        # 可追溯标记也用规则号本身（P-RISK-01），否则评审人无从查是哪条范式。
+        rid = rec.get("rule_id") or cat
+        head = rec["pattern_name"] if cat == "P1" and rec.get("pattern_name") else rule_label(cat)
+        lines = [head]
         if rec.get("evidence"):
             lines.append(rec["evidence"])
         if rec.get("suggested_text"):
             lines.append(f"建议改为：{rec['suggested_text']}")
-        lines.append(f"（检测规则 {cat}）")
+        lines.append(f"（检测规则 {rid}）")
         items.append({
             "comment_id": None, "pid": rec["pid"], "anchor": rec.get("original_text") or "",
             "severity": rec.get("severity") or "Medium",

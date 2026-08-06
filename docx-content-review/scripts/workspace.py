@@ -80,6 +80,7 @@ KINDS = {
     "conflicts_verified": "work/conflicts-verified.jsonl",
     "issues_verified": "work/issues-verified.jsonl",
     "typos": "work/typos",
+    "patterns": "work/patterns",
     "patchlist": "work/patchlist.json",
     # 以下四项是 run 内的暂存位置。**最终交付物不在这里**——
     # 交付路径由 deliver_path() 依 manifest 的 deliver_dir 解析（见 DELIVERABLES）。
@@ -221,7 +222,10 @@ def resolve_temp_root(cli_dir: str | None, cfg: dict, source: Path | None,
     if not explicit:
         return deliver_root          # 已由 resolve_deliver_root 校验过
     root = Path(explicit).expanduser().resolve()
-    return _validate_root(root, source, "临时目录", allow_source_dir=True)
+    # 交付目录可以是源文档所在目录（产物带"审查版_时间戳"后缀，不会覆盖原件），
+    # 但**显式指定的临时根不行**——中间件会在那里建整棵目录树并反复读写，
+    # 那是源文档所在的地方。CWD 仍是例外，由 _validate_root 内部放行。
+    return _validate_root(root, source, "临时目录", allow_source_dir=False)
 
 
 def _rand_suffix(n: int = 4) -> str:

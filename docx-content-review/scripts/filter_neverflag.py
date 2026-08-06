@@ -23,7 +23,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from _common import (  # noqa: E402
-    EX, atomic_write_json, atomic_write_jsonl, emit, normalize_key, normalize_width,
+    EX, atomic_write_json, atomic_write_jsonl, die, emit, normalize_key, normalize_width,
     read_json, read_jsonl, run_cli,
 )
 from workspace import guard_write_path, load_config, resolve_path  # noqa: E402
@@ -128,6 +128,12 @@ def check(issue: dict, para: dict | None, cfg: dict, glossary: dict,
     if any(rx.search(ptext.strip()) for rx in CAPTION_PATTERNS):
         return "N12"
 
+    # P 类到此为止：N7/N8/N13/N14 判的是「改动本身该不该做」，而 P 类不改任何字，
+    # 它的 original_text 是整个段落。拿整段去撞 fallback 术语表必然命中，
+    # 会把所有范式条目误杀——位置类规则（N9/N10/N11/N12）已在上面判过，够了。
+    if cat in ("P1",):
+        return None
+
     # N7 术语的合法别名
     if sugg:
         a, b = normalize_key(text), normalize_key(sugg)
@@ -157,8 +163,10 @@ def check(issue: dict, para: dict | None, cfg: dict, glossary: dict,
 
 
 def process_chunk(run_dir: Path, chunk_id: str, cfg: dict, paras: dict,
-                  glossary: dict, groups, fallback) -> dict:
-    path = resolve_path(run_dir, "issues") / f"issues-{chunk_id}.jsonl"
+                  glossary: dict, groups, fallback, path: Path | None = None) -> dict:
+    # path 供侧通道（错别字/范式）使用：它们的产物是 issues-<chunk>.<通道>.jsonl，
+    # 就地过滤，与主通道互不覆盖。
+    path = Path(path) if path else resolve_path(run_dir, "issues") / f"issues-{chunk_id}.jsonl"
     if not path.exists():
         return {"chunk_id": chunk_id, "skipped": True}
     kept, hits = [], {}
@@ -170,7 +178,8 @@ def process_chunk(run_dir: Path, chunk_id: str, cfg: dict, paras: dict,
         kept.append(rec)
     guard_write_path(path, run_dir)
     atomic_write_jsonl(path, kept)
-    meta = resolve_path(run_dir, "issues") / f"issues-{chunk_id}.neverflag.json"
+    stem = path.name[:-len(".jsonl")] if path.name.endswith(".jsonl") else path.name
+    meta = path.parent / f"{stem}.neverflag.json"
     guard_write_path(meta, run_dir)
     total = sum(hits.values())
     atomic_write_json(meta, {"chunk_id": chunk_id, "dropped": total, "by_rule": hits,
@@ -183,6 +192,8 @@ def main(argv: list[str]) -> int:
     ap.add_argument("--run-dir")
     ap.add_argument("--chunk")
     ap.add_argument("--all", action="store_true")
+    ap.add_argument("--file", help="直接指定要过滤的 issues 文件；"
+                                   "侧通道（错别字/范式）用它指向自己的产物")
     ap.add_argument("--config")
     ap.add_argument("--probe", help="直接检查一段文本（调试用）")
     ap.add_argument("--category", default="A5")
@@ -207,7 +218,11 @@ def main(argv: list[str]) -> int:
                      if p.name.count(".") == 1)
     elif args.chunk:
         ids = [args.chunk]
-    results = [process_chunk(run_dir, c, cfg, paras, glossary, groups, fallback) for c in ids]
+    target = Path(args.file) if args.file else None
+    if target and not args.chunk:
+        die(EX.USAGE, "--file 必须与 --chunk 一起使用")
+    results = [process_chunk(run_dir, c, cfg, paras, glossary, groups, fallback, target)
+               for c in ids]
     emit({"ok": True, "chunks": len(results),
           "dropped": sum(r.get("dropped", 0) for r in results),
           "kept": sum(r.get("kept", 0) for r in results),

@@ -32,7 +32,7 @@ from workspace import (  # noqa: E402
 
 SEV_ORDER = {"Critical": 0, "High": 1, "Medium": 2, "Low": 3}
 SEV_CN = {"Critical": "严重", "High": "重要", "Medium": "中等", "Low": "提示"}
-CATEGORY_WEIGHT = {"A": 1.0, "B": 0.7, "C": 0.3, "L": 1.0}
+CATEGORY_WEIGHT = {"A": 1.0, "B": 0.7, "C": 0.3, "L": 1.0, "P": 0.6}
 COLUMNS = ["id", "严重度", "priority_score", "类别", "规则ID", "章节路径", "页码",
            "原文", "建议", "动作", "复核结果", "记忆命中", "人工决策", "备注"]
 
@@ -68,6 +68,7 @@ def load_rows(run_dir: Path, cfg: dict) -> list[dict]:
             "verify": (r.get("verify") or {}).get("result") or "n/a",
             "memory_hit": bool(r.get("memory_hit")),
             "note": r.get("gate_note") or r.get("evidence") or "",
+            "pattern_name": r.get("pattern_name") or "",
             "kind": "issue",
         })
 
@@ -302,8 +303,46 @@ def render_markdown(run_dir: Path, rows: list[dict], cfg: dict) -> str:
             w(f"- `{cid}`：{'、'.join(forms)}")
     w()
 
-    # 6 本次未覆盖范围
-    w("## 6. 本次未覆盖范围")
+    # 6 范式符合性
+    w("## 6. 范式符合性")
+    w()
+    pr = cfg.get("pattern_review") or {}
+    if not pr.get("enabled"):
+        w("未启用（`pattern_review.enabled: false`）。"
+          "范式规则是场景特定的，需按 `references/patterns.md` 提供规则包后开启。")
+    else:
+        applied: dict[str, int] = {}
+        names: dict[str, str] = {}
+        pdir = resolve_path(run_dir, "patterns")
+        if pdir.exists():
+            for f in sorted(pdir.glob("patterns-*.json")):
+                if f.name.count(".") != 1:
+                    continue
+                d = read_json(f, {}) or {}
+                for r in d.get("rules") or []:
+                    names[r["id"]] = r.get("name") or r["id"]
+                for c in d.get("candidates") or []:
+                    applied[c["pattern_id"]] = applied.get(c["pattern_id"], 0) + 1
+        miss = Counter(r["rule_id"] for r in rows if (r.get("category") or "") == "P1")
+        for rid, n in miss.items():
+            names.setdefault(rid, rid)
+            applied.setdefault(rid, n)
+        if not applied:
+            w("已启用，但本文档未命中任何范式规则的适用场景。"
+              "若与预期不符，多半是 `scope` 的定位条件过严——见 `references/patterns.md` 排障表。")
+        else:
+            w("| 规则 | 范式 | 适用段落 | 要件缺失 |")
+            w("|---|---|---|---|")
+            for rid in sorted(applied):
+                w(f"| `{rid}` | {names.get(rid, rid)} | {applied[rid]} | {miss.get(rid, 0)} |")
+            w()
+            w("「适用段落」由脚本按规则的 `scope` 确定性定位，"
+              "「要件缺失」是其中经裁定确认缺少必填要件的条数。"
+              "**P 类只出批注，永不生成修订**——要件缺什么内容只有作者知道。")
+    w()
+
+    # 7 本次未覆盖范围
+    w("## 7. 本次未覆盖范围")
     w()
     skip = cfg.get("skip") or {}
     n_code = sum(1 for p in paras if p["is_code"])
@@ -322,15 +361,20 @@ def render_markdown(run_dir: Path, rows: list[dict], cfg: dict) -> str:
         w(f"| 未完成分片 | {len(skipped_chunks)} | "
           f"重试耗尽或失败：{', '.join(c['id'] for c in skipped_chunks[:10])} |")
     if not (cfg.get("typo_check") or {}).get("enabled"):
-        w("| 错别字专项 | — | typo_check 未启用；v1 由主审查顺带发现，召回率有限 |")
+        w("| 错别字专项 | — | typo_check 未启用；仅由主审查顺带发现，召回率有限 |")
+    elif not (cfg.get("typo_check") or {}).get("oov_detection"):
+        w("| 未登录词错别字 | — | 未登录词检测需 5 万词级词表，内置词表未达该规模；"
+          "错别字召回上限 = common-typos.txt 的覆盖范围 |")
+    if not pr.get("enabled"):
+        w("| 场景描述范式 | — | pattern_review 未启用（需先提供范式规则包） |")
     if not (cfg.get("argument_review") or {}).get("enabled"):
         w("| 论证链审查 | — | argument_review 默认关闭（无客观阈值，误报不可收敛） |")
     w("| 格式/排版规范 | — | 本技能不做格式审查，且不修改任何样式（D9） |")
     w("| 事实性核查 | — | 只做文档内部自洽性，不判断与外部世界是否相符 |")
     w()
 
-    # 7 参数快照
-    w("## 7. 参数快照")
+    # 8 参数快照
+    w("## 8. 参数快照")
     w()
     ch = cfg.get("chunking") or {}
     w("| 参数 | 值 |")

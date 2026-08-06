@@ -36,7 +36,12 @@ SEVERITIES = ["Critical", "High", "Medium", "Low"]
 A_CLASSES = {"A1", "A2", "A3", "A4", "A5", "A6", "A7", "A8"}
 B_CLASSES = {"B1", "B2", "B3", "B4", "B5"}
 C_CLASSES = {"C1", "C2"}
-VALID_CATEGORIES = A_CLASSES | B_CLASSES | C_CLASSES
+# P 类只有一个 category（范式不符），具体是哪条范式由 rule_id 承载——
+# 规则号由用户的规则包定义，是开放集合；category 保持封闭枚举不变。
+P_CLASSES = {"P1"}
+VALID_CATEGORIES = A_CLASSES | B_CLASSES | C_CLASSES | P_CLASSES
+# P 类依赖场景定位的准确性，与 L29–L32 同理，不配 High（references/patterns.md）
+P_SEVERITY_CAP = "Medium"
 
 DE_SET = set("的地得")
 CONJUNCTIONS = [
@@ -149,7 +154,10 @@ def severity_rank(s: str) -> int:
     return SEVERITIES.index(s) if s in SEVERITIES else len(SEVERITIES)
 
 
-def process(run_dir: Path, chunk_id: str, raw_path: Path, cfg: dict) -> dict:
+def process(run_dir: Path, chunk_id: str, raw_path: Path, cfg: dict,
+            out_path: Path | None = None, cap_override: int | None = None) -> dict:
+    """out_path/cap_override 供侧通道（错别字、范式）使用：它们各有独立配额，
+    产物也必须落在各自的文件里——写回同一个 issues-<chunk>.jsonl 会互相覆盖。"""
     chunk_text = (resolve_path(run_dir, "chunks") / f"chunk-{chunk_id}.txt")
     if not chunk_text.exists():
         die(EX.ERROR, f"分片文本不存在：{chunk_text}")
@@ -167,7 +175,7 @@ def process(run_dir: Path, chunk_id: str, raw_path: Path, cfg: dict) -> dict:
     v = cfg.get("verification") or {}
     min_len = int(v.get("min_span_chars") or 4)
     max_len = int(v.get("max_span_chars") or 120)
-    cap = int((cfg.get("chunking") or {}).get("max_issues_per_chunk") or 20)
+    cap = int(cap_override or (cfg.get("chunking") or {}).get("max_issues_per_chunk") or 20)
 
     counters = {"raw": 0, "bad_schema": 0, "unknown_category": 0, "context_pid": 0,
                 "hallucination_drop": 0, "length_drop": 0, "edit_gate_degrade": 0,
@@ -224,13 +232,22 @@ def process(run_dir: Path, chunk_id: str, raw_path: Path, cfg: dict) -> dict:
         sev = (rec.get("severity") or "").strip().capitalize()
         if sev not in SEVERITIES:
             sev = "High" if cat in A_CLASSES else "Medium"
+        if cat in P_CLASSES and severity_rank(sev) < severity_rank(P_SEVERITY_CAP):
+            sev = P_SEVERITY_CAP           # 规则包写 High 也压回 Medium
         ev = (rec.get("evidence") or "").strip()[:25]   # 禁止长理由
+        # P 类的 rule_id 是规则包定义的开放标识（P-RISK-01），必须原样带下去；
+        # 其余类别的 rule_id 恒等于 category。
+        rid = ((rec.get("rule_id") or "").strip() or cat) if cat in P_CLASSES else cat
+        # 范式名要进批注正文（ADR-019：批注说人话），随记录带下去
+        extra = {"pattern_name": (rec.get("pattern_name") or "").strip()} \
+            if cat in P_CLASSES else {}
 
         kept.append({
             "chunk_id": chunk_id,
             "pid": pid,
             "category": cat,
-            "rule_id": cat,
+            "rule_id": rid,
+            **extra,
             "severity": sev,
             "original_text": orig,
             "suggested_text": sugg,
@@ -280,10 +297,13 @@ def process(run_dir: Path, chunk_id: str, raw_path: Path, cfg: dict) -> dict:
         dedup.append(r)
     counters["dedup_drop"] = len(kept) - len(dedup)
 
-    out = resolve_path(run_dir, "issues") / f"issues-{chunk_id}.jsonl"
+    out = Path(out_path) if out_path else resolve_path(run_dir, "issues") / f"issues-{chunk_id}.jsonl"
     guard_write_path(out, run_dir)
+    out.parent.mkdir(parents=True, exist_ok=True)
     atomic_write_jsonl(out, dedup)
-    gates_path = resolve_path(run_dir, "issues") / f"issues-{chunk_id}.gates.json"
+    # 闸门统计按输出文件命名，侧通道各自成档，不覆盖主通道的 gates
+    stem = out.name[:-len(".jsonl")] if out.name.endswith(".jsonl") else out.name
+    gates_path = out.parent / f"{stem}.gates.json"
     guard_write_path(gates_path, run_dir)
     atomic_write_json(gates_path, {"chunk_id": chunk_id, "truncated": truncated, **counters})
 
@@ -296,6 +316,10 @@ def main(argv: list[str]) -> int:
     ap.add_argument("--run-dir", required=True)
     ap.add_argument("--chunk", required=True)
     ap.add_argument("--in", dest="raw", help="原始 JSONL；默认 issues-<chunk>.raw.jsonl")
+    ap.add_argument("--out", help="过闸后的输出；默认 issues-<chunk>.jsonl。"
+                                  "侧通道（错别字/范式）必须指定，否则会覆盖主通道产物")
+    ap.add_argument("--cap", type=int, help="本次的单片上限；默认 max_issues_per_chunk。"
+                                            "侧通道用各自的独立配额")
     ap.add_argument("--config")
     args = ap.parse_args(argv)
     run_dir = Path(args.run_dir).resolve()
@@ -303,7 +327,8 @@ def main(argv: list[str]) -> int:
     if not raw.exists():
         die(EX.PARSE, f"原始输出不存在：{raw}",
             "子 Agent 的 Pass 1 输出应先写入该路径（一行一条 JSON，无代码围栏）。")
-    emit({"ok": True, **process(run_dir, args.chunk, raw, load_config(args.config))})
+    emit({"ok": True, **process(run_dir, args.chunk, raw, load_config(args.config),
+                                Path(args.out) if args.out else None, args.cap)})
     return EX.OK
 
 

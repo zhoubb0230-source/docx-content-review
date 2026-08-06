@@ -1,0 +1,79 @@
+# 范式规则包 · 内置示例
+#
+# 这两条是**示例**，用来给出规则的写法与粒度。真实项目的范式是场景特定的，
+# 请按 references/patterns.md 写自己的规则包，用 --patterns <file> 传入
+# （同 id 会覆盖本文件），或直接删掉本文件。
+#
+# 三条铁律（见 references/patterns.md）：
+#   1. scope 必须能由脚本确定性判定——模型只回答「要件出现了吗」，不判断「适不适用」；
+#   2. requires 的每一项都要能用「这个信息出现了吗」来问。问不出来的，
+#      说明它是论证强度判断，不属于范式审查；
+#   3. 反例比正例重要。why_not_flag（场景不适用、不该报）是误报抑制的主要资产。
+
+schema_version: 1
+
+patterns:
+  - id: P-RISK-01
+    name: 风险条目描述范式
+    # enabled: false            # 逐条开关；不写即启用
+    scope:
+      heading_regex: "风险|Risk"
+      paragraph_regex: "^\\s*(?:风险|Risk)\\s*[0-9０-９一二三四五六七八九十]+|^\\s*风险(?:点|项)?\\s*[:：]"
+      exclude_regex: "^\\s*本(?:章|节|部分)|^\\s*以下(?:列出|分析)|^\\s*下表"
+      min_chars: 20
+    requires:
+      - key: impact
+        label: 影响
+        hint: 该风险一旦发生，对进度、成本、质量或范围造成什么后果
+      - key: mitigation
+        label: 应对措施
+        hint: 为降低或规避该风险准备采取的具体动作
+      - key: owner
+        label: 责任人
+        hint: 明确到人或到组的责任主体
+        optional: true          # 可选要件缺失只进报告，不出批注
+    severity: Medium
+    action: comment
+    examples:
+      positive:
+        - text: "风险1：第三方结算接口稳定性不足。若可用性低于 99%，将导致日终对账延迟一个工作日；拟增加本地缓存与失败重试，并保留人工对账通道，由集成组负责跟进。"
+          note: 影响、应对、责任人三项齐备
+        - text: "风险2：核心开发人员集中在两人，存在单点依赖，一旦请假将直接阻塞联调进度。已安排第三人参与代码评审并同步文档，形成备份。"
+          note: 缺责任人，但责任人是可选要件——只进报告，不出批注
+      negative:
+        - text: "风险1：第三方接口可能不稳定，需要重点关注。"
+          why_flag: 只点了风险本身，既没写影响也没写应对
+        - text: "本章分析项目实施过程中面临的主要风险与应对思路。"
+          why_not_flag: 章节引导语，不是风险条目——scope 的 exclude_regex 已排除
+        - text: "风险管理由项目管理办公室统一负责，每月更新风险登记册。"
+          why_not_flag: 讲的是风险管理机制，不是某一条具体风险
+
+  - id: P-IFACE-01
+    name: 接口描述范式
+    scope:
+      heading_regex: "接口|API|服务定义"
+      paragraph_regex: "接口\\s*[:：]|^\\s*(?:接口名|接口编号)|\\b(?:GET|POST|PUT|DELETE)\\b"
+      min_chars: 20
+    requires:
+      - key: request
+        label: 入参
+        hint: 请求参数或输入字段的说明
+      - key: response
+        label: 出参
+        hint: 返回内容或输出字段的说明
+      - key: error
+        label: 异常处理
+        hint: 失败时的返回码、错误码或异常约定
+    severity: Medium
+    action: comment
+    examples:
+      positive:
+        - text: "接口：订单查询。入参为订单号（必填）与租户 ID（必填）；出参返回订单主体、状态与最后更新时间；订单不存在时返回 40401，租户越权时返回 40301。"
+          note: 入参、出参、异常三项齐备
+      negative:
+        - text: "接口：订单查询。根据订单号查询订单详情。"
+          why_flag: 未说明出参内容，也未约定异常返回
+        - text: "本节描述系统对外提供的全部接口，共 12 个，详见附录 B。"
+          why_not_flag: 章节概述，不是单个接口的定义
+        - text: "接口调用统一走网关鉴权，超时时间默认 3 秒。"
+          why_not_flag: 讲的是接口的公共约定，不是某个接口的定义

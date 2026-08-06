@@ -29,10 +29,22 @@ logic:
   entity_similar_distance: 2    # L04 写法相近判定的编辑距离上限
 
 typo_check:
-  enabled: false                # M8 能力，v1 关闭
+  enabled: true                 # 独立通道：脚本出候选 → LLM 二选一裁定 → 过闸门②③
   max_typos_per_chunk: 100      # 独立配额，不占用 max_issues_per_chunk
   batch_size: 50
   require_llm_adjudication: true # 脚本候选不得直接生成修订
+  # 未登录词检测（切词后查不到的词即可疑）需 5 万词级词表才有信噪比，
+  # 内置词表远未达到该规模，故不启用。召回率上限 = common-typos.txt 的覆盖范围。
+  oov_detection: false
+
+pattern_review:                 # P 类：特定场景的描述范式审查
+  enabled: false                # 默认关闭；无规则包时即使打开也自动跳过
+  use_builtin: true             # 加载 assets/patterns/*.yaml（内置的是示例，可删）
+  packs: []                     # 额外规则包路径；--patterns 可追加，同 id 后者覆盖前者
+  max_pattern_issues_per_chunk: 20  # 独立配额，不占用 max_issues_per_chunk
+  batch_size: 20
+  severity_cap: Medium          # 依赖场景定位准确性，与 L29–L32 同理，不配 High
+  unsure_as_present: true       # 「不确定」按要件齐备处理（不确定即无问题）
 
 argument_review:
   enabled: false                # v2 能力，默认关闭
