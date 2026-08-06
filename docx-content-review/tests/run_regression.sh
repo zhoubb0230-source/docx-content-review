@@ -595,5 +595,113 @@ TN=$(python3 "$S/typo_scan.py" scan --run-dir "$RUN5")
 check "负样本集上错别字通道零候选" "$(echo "$TN" | jget "['candidates']")" 0
 
 echo
+echo "══ 11. 闸门④：盲测 A/B 脚手架 ══"
+
+# RUN4 已有 28 条正例过闸产物（第 10 节灌入）；复用它建复核集
+python3 "$S/verify_span.py" --run-dir "$RUN4" --chunk 0001 --in "$K/key.raw.jsonl" >/dev/null
+B1=$(python3 "$S/verify_pass2.py" build --run-dir "$RUN4")
+ge "待复核条目数" "$(echo "$B1" | jget "['items']")" 10
+python3 "$S/verify_pass2.py" build --run-dir "$RUN4" --arrangement mirror >/dev/null
+
+# 盲测的全部意义在于 payload 不泄题：既不能带「原文在哪一侧」，
+# 也不能让上下文原样带出待判跨度——同批条目的上下文彼此重叠，只挡本条远远不够
+python3 - "$RUN4" <<'PYEOF'
+import json,sys
+run=sys.argv[1]; V=f"{run}/work/verify"
+bad=[]
+raw=open(f"{V}/pass2-primary.json",encoding="utf-8").read()
+for f in ("orig_side","suggested_text","category","severity","evidence"):
+    if f in raw: bad.append(f"payload 含字段 {f}")
+for arr in ("primary","mirror"):
+    d=json.load(open(f"{V}/pass2-{arr}.json",encoding="utf-8"))
+    for b in d["batches"]:
+        whole=" ".join(x.get("context") or "" for x in b["items"])
+        for x in b["items"]:
+            if x["form"]!="ab": continue
+            if x["A"] in whole or x["B"] in whole:
+                bad.append(f"{arr}/{b['batch_id']} 的选项出现在同批上下文里：{x['A'][:12]!r}")
+for x in bad[:6]: print("   ", x)
+sys.exit(1 if bad else 0)
+PYEOF
+check "payload 不泄题（无侧别字段，选项不出现在任何上下文里）" "$?" 0
+
+# 位置由 ab_seed 逐条派生 → 可复现；mirror 必须是逐条镜像
+python3 - "$RUN4" <<'PYEOF'
+import json,sys
+run=sys.argv[1]; V=f"{run}/work/verify"
+k1=json.load(open(f"{V}/pass2-primary.key.json",encoding="utf-8"))["key"]
+k2=json.load(open(f"{V}/pass2-mirror.key.json",encoding="utf-8"))["key"]
+ab=[i for i,v in k1.items() if v["form"]=="ab"]
+bad=[i for i in ab if k2[i]["orig_side"]==k1[i]["orig_side"]]
+same=len({v["orig_side"] for i,v in k1.items() if v["form"]=="ab"})
+if bad: print(f"    {len(bad)} 条在 mirror 里没有翻面")
+if same<2: print("    primary 的位置全落在同一侧，随机化没生效")
+sys.exit(1 if bad or same<2 else 0)
+PYEOF
+check "mirror 逐条镜像，且 primary 的位置两侧都有" "$?" 0
+
+python3 "$S/verify_pass2.py" build --run-dir "$RUN4" >/dev/null
+H1=$(python3 - "$RUN4" <<'PYEOF'
+import hashlib,sys;print(hashlib.sha256(open(f"{sys.argv[1]}/work/verify/pass2-primary.key.json","rb").read()).hexdigest())
+PYEOF
+)
+python3 "$S/verify_pass2.py" build --run-dir "$RUN4" >/dev/null
+H2=$(python3 - "$RUN4" <<'PYEOF'
+import hashlib,sys;print(hashlib.sha256(open(f"{sys.argv[1]}/work/verify/pass2-primary.key.json","rb").read()).hexdigest())
+PYEOF
+)
+check "重跑 build 得到完全相同的排列（ab_seed 可复现）" "$([ "$H1" = "$H2" ] && echo yes || echo no)" yes
+
+# 判定表的负向对照：五条淘汰路径都要走通，不能只验通过路径
+python3 - "$RUN4" <<'PYEOF'
+import json,sys,pathlib
+run=sys.argv[1]; V=pathlib.Path(run,"work","verify")
+key=json.load(open(V/"pass2-primary.key.json",encoding="utf-8"))["key"]
+ab=[i for i,v in key.items() if v["form"]=="ab"]
+sg=[i for i,v in key.items() if v["form"]=="single"]
+rows=[]
+for n,i in enumerate(ab):
+    o=key[i]["orig_side"]; flip="B" if o=="A" else "A"
+    rows.append({"id":i,"answer":[o,flip,"两者都没有","两者都有","???"][min(n,4)]})
+rows=[r for r in rows if r["id"]!=ab[-1]]        # 末条整体缺裁定
+for n,i in enumerate(sg):
+    rows.append({"id":i,"answer":["YES","NO","UNSURE"][min(n,2)]})
+(V/"pass2-primary.verdicts.jsonl").write_text(
+    "".join(json.dumps(r,ensure_ascii=False)+"\n" for r in rows),encoding="utf-8")
+PYEOF
+M=$(python3 "$S/verify_pass2.py" merge --run-dir "$RUN4")
+python3 - "$RUN4" <<'PYEOF'
+import json,sys
+want={"选中建议所在项","模型认为原文没问题","模型未能区分，视为不可靠",
+      "缺裁定结果，按淘汰处理"}
+got={json.loads(l)["verify"].get("note","") for l in
+     open(f"{sys.argv[1]}/work/issues-verified.jsonl",encoding="utf-8")}
+miss=[w for w in want if w not in got]
+unparsed=[g for g in got if g.startswith("无法解析")]
+unsure=[g for g in got if "UNSURE" in g]
+for m in miss: print("    未走到淘汰路径：", m)
+if not unparsed: print("    未走到淘汰路径：无法解析的回答")
+if not unsure:   print("    未走到淘汰路径：UNSURE 按 NO")
+sys.exit(1 if miss or not unparsed or not unsure else 0)
+PYEOF
+check "判定表六条淘汰路径全部走通（负向对照）" "$?" 0
+ge "淘汰计数" "$(echo "$M" | jget "['drop']")" 5
+
+# 一致率：M2 验收项，此前根本算不出来
+python3 - "$RUN4" <<'PYEOF'
+import json,pathlib,sys
+V=pathlib.Path(sys.argv[1],"work","verify")
+key=json.load(open(V/"pass2-primary.key.json",encoding="utf-8"))["key"]
+prim={json.loads(l)["id"]:json.loads(l)["answer"]
+      for l in open(V/"pass2-primary.verdicts.jsonl",encoding="utf-8")}
+mir={k:("B" if v=="A" else "A" if v=="B" else v) for k,v in prim.items()}
+(V/"pass2-mirror.verdicts.jsonl").write_text(
+    "".join(json.dumps({"id":k,"answer":v},ensure_ascii=False)+"\n" for k,v in mir.items()),
+    encoding="utf-8")
+PYEOF
+CONS=$(python3 "$S/verify_pass2.py" consistency --run-dir "$RUN4")
+check "两种排列判定一致率可计算且达标" "$(echo "$CONS" | jget "['meets_threshold']")" True
+
+echo
 printf '通过 \033[32m%d\033[0m，失败 \033[31m%d\033[0m\n' "$PASS" "$FAIL"
 [ "$FAIL" -eq 0 ]

@@ -204,9 +204,29 @@ filter_neverflag.py --run-dir <run> --chunk <id> --file work/issues/issues-<id>.
 
 ### 第 5 步：Pass 2　盲测 A/B 二次复核
 
-把所有 `issues-*.jsonl`（含两条支线的 `.typos.jsonl` / `.patterns.jsonl`）合并为待复核集，按 `references/prompts/pass2-verify.md`
-批量复核（一次 ≤10 组），结果写入 `work/issues-verified.jsonl`（在原记录上加
-`"verify": {"result": "pass"|"drop"}`）。
+```
+verify_pass2.py build --run-dir <run>            # 拼装待复核集（含位置随机化）
+```
+
+脚本已把三个通道的过闸产物合并、按 manifest 的 `ab_seed` 逐条定好 A/B 位置，
+产出 `work/verify/pass2-primary.json`。**你只发这个 payload**——
+按 `references/prompts/pass2-verify.md` 逐 batch 复核（一次 ≤10 组），
+每行一条 `{"id":"…","answer":"A"}` 追加写入 `work/verify/pass2-primary.verdicts.jsonl`。
+
+**同目录下的 `.key.json` 不要读、更不要带进调用。** 它记的是原文在哪一侧，
+是 `merge` 应用判定表用的。看了它，盲测就只剩名义。
+
+```
+verify_pass2.py merge --run-dir <run>            # 判定表 → work/issues-verified.jsonl
+```
+
+判定表由脚本执行：选中原文所在项 = 通过；选中建议侧 / 两者都没有 / 两者都有 /
+答案无法解析 / 缺裁定 = 一律淘汰。B 类的封闭单问里 UNSURE 按 NO 处理。
+
+> 需要测模型的位置偏好时（M2 验收项）：`build --arrangement mirror` 再复核一轮，
+> 然后 `verify_pass2.py consistency --run-dir <run>` 给出两种排列的判定一致率。
+> **低于 0.9 说明模型答的是"哪一侧"而不是"哪一个有错"，要换 prompt，不要调阈值。**
+> 常规运行不需要跑镜像排列。
 
 ```
 import_decisions.py apply --run-dir <run>    # 审查记忆命中者降级为 report_only
@@ -287,6 +307,7 @@ workspace.py clean-temp --run-dir <run>
 | `import_glossary.py` | 术语表导入 + 自检 + 三层合并 | `--run-dir --authoritative --fallback` | entries / layers |
 | `chunk.py` | 分片（按 token） | `--run-dir` | chunks / single_pass |
 | `verify_span.py` | 闸门②③ | `--run-dir --chunk [--in --out --cap]` | 各闸门丢弃计数 |
+| `verify_pass2.py build\|merge\|consistency` | 闸门④盲测 A/B 脚手架 | `--run-dir [--arrangement]` | items / pass / drop / 一致率 |
 | `filter_neverflag.py` | 不改清单硬过滤 | `--run-dir --chunk\|--all [--file]` | dropped / by_rule |
 | `ledger.py build\|rebuild\|stats` | 台账 SQLite 索引 | `--run-dir` | stats |
 | `detect_conflicts.py` | L01–L32 冲突检测 | `--run-dir [--rules]` | total / by_rule |

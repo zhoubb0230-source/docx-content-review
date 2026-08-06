@@ -81,6 +81,7 @@ KINDS = {
     "issues_verified": "work/issues-verified.jsonl",
     "typos": "work/typos",
     "patterns": "work/patterns",
+    "verify": "work/verify",
     "patchlist": "work/patchlist.json",
     # 以下四项是 run 内的暂存位置。**最终交付物不在这里**——
     # 交付路径由 deliver_path() 依 manifest 的 deliver_dir 解析（见 DELIVERABLES）。

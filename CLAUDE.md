@@ -45,6 +45,7 @@
 | token 计量、分片策略 | `scripts/tokenizer.py` / `chunk.py` | `references/schemas.md` |
 | **新增/修改一个 A/B/C 类别** | `scripts/verify_span.py` 的 `edit_gate` | `references/taxonomy.md` + `prompts/pass1-review.md` + `tests/fixtures` |
 | **新增一条不改清单规则** | `scripts/filter_neverflag.py` 的 `check` | `references/never-flag.md` + 负样本 fixture |
+| 闸门④盲测 A/B（拼装、判定表、一致率） | `scripts/verify_pass2.py` | `prompts/pass2-verify.md`；**改动必须重跑泄题检查** |
 | **新增一条 L 规则** | `scripts/detect_conflicts.py`（加 `RULES` 项 + `r_LNN` 函数） | `references/logic-rules.md` + `logic-injection.facts.json` + 回归断言 |
 | 事实台账字段 | `scripts/ledger.py` 的 `MAPPING` | `references/schemas.md` + `prompts/pass1-extract.md` |
 | 术语表格式、合并规则 | `scripts/import_glossary.py` | `references/schemas.md` |
