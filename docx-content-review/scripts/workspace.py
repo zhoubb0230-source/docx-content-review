@@ -98,15 +98,35 @@ KINDS = {
 }
 
 
-# 交付物：文件名 = filename_pattern.format(stem=原文件名, ts=时间戳, ext=下表后缀)
-# 全部落在**交付目录**（工作目录），不在临时目录内——临时目录随时可整体删除。
-DELIVERABLES = {
+# 产物命名：文件名 = filename_pattern.format(stem=原文件名, ts=时间戳, ext=下表后缀)。
+# 五个产物都会生成，但**只有 deliver_kinds 里的进交付目录**，其余落在 run/output/
+# 之下随临时目录一起清理。默认只交付 docx——报告、xlsx、metrics、术语表各有用途
+# （转述、回灌审查记忆、调优、下一轮输入），但不该堆在用户的工作目录里。
+ARTIFACTS = {
     "reviewed_docx": ".docx",
     "report":        ".report.md",
     "issues_xlsx":   ".issues.xlsx",
     "metrics":       ".metrics.json",
     "glossary_out":  ".glossary.json",
 }
+DEFAULT_DELIVERED = ["reviewed_docx"]
+# 配置项 output.deliver_<x> → 产物 kind
+DELIVER_FLAGS = {
+    "reviewed_docx": None,          # 审查版 docx 恒为交付物，不可关
+    "report": "deliver_report",
+    "issues_xlsx": "deliver_issues_xlsx",
+    "metrics": "deliver_metrics",
+    "glossary_out": "deliver_glossary",
+}
+
+
+def delivered_kinds(cfg: dict) -> list[str]:
+    out = ["reviewed_docx"]
+    oc = cfg.get("output") or {}
+    for kind, flag in DELIVER_FLAGS.items():
+        if flag and oc.get(flag):
+            out.append(kind)
+    return out
 
 
 # --------------------------------------------------------------------------
@@ -343,20 +363,44 @@ def deliver_meta(run_dir: str | os.PathLike) -> dict:
     return man
 
 
-def deliver_path(run_dir: str | os.PathLike, kind: str, *, man: dict | None = None) -> Path:
-    """交付物的最终路径：<交付目录>/<原文件名>审查版_<时间戳><后缀>。"""
-    if kind not in DELIVERABLES:
-        die(EX.USAGE, f"未知的交付物：{kind}（可用：{', '.join(DELIVERABLES)}）")
-    man = man or deliver_meta(run_dir)
+def artifact_name(kind: str, man: dict) -> str:
     pattern = man.get("filename_pattern") or "{stem}审查版_{ts}{ext}"
-    name = pattern.format(stem=man.get("deliver_stem") or "document",
-                          ts=man.get("deliver_ts") or "", ext=DELIVERABLES[kind])
-    return Path(man["deliver_dir"]) / name
+    return pattern.format(stem=man.get("deliver_stem") or "document",
+                          ts=man.get("deliver_ts") or "", ext=ARTIFACTS[kind])
+
+
+def artifact_path(run_dir: str | os.PathLike, kind: str, *, man: dict | None = None) -> Path:
+    """产物的最终落点。
+
+    交付物 → `<交付目录>/<原文件名>审查版_<时间戳><后缀>`
+    其余   → `<run>/output/` 下同名文件，随临时目录一起清理
+    """
+    if kind not in ARTIFACTS:
+        die(EX.USAGE, f"未知的产物：{kind}（可用：{', '.join(ARTIFACTS)}）")
+    man = man or deliver_meta(run_dir)
+    name = artifact_name(kind, man)
+    if kind in (man.get("deliver_kinds") or DEFAULT_DELIVERED):
+        return Path(man["deliver_dir"]) / name
+    return resolve_path(run_dir, "output") / name
+
+
+# 向后兼容的别名：语义与 artifact_path 相同
+deliver_path = artifact_path
 
 
 def deliver_all(run_dir: str | os.PathLike) -> dict:
+    """只列真正进交付目录的产物。"""
     man = deliver_meta(run_dir)
-    return {k: str(deliver_path(run_dir, k, man=man)) for k in DELIVERABLES}
+    kinds = man.get("deliver_kinds") or DEFAULT_DELIVERED
+    return {k: str(artifact_path(run_dir, k, man=man)) for k in kinds}
+
+
+def artifact_all(run_dir: str | os.PathLike) -> dict:
+    """列全部产物及其去向，便于 Agent 向用户说明哪些在工作目录、哪些在临时目录。"""
+    man = deliver_meta(run_dir)
+    kinds = man.get("deliver_kinds") or DEFAULT_DELIVERED
+    return {k: {"path": str(artifact_path(run_dir, k, man=man)), "delivered": k in kinds}
+            for k in ARTIFACTS}
 
 
 def source_copy_path(run_dir: str | os.PathLike, ext: str) -> Path:
@@ -750,6 +794,7 @@ def cmd_init(args) -> int:
             (cfg.get("output") or {}).get("timestamp_format") or "%Y%m%d_%H%M%S"),
         "filename_pattern": (cfg.get("output") or {}).get("filename_pattern")
         or "{stem}审查版_{ts}{ext}",
+        "deliver_kinds": delivered_kinds(cfg),
         "temp_root": str(temp_root),
         "chunks": [],
         "stats": {"total_chunks": 0, "done": 0, "failed": 0, "pending": 0},
@@ -764,7 +809,7 @@ def cmd_init(args) -> int:
         "needs_conversion": ext == ".doc", "new_doc_dir": is_new_doc,
         "local_fs": is_local_fs(base), "fs_type": fs_type(base),
         "temp_root": str(temp_root), "deliver_dir": str(deliver_root),
-        "deliverables": deliver_all(run_dir),
+        "deliverables": deliver_all(run_dir), "artifacts": artifact_all(run_dir),
     })
     return EX.OK
 
@@ -899,10 +944,11 @@ def cmd_claim(args) -> int:
 def cmd_deliver(args) -> int:
     run_dir = Path(args.run_dir).resolve()
     if args.kind:
-        emit({"ok": True, "path": str(deliver_path(run_dir, args.kind))})
+        emit({"ok": True, "path": str(artifact_path(run_dir, args.kind))})
     else:
         man = deliver_meta(run_dir)
-        emit({"ok": True, "deliver_dir": man["deliver_dir"], "paths": deliver_all(run_dir)})
+        emit({"ok": True, "deliver_dir": man["deliver_dir"],
+              "paths": deliver_all(run_dir), "artifacts": artifact_all(run_dir)})
     return EX.OK
 
 
@@ -914,8 +960,10 @@ def cmd_clean_temp(args) -> int:
     if stage != "completed" and not args.force:
         die(EX.USAGE, f"当前阶段为 {stage}，尚未完成；删除临时目录会丢失续跑所需的中间件",
             "确认无需续跑再加 --force。")
-    # 必须在删除之前把交付物路径读出来——manifest 就在待删目录里
-    kept = deliver_all(run_dir)
+    # 必须在删除之前把路径读出来——manifest 就在待删目录里
+    allart = artifact_all(run_dir)
+    kept = {k: v["path"] for k, v in allart.items() if v["delivered"]}
+    dropped = {k: v["path"] for k, v in allart.items() if not v["delivered"]}
     missing = [k for k, v in kept.items() if not Path(v).exists()]
     if missing and not args.force:
         die(EX.USAGE, f"交付物尚未全部产出（缺 {missing}），拒绝删除临时目录",
@@ -927,7 +975,10 @@ def cmd_clean_temp(args) -> int:
                  if x.name not in ("latest.json", "doc.json", "owner.json", "glossary.json")]
     if not leftovers:
         shutil.rmtree(doc_dir, ignore_errors=True)
-    emit({"ok": True, "removed": str(run_dir), "deliverables_kept": kept})
+    emit({"ok": True, "removed": str(run_dir), "deliverables_kept": kept,
+          "also_removed": dropped,
+          "note": "报告/xlsx/metrics/术语表未列为交付物，随临时目录一并删除；"
+                  "需要保留请先复制，或在配置中打开对应的 output.deliver_* 开关"})
     return EX.OK
 
 
@@ -993,7 +1044,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     p = sub.add_parser("deliver", help="打印交付物最终路径")
     p.add_argument("--run-dir", required=True)
-    p.add_argument("--kind", choices=sorted(DELIVERABLES))
+    p.add_argument("--kind", choices=sorted(ARTIFACTS))
     p.set_defaults(func=cmd_deliver)
 
     p = sub.add_parser("clean-temp", help="删除本次 run 的临时目录（交付物不受影响）")

@@ -224,10 +224,10 @@ ge "报告条目数" "$(echo "$RP" | jget "['rows']")" 20
 ge "严重级人工确认项" "$(echo "$RP" | jget "['critical']")" 3
 DLV=$(python3 "$S/workspace.py" deliver --run-dir "$RUN2")
 for k in report issues_xlsx metrics glossary_out; do
-  P=$(echo "$DLV" | jget "['paths']['$k']")
+  P=$(echo "$DLV" | jget "['artifacts']['$k']['path']")
   [ -s "$P" ] && ok "产出 $k" || bad "缺少 $k（$P）"
 done
-python3 - "$(echo "$DLV" | jget "['paths']['metrics']")" <<'PYEOF'
+python3 - "$(echo "$DLV" | jget "['artifacts']['metrics']['path']")" <<'PYEOF'
 import sys,json
 m=json.load(open(sys.argv[1],encoding="utf-8"))
 sys.exit(0 if "gates" in m and "gate_rates" in m else 1)
@@ -252,12 +252,25 @@ DOCX=$(echo "$D" | jget "['paths']['reviewed_docx']")
 STEM=$(basename "$DOCX")
 echo "$STEM" | grep -qE '^logic-injection审查版_[0-9]{8}_[0-9]{6}\.docx$' \
   && ok "交付物命名格式（$STEM）" || bad "交付物命名格式不符：$STEM"
+# 交付物有且只有 docx；其余四项照常生成但留在 run/output/
+NDLV=$(echo "$D" | python3 -c "import json,sys;print(len(json.load(sys.stdin)['paths']))")
+check "交付物只有一项" "$NDLV" 1
 for k in report issues_xlsx metrics glossary_out; do
-  P=$(echo "$D" | jget "['paths']['$k']")
-  case "$P" in "$DELIVER"/*) ok "$k 落在交付目录";; *) bad "$k 落在 $P";; esac
+  P=$(echo "$D" | jget "['artifacts']['$k']['path']")
+  DL=$(echo "$D" | jget "['artifacts']['$k']['delivered']")
+  case "$P:$DL" in
+    "$RUN2/output/"*":False") ok "$k 生成于 run/output/，未进交付目录";;
+    *) bad "$k 去向不对：$P (delivered=$DL)";;
+  esac
 done
 python3 "$S/unpack.py" pack --run-dir "$RUN2" >/dev/null
 [ -s "$DOCX" ] && ok "审查版 docx 已产出到交付目录" || bad "审查版 docx 未产出"
+for k in report issues_xlsx metrics glossary_out; do
+  P=$(echo "$D" | jget "['artifacts']['$k']['path']")
+  [ -s "$P" ] && ok "$k 仍照常生成" || bad "$k 未生成（$P）"
+done
+NDOCX=$(find "$DELIVER" -maxdepth 1 -name '*审查版*' -not -name '*.docx' | wc -l)
+check "交付目录内无 docx 之外的审查产物" "$NDOCX" 0
 TMPLEFT=$(find "$TEMP" -maxdepth 4 -name '*审查版*' | wc -l)
 check "临时目录内不残留交付物" "$TMPLEFT" 0
 

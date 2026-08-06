@@ -37,27 +37,41 @@ workspace.py init --source <文档路径> [--output-dir <交付目录>] [--temp-
 
 | 目录 | 放什么 | 默认值 | 可否删除 |
 |---|---|---|---|
-| **交付目录** | 最终产物：审查版 docx、报告、issues.xlsx、metrics、术语表 | Agent 当前工作目录 | 不可，这是交付物 |
-| **临时目录** | 全部中间件：源文档副本、解包目录、分片、台账、冲突候选 | **同交付目录**，落在 `<工作目录>/docx-review/` 之下 | 可整体删除 |
+| **交付目录** | **只有审查版 docx** | Agent 当前工作目录 | 不可，这是交付物 |
+| **临时目录** | 中间件 + 报告/xlsx/metrics/术语表 | **同交付目录**，落在 `<工作目录>/docx-review/` 之下 | 可整体删除 |
 
-默认两者都在工作目录，跑完长这样：
+**交付物只有一个：带修订与批注的 docx。** 跑完长这样：
 
 ```
 <工作目录>/
-├── 系统设计说明书审查版_20260805_122806.docx     ← 交付物
-├── 系统设计说明书审查版_20260805_122806.report.md
-├── 系统设计说明书审查版_20260805_122806.issues.xlsx
-├── 系统设计说明书审查版_20260805_122806.metrics.json
-├── 系统设计说明书审查版_20260805_122806.glossary.json
-└── docx-review/                                  ← 中间件，可整体删除
-    └── 系统设计说明书-2faa47ba04ec/run-20260805-1228-xyn8/
+├── 系统设计说明书审查版_20260806_005525.docx      ← 唯一交付物
+└── docx-review/                                   ← 可整体删除
+    └── 系统设计说明书-2faa47ba04ec/run-.../
+        ├── output/                                ← 报告等四项在这里
+        │   ├── 系统设计说明书审查版_20260806_005525.report.md
+        │   ├── 系统设计说明书审查版_20260806_005525.issues.xlsx
+        │   ├── 系统设计说明书审查版_20260806_005525.metrics.json
+        │   └── 系统设计说明书审查版_20260806_005525.glossary.json
+        └── work/                                  ← 中间件
 ```
 
-只有在工作目录位于网络盘、或需要把大体积中间件挪到别的盘时，才用 `--temp-dir` 指定别处。
+报告等四项**照常生成**，只是不堆到用户的工作目录——它们各有用途：
 
-交付物文件名固定为 **`<原文件名>审查版_<时间戳>.<后缀>`**（时间戳格式 `20260805_121153`，
-全流程共用 init 时生成的同一个时间戳）。取交付路径用
-`workspace.py deliver --run-dir <run>`，**不要自己拼**。
+| 产物 | 用途 |
+|---|---|
+| `report.md` | **你据此向用户口头汇报审查结果**；用户要文件时再把路径给他 |
+| `issues.xlsx` | 用户标注 accept/ignore 后回灌审查记忆（`import_decisions.py`） |
+| `metrics.json` | 四道闸门的丢弃率，调 prompt 的唯一依据 |
+| `glossary.json` | 人工修订后作为下一轮的 `--authoritative` 输入 |
+
+用户明确要哪一个，就把 `output.deliver_report` / `deliver_issues_xlsx` /
+`deliver_metrics` / `deliver_glossary` 中对应项改成 `true`，或直接把文件复制过去。
+
+文件名统一为 **`<原文件名>审查版_<时间戳>.<后缀>`**（时间戳 `20260806_005525`，
+全流程共用 init 时生成的同一个）。取路径用 `workspace.py deliver --run-dir <run>`
+（返回 `paths` = 交付物，`artifacts` = 全部产物及其去向），**不要自己拼**。
+
+只有在工作目录位于网络盘、或需要把大体积中间件挪到别的盘时，才用 `--temp-dir` 指定别处。
 
 返回 `action` 决定下一步：
 
@@ -184,14 +198,19 @@ validate_docx.py --run-dir <run>
 unpack.py pack --run-dir <run>      # 不传 --output 即打包到交付目录，文件名自动
 state.py rebuild --run-dir <run>
 metrics.py collect --run-dir <run>
-report.py --run-dir <run>           # 报告/xlsx/术语表同样直接写交付目录
+report.py --run-dir <run>           # 报告等四项写 run/output/，不进交付目录
 ```
 
-全部完成后把交付目录里的文件路径报给用户。若用户要求清理中间件：
+**收尾**：读 `run/output/` 里的 report.md，把审查结果**当面讲给用户**——
+问题总数、按严重度分档、必须人工确认的严重级冲突有哪几条。
+然后只报一个文件路径：交付目录里的审查版 docx。
+其余四项只在用户问起时再给路径。
+
+若用户要求清理中间件（**报告等四项会一并删除，先确认用户不需要**）：
 
 ```
 state.py stage --run-dir <run> --value completed
-workspace.py clean-temp --run-dir <run>     # 只删临时目录，交付物不受影响
+workspace.py clean-temp --run-dir <run>
 ```
 
 ---
@@ -205,14 +224,14 @@ workspace.py clean-temp --run-dir <run>     # 只删临时目录，交付物不�
 | `workspace.py init` | 建工作目录、复制源文档、续跑判定 | `--source` | run_dir / action / lease |
 | `workspace.py locate` | 只查已有文档目录 | `--source` | doc_dir / stage |
 | `workspace.py resolve` | 取临时目录内的标准路径 | `--run-dir --kind` | path |
-| `workspace.py deliver` | 取交付物最终路径 | `--run-dir [--kind]` | 交付目录 + 各产物路径 |
+| `workspace.py deliver` | 取产物路径与去向 | `--run-dir [--kind]` | paths（交付物）+ artifacts（全部及去向） |
 | `workspace.py clean-temp` | 删除本次 run 的临时目录 | `--run-dir` | 已删路径 + 保留的交付物 |
 | `workspace.py lease` | 租约 status/acquire/takeover/heartbeat/verify/release | `--doc-dir --session` | owner |
 | `workspace.py claim` | 分片 next/renew/release/status | `--run-dir --session` | chunk |
 | `env_probe.py` | 环境探测 | `--require-doc` | converters / can_convert_doc |
 | `convert_doc.py` | doc→docx（输出路径显式指定） | `--run-dir` | docx |
 | `unpack.py run` | 解包 + 合并 run + 记录 D9 基线 | `--run-dir` | 合并统计 |
-| `unpack.py pack` | 重新打包；默认写交付目录 | `--run-dir [--output]` | docx |
+| `unpack.py pack` | 重新打包；默认写交付目录 | `--run-dir [--output]` | 审查版 docx |
 | `extract.py` | 段落抽取 + 标题树 + 页码估算 | `--run-dir` | paragraphs / headings |
 | `glossary_scan.py` | 候选术语预筛 + 概念族聚类 | `--run-dir` | candidates / batches |
 | `import_glossary.py` | 术语表导入 + 自检 + 三层合并 | `--run-dir --authoritative --fallback` | entries / layers |
@@ -227,7 +246,7 @@ workspace.py clean-temp --run-dir <run>     # 只删临时目录，交付物不�
 | `state.py rebuild\|stats\|stage\|mark\|heartbeat\|doctor` | 状态与续跑 | `--run-dir` | stats / stage |
 | `metrics.py bump\|collect\|show` | 闸门丢弃率统计 | `--run-dir` | gates / gate_rates |
 | `import_decisions.py import\|apply\|show` | 审查记忆 | `--run-dir` | hits |
-| `report.py` | report.md + issues.xlsx | `--run-dir` | 路径 / 计数 |
+| `report.py` | report.md + issues.xlsx（写 run/output/） | `--run-dir` | 路径 / 计数 / artifacts |
 | `typo_scan.py scan\|merge` | 错别字候选（默认关闭） | `--run-dir` | candidates |
 
 **退出码**：0 成功 / 1 失败 / 2 参数错 / 3 环境缺失 / 4 写路径越界 / 5 磁盘不足 /

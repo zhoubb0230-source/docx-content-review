@@ -378,20 +378,23 @@ def main(argv: list[str]) -> int:
     guard_write_path(path, run_dir)
     path.parent.mkdir(parents=True, exist_ok=True)
     atomic_write_text(path, md)
-    xlsx = write_xlsx(run_dir, rows) if out_cfg.get("deliver_issues_xlsx", True) else None
+    xlsx = write_xlsx(run_dir, rows)
 
     gl = read_json(resolve_path(run_dir, "glossary_merged"), {})
     gl_path = None
-    if gl and out_cfg.get("deliver_glossary", True):
+    if gl:
         out = deliver_path(run_dir, "glossary_out")
         guard_write_path(out, run_dir)
         atomic_write_text(out, __import__("json").dumps(gl, ensure_ascii=False, indent=2) + "\n")
         gl_path = str(out)
 
+    from workspace import artifact_all
+
     emit({"ok": True, "report": str(path), "issues_xlsx": xlsx, "glossary": gl_path,
-          "deliver_dir": deliver_meta(run_dir)["deliver_dir"], "rows": len(rows),
+          "deliver_dir": deliver_meta(run_dir)["deliver_dir"],
+          "artifacts": artifact_all(run_dir), "rows": len(rows),
           "critical": sum(1 for r in rows if r["severity"] == "Critical"),
-          "xlsx_skipped": None if xlsx else "openpyxl 未安装或已关闭，跳过 issues.xlsx"})
+          "xlsx_skipped": None if xlsx else "openpyxl 未安装，跳过 issues.xlsx"})
     return EX.OK
 
 

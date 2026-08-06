@@ -117,10 +117,13 @@ output:
   # 交付物命名：{stem}=原文件名（去扩展名），{ts}=时间戳，{ext}=各产物后缀
   filename_pattern: "{stem}审查版_{ts}{ext}"
   timestamp_format: "%Y%m%d_%H%M%S"
-  deliver_report: true          # report.md 是否也放到交付目录
-  deliver_issues_xlsx: true
-  deliver_metrics: true
-  deliver_glossary: true
+  # 只有审查版 docx 是交付物。以下四项默认 false：产物照常生成，但留在
+  # <run>/output/ 内，随临时目录一起清理，不堆到用户的工作目录。
+  # 需要哪个就把哪个改成 true。
+  deliver_report: false
+  deliver_issues_xlsx: false
+  deliver_metrics: false
+  deliver_glossary: false
 
 skip:
   code_blocks: true

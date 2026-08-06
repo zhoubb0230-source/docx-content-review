@@ -225,3 +225,22 @@ L 规则表、目录结构、配置项）不在此重复。
      「「并发连接数」的目标值出现 2 种：5000、3000（适用范围：全局）」。
 - **影响**：`scripts/_common.py`、`scripts/apply_comments.py`、`scripts/report.py`、
   `scripts/detect_conflicts.py` 的 `r_L06` note。
+
+## ADR-020　只有审查版 docx 是交付物
+
+- **日期**：2026-08-06
+- **决策**：五个产物照常生成，但只有 `reviewed_docx` 落在交付目录；`report.md` /
+  `issues.xlsx` / `metrics.json` / `glossary.json` 落在 `<run>/output/`，随临时目录一起清理。
+  由 `output.deliver_report` / `deliver_issues_xlsx` / `deliver_metrics` / `deliver_glossary`
+  四个开关控制（默认全 `false`），init 时算出 `deliver_kinds` 存入 manifest，
+  `artifact_path()` 据此决定落点。
+- **备选**：① 全部交付（初版）；② 干脆不生成那四项。
+- **理由**：用户要的是「带修订与批注的 Word 文档」，其余四项对他是噪音。
+  但它们不能不生成——`report.md` 是 Agent 向用户汇报的依据，`issues.xlsx` 是审查记忆的
+  回灌入口，`metrics.json` 是调 prompt 的唯一依据（SPEC §10.5 明写"没有这份数据，调优是盲的"），
+  `glossary.json` 是下一轮的 `--authoritative` 输入。删掉它们等于砍掉迭代路径。
+  折中是**生成但不交付**：需要时按路径取，或打开对应开关。
+- **连带效果**：`clean-temp` 现在会连同这四项一起删除，因此它的返回值里明确列出
+  `also_removed` 与提示语，SKILL.md 也要求 Agent 在清理前先确认用户不需要。
+- **影响**：`scripts/workspace.py`（`ARTIFACTS` / `delivered_kinds` / `artifact_path` /
+  `artifact_all` / `clean-temp`）、`scripts/report.py`、`assets/config.default.yaml`、`SKILL.md`。
