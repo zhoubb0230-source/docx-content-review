@@ -122,7 +122,7 @@ python3 "$S/ledger.py" build --run-dir "$RUN2" >/dev/null
 C=$(python3 "$S/detect_conflicts.py" --run-dir "$RUN2")
 FIRED=$(echo "$C" | python3 -c "import json,sys;d=json.load(sys.stdin)['by_rule'];print(sum(1 for k,v in d.items() if v))")
 ge "触发的 L 规则数（不含需术语表/TOC 的 L05/L17/L25/L26/L32）" "$FIRED" 25
-for r in L01 L02 L06 L08 L12 L20 L27 L29 L30; do
+for r in L01 L02 L06 L08 L11 L12 L20 L23 L24 L27 L29 L30; do
   N=$(echo "$C" | jget "['by_rule']['$r']")
   [ "$N" -ge 1 ] && ok "$r 检出（$N）" || bad "$r 未检出"
 done
@@ -137,6 +137,47 @@ a=json.load(open(sys.argv[1]))["by_rule"]; b=json.load(open(sys.argv[2]))["by_ru
 sys.exit(0 if a==b else 1)
 PY
 check "删除 ledger.db 后重建结果一致" "$?" 0
+
+# 参考台账不得凭空造事实。它是回归里「理想的 Pass 1 产出」，一旦掺进文档里
+# 根本没写的记录，被验证的就不是规则而是那条杜撰——L23 曾经就是这样"通过"的：
+# 靠一条 subject 写「数据层」、锚点却指向讲多租户隔离那句的 status。
+for FX in logic-injection planning-tables; do
+python3 - "$F/$FX.facts.json" "$RUN2" "$FX" <<'PYEOF'
+import json,sys,re
+src,run,name=sys.argv[1],sys.argv[2],sys.argv[3]
+facts=json.load(open(src,encoding="utf-8"))
+paras=[json.loads(l) for l in open(f"{run}/work/paragraphs.jsonl",encoding="utf-8")]
+if name!="logic-injection":        # 只有本 run 的段落可比，其余仅查 _anchor 是否齐备
+    paras=None
+ws=lambda t: "".join(str(t or "").split())
+# subject 必须真的出现在锚点段落里；conclusions 的 scope 是章节路径，比标题
+SUBJ={"statuses":"subject","positions":"subject","roles":"role",
+      "versions":"subject","terms":"term","entities":"name"}
+bad=[]
+for kind,items in facts.items():
+    if kind.startswith("_") or not isinstance(items,list): continue
+    for it in items:
+        a=it.get("_anchor")
+        if not a:
+            bad.append(f"{name}/{kind} 缺 _anchor：{it}"); continue
+        if paras is None: continue
+        hit=next((p for p in paras if a in p["text"]),None)
+        if not hit:
+            bad.append(f"{name}/{kind} 锚点在正文中找不到：{a!r}"); continue
+        if kind in SUBJ:
+            v=ws(it.get(SUBJ[kind]))
+            if v and v not in ws(hit["text"]):
+                bad.append(f"{name}/{kind} 的 {SUBJ[kind]}={v!r} 未出现在锚点段落：{hit['text'][:30]!r}")
+        if kind=="conclusions":
+            v=ws(it.get("scope"))
+            where=ws(hit["text"])+ws("".join(hit.get("heading_path") or []))
+            if v and v not in where:
+                bad.append(f"{name}/conclusions 的 scope={v!r} 既不在锚点段落也不在其标题路径中")
+for b in bad: print("   ", b)
+sys.exit(1 if bad else 0)
+PYEOF
+check "参考台账 $FX 的每条事实都能在正文中找到出处" "$?" 0
+done
 
 # 权威术语表激活 L25/L26；表自身矛盾时必须终止
 python3 "$S/import_glossary.py" --run-dir "$RUN2" \
