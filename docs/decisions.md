@@ -244,3 +244,75 @@ L 规则表、目录结构、配置项）不在此重复。
   `also_removed` 与提示语，SKILL.md 也要求 Agent 在清理前先确认用户不需要。
 - **影响**：`scripts/workspace.py`（`ARTIFACTS` / `delivered_kinds` / `artifact_path` /
   `artifact_all` / `clean-temp`）、`scripts/report.py`、`assets/config.default.yaml`、`SKILL.md`。
+
+## ADR-021　范式审查做成数据驱动的 P 类，规则包外置
+
+- **日期**：2026-08-06
+- **决策**：新增 P 类（场景描述范式）。`category` 固定为 `P1`（封闭枚举不变），
+  具体范式由 `rule_id` 承载（`P-RISK-01`…，开放集合）。规则写在 YAML 规则包里
+  （`assets/patterns/*.yaml` + 用户的 `--patterns`），**加规则不改代码**。
+  执行链路与 D1、错别字通道同构：脚本按 `scope` 确定性定位 → LLM 逐要件答 Y/N/U →
+  只有明确 N 成条目 → 过闸门②③。
+- **备选**：① 把范式规则写进 `verify_span.py` 的类别体系；② 塞进 B 类；
+  ③ 打开 `argument_review` 用它兜住。
+- **理由**：范式是场景特定的、会持续增加的。写进代码意味着每加一条规则要改三处
+  （类别枚举、闸门、prompt），而用户明确说"正例/反例待后续补充"——规则会一直加。
+  塞进 B 类会让 never-flag 的适用范围和 `metrics.json` 的分类丢弃率同时失去意义
+  （B 类判据是语言学，P 类判据是外部规则包，动作也不同）。
+- **与 SPEC §9.6 的边界**：论证链审查被关闭的理由是误报不可收敛——写不出一份
+  《哪些论断不需要证据》的清单。**范式审查能进 v1.1 的唯一原因是它的要件清单
+  由规则包给出、是闭合的。** 因此写死一条红线：任何一条 `requires`，
+  如果无法用「这个信息出现了吗」来问，就不该进规则包。规则包加载时强制校验
+  三项（必须有 scope 定位条件、不得携带建议文本、反例必须注明 why_flag/why_not_flag），
+  违反即以退出码 10 拒绝加载，不做猜测性修复。
+- **闸门代价**：出奇地小。`verify_span.py` 只需把 `P1` 加进 `VALID_CATEGORIES`——
+  `edit_gate` 的默认分支本就是「该类别不允许携带建议文本」，P 类会自动降级为批注。
+  额外只加了严重度上限（`P_SEVERITY_CAP = Medium`）与 `rule_id` 透传。
+- **影响**：新增 `scripts/scan_patterns.py`、`assets/patterns/builtin-examples.yaml`、
+  `references/patterns.md`、`references/prompts/pass1-pattern.md`；
+  改 `verify_span.py`、`filter_neverflag.py`、`report.py`、`apply_comments.py`、
+  `_common.py`、`workspace.py` 的 `KINDS`、配置、`SKILL.md`、`taxonomy.md`。
+
+## ADR-022　侧通道必须有自己的输出文件与配额
+
+- **日期**：2026-08-06
+- **决策**：`verify_span.py` 增加 `--out` 与 `--cap`，`filter_neverflag.py` 增加 `--file`。
+  错别字与范式两条支线各写 `issues-<chunk>.typos.jsonl` / `.patterns.jsonl`，
+  闸门统计文件按输出文件名派生。
+- **理由**：原实现的输出路径是硬编码的 `issues-<chunk>.jsonl`。错别字通道的 `merge`
+  已经写了自己的文件并提示"需再过两道闸门"，但照做就会**覆盖主通道的产物**——
+  这是接通道时才会暴露的设计漏洞，不是使用错误。配额同理：错别字一片可能有 40 条，
+  用主通道的 20 条上限会把它截断成随机取舍。
+- **连带**：`filter_neverflag.py` 的 `check()` 对 P 类在位置类规则（N9/N10/N11/N12）
+  之后即返回。N7/N8/N13/N14 判的是「改动本身该不该做」，而 P 类不改任何字，
+  它的 `original_text` 是整个段落——拿整段去撞 fallback 术语表必然命中，
+  会把所有范式条目误杀。
+- **影响**：`scripts/verify_span.py`、`scripts/filter_neverflag.py`、
+  `scripts/typo_scan.py` 的返回提示、`SKILL.md` 第 4.5 步。
+
+## ADR-023　错别字通道转正；不做未登录词检测
+
+- **日期**：2026-08-06
+- **决策**：`typo_check.enabled` 默认改为 `true`，补 `prompts/pass1-typo.md`，
+  接入 `SKILL.md` 主流程第 4.5 步，`common-typos.txt` 从 41 条扩到 210 条，
+  新增 `typo_scan.py lint` 词表自检。**不启用未登录词检测**
+  （`typo_check.oov_detection: false`），单字混淆集的空转循环删除并写明原因。
+- **理由**：用户把错别字列为第一需求，而原状态是：description 里承诺了错别字，
+  主流程里却没有 typo 支线；`scan` 产出了裁定 payload，`merge` 准备好读裁定结果，
+  中间那步没有 prompt 模板——通道是断的。
+  未登录词检测能突破「错词对表只查已知错误」的天花板，但需 5 万词级词表才有信噪比
+  （现有 `common-words.txt` 只有 117 词）。内置大词表涉及词表来源与分发许可，
+  先不做；召回率上限因此就是 `common-typos.txt` 的覆盖范围。
+- **优先级序列相应调整**：`CLAUDE.md` 的取舍序列里，「错别字召回率」插到
+  「逻辑检出率」之前。理由不是需求排序，而是两者性质不同：
+  **错别字召回靠词表（确定性资产），扩表不抬高误报率**；语病召回靠模型，
+  提召回必然抬高误报。把两者并列在末尾是原序列的一个错误。
+  推论：扩 `common-typos.txt` 永远可做，**放宽闸门②的 A1 阈值永远不可做**。
+- **词表登记规则**（`lint` 强制）：左串必须 ≥2 字（单字会把「度」「作」「帐」
+  这类高频字全部拉成候选）；不得与白名单冲突；建议与原文不得相同；
+  差异不得超出 A1 闸门（长度差 ≤2 且编辑距离 ≤3，否则永远落不了笔）。
+  实际踩到的坑：`子节` 会命中「子节点」、`以经` 会命中「以经济」、
+  `在次` 会命中「在次年」——这类条目一律删除或加白名单。
+- **影响**：`assets/config.default.yaml`、`assets/dict/common-typos.txt`、
+  `assets/dict/typo-whitelist.txt`、`scripts/typo_scan.py`、
+  `references/prompts/pass1-typo.md`、`SKILL.md`、`CLAUDE.md`、`docs/SPEC.md` §9.7。

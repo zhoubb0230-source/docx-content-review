@@ -15,6 +15,7 @@
 子命令
   scan   扫描候选 → work/typos/typos-<chunk>.json（含供 LLM 裁定的分批 payload）
   merge  合并裁定结果 → work/issues/issues-<chunk>.typos.jsonl，类别记为 A1
+  lint   只自检词表，不需要 run 目录（扩表后必跑）
 
 **召回率上限 = common-typos.txt 的覆盖范围。** 未登录词检测（切词后查不到的词即可疑）
 能突破这个上限，但需 5 万词级词表才有信噪比，内置词表远未达到该规模，故不启用
@@ -63,6 +64,30 @@ def _load_list(name: str) -> set[str]:
         return set()
     return {ln.strip() for ln in p.read_text(encoding="utf-8").splitlines()
             if ln.strip() and not ln.startswith("#")}
+
+
+def lint() -> dict:
+    """词表自检。扩表是提召回的唯一手段，也是最容易引入误报的地方——
+    这四项都是实际踩过的坑，扩表后必跑。"""
+    rows = [(w, r) for w, r, _ in _load_pairs("common-typos.txt")]
+    whitelist = _load_list("typo-whitelist.txt")
+    seen, dup = set(), []
+    for w, _ in rows:
+        (dup.append(w) if w in seen else seen.add(w))
+    problems = {
+        # 建议与原文相同 → 闸门②直接判「建议与原文相同」，白白消耗一次裁定
+        "same": [w for w, r in rows if w == r],
+        # 单字左串会把「度」「作」「帐」这类高频字全部拉成候选，噪音淹没一切
+        "single_char": [w for w, _ in rows if len(w) < 2],
+        # 左串同时躺在白名单里 → 自相矛盾，扫描时永远被跳过
+        "in_whitelist": [w for w, _ in rows if w in whitelist],
+        "duplicated": dup,
+        # 差异超出 A1 闸门（长度差 ≤2 且编辑距离 ≤3）→ 永远落不了笔，只会降级成批注
+        "over_a1_gate": [w for w, r in rows
+                         if abs(len(w) - len(r)) > 2 or levenshtein(w, r) > 3],
+    }
+    return {"entries": len(rows), "whitelist": len(whitelist),
+            "ok": not any(problems.values()), "problems": problems}
 
 
 def scan(run_dir: Path, cfg: dict, chunk_id: str | None) -> dict:
@@ -180,7 +205,12 @@ def main(argv: list[str]) -> int:
     p.add_argument("--run-dir", required=True)
     p.add_argument("--chunk", required=True)
     p.add_argument("--config")
+    sub.add_parser("lint", help="自检词表，不需要 run 目录")
     args = ap.parse_args(argv)
+    if args.cmd == "lint":
+        res = lint()
+        emit({"ok": res["ok"], **res})
+        return EX.OK if res["ok"] else EX.PARSE
     run_dir = Path(args.run_dir).resolve()
     cfg = load_config(args.config)
     if args.cmd == "scan":

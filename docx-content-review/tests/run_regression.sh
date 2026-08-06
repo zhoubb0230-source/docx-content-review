@@ -311,5 +311,144 @@ PYEOF
 check "非互斥类规则不套用「以哪一处为准」" "$?" 0
 
 echo
+echo "══ 9. 支线：错别字与范式（P 类） ══"
+
+# 词表与规则包自检——扩表/加规则后最容易踩的四类坑，先卡住
+python3 "$S/typo_scan.py" lint >/dev/null 2>&1
+check "错词表自检通过（无同形项/单字项/白名单冲突/超 A1 闸门）" "$?" 0
+LINT=$(python3 "$S/scan_patterns.py" lint)
+ge "内置范式规则数" "$(echo "$LINT" | jget "['rules']")" 2
+ge "范式规则携带的正反例数" "$(echo "$LINT" | jget "['examples_total']")" 6
+
+# 缺 scope 定位条件、带建议文本、反例未注明 why —— 三条红线都必须拒绝加载
+mkdir -p "$WORK/patterns"
+cat > "$WORK/patterns/noscope.yaml" <<'YAML'
+patterns:
+  - id: P-BAD-01
+    name: 无定位条件
+    requires: [{key: x, label: X}]
+YAML
+python3 "$S/scan_patterns.py" lint --patterns "$WORK/patterns/noscope.yaml" >/dev/null 2>&1
+check "范式规则缺 scope 定位条件时拒绝加载" "$?" 10
+cat > "$WORK/patterns/withsugg.yaml" <<'YAML'
+patterns:
+  - id: P-BAD-02
+    name: 携带建议文本
+    scope: {paragraph_regex: "风险"}
+    requires: [{key: x, label: X}]
+    suggested_text: "补充影响与应对"
+YAML
+python3 "$S/scan_patterns.py" lint --patterns "$WORK/patterns/withsugg.yaml" >/dev/null 2>&1
+check "范式规则携带建议文本时拒绝加载" "$?" 10
+cat > "$WORK/patterns/badneg.yaml" <<'YAML'
+patterns:
+  - id: P-BAD-03
+    name: 反例未注明理由
+    scope: {paragraph_regex: "风险"}
+    requires: [{key: x, label: X}]
+    examples:
+      negative: [{text: "风险1：需要关注。"}]
+YAML
+python3 "$S/scan_patterns.py" lint --patterns "$WORK/patterns/badneg.yaml" >/dev/null 2>&1
+check "范式反例未注明 why_flag/why_not_flag 时拒绝加载" "$?" 10
+
+# 端到端：同一片上主通道 + 两条支线并存，三份产物互不覆盖
+mkdir -p "$WORK/tp"
+cp "$F/typo-pattern.docx" "$WORK/tp/typo-pattern.docx"
+printf 'pattern_review:\n  enabled: true\n' > "$WORK/tp/cfg.yaml"
+RUN3=$(cd "$WORK/tp" && python3 "$S/workspace.py" init --source "$WORK/tp/typo-pattern.docx" \
+       --config "$WORK/tp/cfg.yaml" | jget "['run_dir']")
+python3 "$S/unpack.py" run --run-dir "$RUN3" >/dev/null
+python3 "$S/extract.py" --run-dir "$RUN3" >/dev/null
+python3 "$S/import_glossary.py" --run-dir "$RUN3" >/dev/null
+python3 "$S/chunk.py" --run-dir "$RUN3" >/dev/null
+
+TS=$(python3 "$S/typo_scan.py" scan --run-dir "$RUN3" --config "$WORK/tp/cfg.yaml")
+ge "错别字候选覆盖植入的 8 处" "$(echo "$TS" | jget "['candidates']")" 8
+PS=$(python3 "$S/scan_patterns.py" scan --run-dir "$RUN3" --config "$WORK/tp/cfg.yaml")
+check "范式候选数（2 风险 + 2 接口，章节引导语被 scope 排除）" \
+      "$(echo "$PS" | jget "['candidates']")" 4
+
+# 白名单陷阱：含错词表左串但写法正确的四段，一个候选都不该有
+python3 - "$RUN3" "$F/typo-pattern.answers.json" <<'PYEOF'
+import json,sys
+run,ans=sys.argv[1],json.load(open(sys.argv[2],encoding="utf-8"))
+cands=json.load(open(f"{run}/work/typos/typos-0001.json",encoding="utf-8"))["candidates"]
+hit=[t for t in ans["traps"] if any(c["context"] in t["text"] or t["contains"]==c["wrong"]
+                                    for c in cands)]
+sys.exit(1 if hit else 0)
+PYEOF
+check "白名单陷阱未产生候选（帐篷/以经济/子节点/登陆作战）" "$?" 0
+
+# 三通道并存：主通道用真实 pid，支线走各自的裁定
+python3 - "$RUN3" <<'PYEOF'
+import json,pathlib,sys
+run=sys.argv[1]
+paras={json.loads(l)["text"]:json.loads(l)["pid"]
+       for l in open(f"{run}/work/paragraphs.jsonl",encoding="utf-8")}
+pid=next(p for t,p in paras.items() if "阀值" in t)
+pathlib.Path(run,"work","issues").mkdir(parents=True,exist_ok=True)
+pathlib.Path(run,"work","issues","issues-0001.raw.jsonl").write_text(json.dumps(
+ {"pid":pid,"category":"A8","original_text":"设定为 200 毫秒","suggested_text":"设定为 200ms",
+  "evidence":"单位不统一","severity":"High"},ensure_ascii=False)+"\n",encoding="utf-8")
+t=json.load(open(f"{run}/work/typos/typos-0001.json",encoding="utf-8"))
+with open(f"{run}/work/typos/typos-0001.verdicts.jsonl","w",encoding="utf-8") as f:
+    for c in t["candidates"]:
+        f.write(json.dumps({"pid":c["pid"],"wrong":c["wrong"],"context":c["context"],
+                            "verdict":"B"},ensure_ascii=False)+"\n")
+p=json.load(open(f"{run}/work/patterns/patterns-0001.json",encoding="utf-8"))
+# 第 2 条风险缺影响与应对；owner 答 U（不确定即无问题，不得成条目）
+verdicts={0:{"impact":"Y","mitigation":"Y","owner":"Y"},1:{"impact":"N","mitigation":"N","owner":"U"},
+          2:{"request":"Y","response":"Y","error":"Y"},3:{"request":"Y","response":"N","error":"N"}}
+with open(f"{run}/work/patterns/patterns-0001.verdicts.jsonl","w",encoding="utf-8") as f:
+    for i,c in enumerate(p["candidates"]):
+        for k,v in verdicts[i].items():
+            f.write(json.dumps({"cid":c["cid"],"key":k,"answer":v},ensure_ascii=False)+"\n")
+PYEOF
+I3="$RUN3/work/issues"
+python3 "$S/verify_span.py" --run-dir "$RUN3" --chunk 0001 >/dev/null
+python3 "$S/typo_scan.py" merge --run-dir "$RUN3" --chunk 0001 --config "$WORK/tp/cfg.yaml" >/dev/null
+python3 "$S/verify_span.py" --run-dir "$RUN3" --chunk 0001 \
+  --in "$I3/issues-0001.typos.jsonl" --out "$I3/issues-0001.typos.jsonl" --cap 100 >/dev/null
+python3 "$S/filter_neverflag.py" --run-dir "$RUN3" --chunk 0001 --file "$I3/issues-0001.typos.jsonl" >/dev/null
+PM=$(python3 "$S/scan_patterns.py" merge --run-dir "$RUN3" --chunk 0001 --config "$WORK/tp/cfg.yaml")
+check "范式条目数（风险2 缺 2 项 + 接口2 缺 2 项，各合并为 1 条）" "$(echo "$PM" | jget "['merged']")" 2
+python3 "$S/verify_span.py" --run-dir "$RUN3" --chunk 0001 \
+  --in "$I3/issues-0001.patterns.jsonl" --out "$I3/issues-0001.patterns.jsonl" --cap 20 >/dev/null
+python3 "$S/filter_neverflag.py" --run-dir "$RUN3" --chunk 0001 --file "$I3/issues-0001.patterns.jsonl" >/dev/null
+
+check "主通道产物未被支线覆盖" "$(wc -l < "$I3/issues-0001.jsonl")" 1
+ge   "错别字支线产物条数"     "$(wc -l < "$I3/issues-0001.typos.jsonl")" 8
+check "范式支线产物条数"       "$(wc -l < "$I3/issues-0001.patterns.jsonl")" 2
+check "三条通道的闸门统计各自成档" \
+      "$(ls "$I3" | grep -c 'gates.json')" 3
+
+# P 类的三条硬约束：不带建议、不升到 High、rule_id 保留规则包里的开放标识
+python3 - "$I3/issues-0001.patterns.jsonl" <<'PYEOF'
+import json,sys
+rows=[json.loads(l) for l in open(sys.argv[1],encoding="utf-8")]
+assert rows, "无范式条目"
+assert all(not r.get("suggested_text") for r in rows), "P 类出现了建议文本"
+assert all(r["action"] in ("comment","report_only") for r in rows), "P 类动作越界"
+assert all(r["severity"] in ("Medium","Low") for r in rows), "P 类严重度超过 Medium"
+assert all(r["rule_id"].startswith("P-") for r in rows), "P 类 rule_id 丢了规则包标识"
+assert all(r["category"]=="P1" for r in rows), "P 类 category 不是 P1"
+# owner 答 U 的那条不得成为缺失项
+assert not any("责任人" in (r.get("evidence") or "") for r in rows), "U 被当成了缺失"
+PYEOF
+check "P 类：无建议文本 / 严重度≤Medium / 保留规则号 / U 不成条目" "$?" 0
+
+# 闸门③ 不得用词级规则误杀整段的 P 类条目
+python3 - "$I3/issues-0001.patterns.neverflag.json" <<'PYEOF'
+import json,sys
+sys.exit(0 if json.load(open(sys.argv[1],encoding="utf-8"))["dropped"]==0 else 1)
+PYEOF
+check "闸门③ 未用词级规则误杀 P 类条目" "$?" 0
+
+# 关掉开关后必须彻底静默（默认配置即为关闭）
+PD=$(python3 "$S/scan_patterns.py" scan --run-dir "$RUN3")
+check "pattern_review 关闭时不产生任何候选" "$(echo "$PD" | jget "['candidates']")" 0
+
+echo
 printf '通过 \033[32m%d\033[0m，失败 \033[31m%d\033[0m\n' "$PASS" "$FAIL"
 [ "$FAIL" -eq 0 ]

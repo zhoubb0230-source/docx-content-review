@@ -1,13 +1,21 @@
 ---
 name: docx-content-review
-description: 对 Word 文档（.doc/.docx）做语病、语义与全文逻辑性审查，输出审查报告并回写修订与批注。当用户要求审查、校对、查错、通读、把关、挑毛病，或要求检查前后一致性、前后矛盾、上下文冲突、术语是否统一、数据是否对得上、语病与错别字、表达是否有歧义时使用。也用于合同、方案、规划、可研、评审材料、设计说明书等长文档的交叉一致性核对。不做格式排版审查，不修改任何样式。
+description: 对 Word 文档（.doc/.docx）做错别字、语病语义与全文逻辑性审查，输出审查报告并回写修订与批注。当用户要求审查、校对、查错、找错别字、通读、把关、挑毛病，或要求检查前后一致性、前后矛盾、上下文冲突、术语是否统一、数据是否对得上、语病与错别字、表达是否有歧义时使用。也可按用户自备的规则包审查特定场景的描述范式（某类内容必须写清哪几项）。也用于合同、方案、规划、可研、评审材料、设计说明书等长文档的交叉一致性核对。不做格式排版审查，不修改任何样式。
 platform: XAgent
 version: 1.1.0
 ---
 
 # docx-content-review
 
-对 Word 文档执行**语病 / 语义 / 逻辑性**三类审查，交付「审查报告 + 带修订与批注的 Word 文档」。
+对 Word 文档执行四类审查，交付「审查报告 + 带修订与批注的 Word 文档」：
+
+| 审查什么 | 由谁产出 | 类别 |
+|---|---|---|
+| 错别字 | 词表出候选 + 模型二选一裁定（支线） | A1 |
+| 语病与语义（含语句不完整、歧义） | Pass 1 主审查 | A2–A8 / B1–B5 |
+| 前后描述与数据的一致性 | 事实台账 + 脚本比对（`detect_conflicts.py`） | L01–L32 |
+| 特定场景的描述范式 | 用户的规则包 + 模型逐要件裁定（支线，默认关） | P1 |
+
 支持 0–3000 页，支持中断续跑与多会话协作。
 
 ## 三条不可违反的底线
@@ -152,9 +160,51 @@ metrics.py bump --run-dir <run> --pass pass1_review --input-tokens N --output-to
 
 **子 Agent 只返回 `{路径, 计数, 状态}`，绝不返回问题正文。** 主 Agent 上下文只保留统计数字。
 
+### 第 4.5 步：两条支线（错别字 / 范式）
+
+这两类问题都**不能靠主审查顺带发现**，各走独立通道：脚本出候选 → 模型答封闭题 →
+过同样的两道闸门。两条支线各有独立配额，不占用主审查每片 20 条。
+
+与主审查是三次独立调用，**绝不合并**。支线可以和主审查在同一个 claim 周期里做完。
+
+**错别字**（`typo_check.enabled` 默认开）——模型对错别字有鲁棒性，让它自己找先天不利：
+
+```
+typo_scan.py scan --run-dir <run> --chunk <id>
+  → candidates:0 就跳过这一片
+  → 否则对 work/typos/typos-<id>.json 的每个 batch，按 prompts/pass1-typo.md 发起调用
+    （二选一：A 原字正确 / B 应改 / C 都不对），逐行写入 typos-<id>.verdicts.jsonl
+typo_scan.py merge --run-dir <run> --chunk <id>
+verify_span.py --run-dir <run> --chunk <id> \
+  --in work/issues/issues-<id>.typos.jsonl --out work/issues/issues-<id>.typos.jsonl --cap 100
+filter_neverflag.py --run-dir <run> --chunk <id> --file work/issues/issues-<id>.typos.jsonl
+```
+
+**范式**（`pattern_review.enabled` 默认关，无规则包时自动跳过）——用户提供规则包后才有内容：
+
+```
+scan_patterns.py scan --run-dir <run> --chunk <id> [--patterns <规则包>]
+  → candidates:0 就跳过；否则按 prompts/pass1-pattern.md 逐 batch 裁定
+    （每个要件只答 Y/N/U），写入 work/patterns/patterns-<id>.verdicts.jsonl
+scan_patterns.py merge --run-dir <run> --chunk <id> [--patterns <规则包>]
+verify_span.py --run-dir <run> --chunk <id> \
+  --in work/issues/issues-<id>.patterns.jsonl --out work/issues/issues-<id>.patterns.jsonl --cap 20
+filter_neverflag.py --run-dir <run> --chunk <id> --file work/issues/issues-<id>.patterns.jsonl
+```
+
+**`--in` 与 `--out` 必须同时给且指向支线自己的文件**——不给 `--out` 会覆盖主通道的
+`issues-<id>.jsonl`。路径用 `workspace.py resolve --kind issues|typos|patterns` 取。
+
+用户要求"重点查错别字"时，把 `typo_check.max_typos_per_chunk` 调高即可；
+**不要去放宽闸门②的 A1 阈值**——召回靠词表，不靠放松校验。
+
+用户提到"某类内容必须写清哪几项"（风险要写影响与应对、接口要写入参出参异常…），
+那是范式审查：开 `pattern_review.enabled`，并按 `references/patterns.md` 写规则包。
+**首轮通常没有规则包**，此时如实告诉用户这一类暂不覆盖，不要临时编规则。
+
 ### 第 5 步：Pass 2　盲测 A/B 二次复核
 
-把所有 `issues-*.jsonl` 合并为待复核集，按 `references/prompts/pass2-verify.md`
+把所有 `issues-*.jsonl`（含两条支线的 `.typos.jsonl` / `.patterns.jsonl`）合并为待复核集，按 `references/prompts/pass2-verify.md`
 批量复核（一次 ≤10 组），结果写入 `work/issues-verified.jsonl`（在原记录上加
 `"verify": {"result": "pass"|"drop"}`）。
 
@@ -236,8 +286,8 @@ workspace.py clean-temp --run-dir <run>
 | `glossary_scan.py` | 候选术语预筛 + 概念族聚类 | `--run-dir` | candidates / batches |
 | `import_glossary.py` | 术语表导入 + 自检 + 三层合并 | `--run-dir --authoritative --fallback` | entries / layers |
 | `chunk.py` | 分片（按 token） | `--run-dir` | chunks / single_pass |
-| `verify_span.py` | 闸门②③ | `--run-dir --chunk` | 各闸门丢弃计数 |
-| `filter_neverflag.py` | 不改清单硬过滤 | `--run-dir --chunk\|--all` | dropped / by_rule |
+| `verify_span.py` | 闸门②③ | `--run-dir --chunk [--in --out --cap]` | 各闸门丢弃计数 |
+| `filter_neverflag.py` | 不改清单硬过滤 | `--run-dir --chunk\|--all [--file]` | dropped / by_rule |
 | `ledger.py build\|rebuild\|stats` | 台账 SQLite 索引 | `--run-dir` | stats |
 | `detect_conflicts.py` | L01–L32 冲突检测 | `--run-dir [--rules]` | total / by_rule |
 | `apply_revisions.py plan\|apply` | 修订回写（两段式） | `--run-dir` | patches / applied |
@@ -247,7 +297,8 @@ workspace.py clean-temp --run-dir <run>
 | `metrics.py bump\|collect\|show` | 闸门丢弃率统计 | `--run-dir` | gates / gate_rates |
 | `import_decisions.py import\|apply\|show` | 审查记忆 | `--run-dir` | hits |
 | `report.py` | report.md + issues.xlsx（写 run/output/） | `--run-dir` | 路径 / 计数 / artifacts |
-| `typo_scan.py scan\|merge` | 错别字候选（默认关闭） | `--run-dir` | candidates |
+| `typo_scan.py scan\|merge` | 错别字候选（支线，默认开） | `--run-dir [--chunk]` | candidates |
+| `scan_patterns.py scan\|merge\|lint` | 范式场景定位与裁定合并（支线，默认关） | `--run-dir [--chunk --patterns]` | rules / candidates |
 
 **退出码**：0 成功 / 1 失败 / 2 参数错 / 3 环境缺失 / 4 写路径越界 / 5 磁盘不足 /
 6 工作目录不合法 / 7 租约被占 / 8 校验失败 / 9 令牌失效 / 10 输入不可解析。
@@ -261,7 +312,7 @@ workspace.py clean-temp --run-dir <run>
 **strictness 怎么选** —— 默认 `balanced`（A+B 类）。用户明确要"只报确定的错"用 `conservative`（仅 A 类）；要"尽量多提示"用 `thorough`（加 C 类，但 C 类永不入文档）。
 **`apply_threshold` 恒为 `conservative`，用户要求放宽也不行**——告诉用户报告可以更宽，但落笔门槛不放。
 
-**修订还是批注** —— 不用你判断，脚本已决定：唯一确定的正确替换 → 修订；无唯一答案（歧义、指代不明、逻辑冲突）→ 批注；仅风格倾向 → 只进报告。
+**修订还是批注** —— 不用你判断，脚本已决定：唯一确定的正确替换 → 修订；无唯一答案（歧义、指代不明、逻辑冲突、范式要件缺失）→ 批注；仅风格倾向 → 只进报告。
 
 **批注和报告里怎么称呼问题** —— 脚本已经把规则号译成了中文（「前后数值不一致」「的/地/得误用」），
 规则号只作为末尾的可追溯标记。**转述给用户时也用中文说法，不要念规则号**——
@@ -311,6 +362,7 @@ workspace.py clean-temp --run-dir <run>
 |---|---|
 | 判定某问题属于哪一类、某类的判定要件 | `references/taxonomy.md` |
 | 拿不准该不该上报、需要反例 | `references/never-flag.md` |
+| 要写或改一条范式规则、范式通道排障 | `references/patterns.md` |
 | 想知道某条 L 规则怎么判、动作是什么 | `references/logic-rules.md` |
 | 需要字段定义、schema | `references/schemas.md` |
 | 回写出问题、要理解 OOXML 结构 | `references/ooxml.md` |

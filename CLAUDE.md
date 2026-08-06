@@ -23,8 +23,13 @@
 2. 不改任何样式（D9）——只改文本，且只以修订/批注形式改。
 3. 不确定即无问题——所有判定是封闭选择题，UNSURE 按否定处理。
 
-优先级排序：**源文档完整性 > 样式不变性 > 定位准确率 > 回写安全性 > 误报率 > 逻辑检出率 > 语病召回率。**
-指标冲突时按此序取舍。任何为提升后四项而放松前三项的方案一律否决。
+优先级排序：**源文档完整性 > 样式不变性 > 定位准确率 > 回写安全性 > 误报率 >
+错别字召回率 > 逻辑检出率 > 语病召回率。**
+指标冲突时按此序取舍。任何为提升后几项而放松前四项的方案一律否决。
+
+错别字召回率排在逻辑与语病之前，是因为它的性质不同：**它靠词表（确定性资产），
+扩表不抬高误报率**；而语病召回靠模型，提召回必然抬高误报。
+因此"扩 `common-typos.txt`"永远可做，"放宽闸门②的 A1 阈值"永远不可做。
 
 ---
 
@@ -52,7 +57,10 @@
 | 闸门统计 | `scripts/metrics.py` | — |
 | 报告章节、xlsx 列 | `scripts/report.py` | `assets/report-template.md`；增列要升 `schema_version` |
 | 审查记忆 | `scripts/import_decisions.py` | — |
-| 错别字通道 | `scripts/typo_scan.py` + `assets/dict/` | — |
+| **新增一条范式规则** | `assets/patterns/*.yaml`（**不改代码**），或用户自带的包 | `references/patterns.md` 的正反例约定 |
+| 范式的场景定位逻辑、规则包校验 | `scripts/scan_patterns.py` | `references/patterns.md` + `prompts/pass1-pattern.md` |
+| 错别字通道 | `scripts/typo_scan.py` + `assets/dict/` | `prompts/pass1-typo.md` |
+| **扩充错别字词表**（提召回的唯一杠杆） | `assets/dict/common-typos.txt` | 白名单同步进 `typo-whitelist.txt` |
 | 默认配置 | `assets/config.default.yaml` | `docs/SPEC.md` §16 |
 
 ---
@@ -104,7 +112,16 @@ docx-content-review/tests/run_regression.sh --keep   # 保留工作目录排障
 ```
 
 回归覆盖：源文档保护、目录隔离、写路径守卫、三道脚本闸门、L01–L32 检出、
-ledger 重建幂等、术语表自检、修订回写、**D9 负向对照**、令牌栅栏、报告产物。
+ledger 重建幂等、术语表自检、修订回写、**D9 负向对照**、令牌栅栏、报告产物、
+两条支线（错词表自检 + 白名单陷阱零候选；范式规则包三条红线拒绝加载、
+P 类无建议文本、裁定 U 不成条目、三通道产物互不覆盖）。
+
+改动词表或规则包后，先跑这两个自检再跑全量：
+
+```bash
+python3 docx-content-review/scripts/typo_scan.py lint
+python3 docx-content-review/scripts/scan_patterns.py lint --patterns <你的包>
+```
 
 `corpus/` 放大型真实语料（不入 git）。小 fixture 跑快速回归，大语料只在里程碑跑。
 

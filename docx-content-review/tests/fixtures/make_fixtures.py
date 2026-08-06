@@ -10,6 +10,7 @@
   logic-injection.docx     + logic-injection.answers.json L01–L32 每条至少 1 例
   planning-tables.docx     + planning-tables.answers.json 规划类文档，表格密集
   style-regression.docx    + style-regression.answers.json 多字体字号，验证 D9
+  typo-pattern.docx        + typo-pattern.answers.json    错别字通道与 P 类范式通道
 """
 from __future__ import annotations
 
@@ -380,6 +381,71 @@ def build_style(outdir: Path) -> None:
     }, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
 
 
+def build_typo_pattern(outdir: Path) -> None:
+    """错别字支线 + P 类范式支线的联合语料。
+
+    错别字部分刻意混入白名单陷阱（帐篷、以经济、子节点）——词表是靠字符串匹配的，
+    这类噪音必然存在，能不能答对它们才是裁定调用的主要价值。
+    """
+    d = _doc()
+    d.add_heading("一、系统概述", level=1)
+    typos, traps = [], []
+
+    def typo(text, wrong, right):
+        d.add_paragraph(text)
+        typos.append({"text": text, "wrong": wrong, "right": right})
+
+    def trap(text, wrong):
+        """含错词表左串、但此处写法正确，不该被改。"""
+        d.add_paragraph(text)
+        traps.append({"text": text, "contains": wrong})
+
+    typo("系统布署完成后，需通过帐号登录管理后台并完成初始化配置。", "布署", "部署")
+    typo("响应时间的阀值设定为 200 毫秒，超出后触发告警。", "阀值", "阈值")
+    typo("客户端与服务端之间通过秘钥协商建立加密通道。", "秘钥", "密钥")
+    typo("本期工做已按计划完成，各模块进入联调阶段。", "工做", "作")
+    typo("截止目前，已完成三个一级模块的开发与自测。", "截止目前", "截至目前")
+    typo("双方签定合同后十五个工作日内启动实施。", "签定合同", "签订合同")
+    typo("运维团队每季度组织一次容灾演炼，覆盖全部核心链路。", "容灾演炼", "容灾演练")
+    typo("综上所诉，本方案在成本与工期上均可满足要求。", "综上所诉", "综上所述")
+
+    trap("现场保障人员在野外搭起帐篷，作为临时值守点。", "帐篷")
+    trap("本规划以经济效益与社会效益并重为原则。", "以经济")
+    trap("每个子节点独立承担一部分计算任务。", "子节点")
+    trap("登陆作战演练不在本系统的支撑范围内。", "登陆")
+
+    d.add_heading("二、风险分析", level=1)
+    patterns = []
+
+    def pat(text, pid_note, missing):
+        d.add_paragraph(text)
+        patterns.append({"text": text, "pattern_id": "P-RISK-01",
+                         "note": pid_note, "expect_missing": missing})
+
+    pat("风险1：第三方结算接口稳定性不足。若可用性低于 99%，将导致日终对账延迟一个工作日；"
+        "拟增加本地缓存与失败重试，并保留人工对账通道，由集成组负责跟进。",
+        "影响与应对齐备", [])
+    pat("风险2：核心开发人员集中在两人，存在单点依赖，需要重点关注。",
+        "缺影响与应对", ["影响", "应对措施"])
+    d.add_paragraph("本章分析项目实施过程中面临的主要风险与应对思路。")   # 引导语，scope 应排除
+
+    d.add_heading("三、接口设计", level=1)
+    d.add_paragraph("接口：订单查询。入参为订单号（必填）与租户 ID（必填）；"
+                    "出参返回订单主体、状态与最后更新时间；订单不存在时返回 40401。")
+    d.add_paragraph("接口：订单创建。根据购物车内容生成订单记录。")
+
+    d.save(str(outdir / "typo-pattern.docx"))
+    (outdir / "typo-pattern.answers.json").write_text(json.dumps({
+        "typos": typos, "traps": traps, "patterns": patterns,
+        "notes": [
+            "typos：错词表应产出候选；裁定为 B 后经闸门② A1 校验（长度差≤2 且差异字符≤3）",
+            "traps：含错词表左串但写法正确。白名单拦掉一部分，其余靠裁定答 A",
+            "patterns：P-RISK-01 的 scope 应命中风险1/风险2，排除章节引导语",
+            "P 类恒无 suggested_text，动作恒为 comment 或 report_only",
+        ],
+    }, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+
+
 def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--outdir", default=str(Path(__file__).resolve().parent))
@@ -391,6 +457,7 @@ def main() -> None:
     build_logic(out)
     build_planning(out)
     build_style(out)
+    build_typo_pattern(out)
     print("fixtures written to", out)
 
 
