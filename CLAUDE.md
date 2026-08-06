@@ -61,7 +61,7 @@
 | **新增一条范式规则** | `assets/patterns/*.yaml`（**不改代码**），或用户自带的包 | `references/patterns.md` 的正反例约定 |
 | 范式的场景定位逻辑、规则包校验 | `scripts/scan_patterns.py` | `references/patterns.md` + `prompts/pass1-pattern.md` |
 | 错别字通道 | `scripts/typo_scan.py` + `assets/dict/` | `prompts/pass1-typo.md` |
-| **扩充错别字词表**（提召回的唯一杠杆） | `assets/dict/common-typos.txt` | 白名单同步进 `typo-whitelist.txt` |
+| **扩充错别字词表**（提召回的唯一杠杆） | `assets/dict/common-typos.txt` | 白名单进 `typo-whitelist.txt`；**误报句进 `typo-traps.txt`** |
 | 默认配置 | `assets/config.default.yaml` | `docs/SPEC.md` §16 |
 
 ---
@@ -114,8 +114,13 @@ docx-content-review/tests/run_regression.sh --keep   # 保留工作目录排障
 
 回归覆盖：源文档保护、目录隔离、写路径守卫、三道脚本闸门、L01–L32 检出、
 ledger 重建幂等、术语表自检、修订回写、**D9 负向对照**、令牌栅栏、报告产物、
-两条支线（错词表自检 + 白名单陷阱零候选；范式规则包三条红线拒绝加载、
-P 类无建议文本、裁定 U 不成条目、三通道产物互不覆盖）。
+两条支线（错词表自检 + 负向语料对照 + 白名单陷阱零候选；范式规则包三条红线拒绝加载、
+P 类无建议文本、裁定 U 不成条目、三通道产物互不覆盖）、
+闸门④脚手架（payload 不泄题、排列可复现、判定表六条淘汰路径）。
+
+**扩词表时记住**：左串不能是常见词组的碎片。「按全」会被「按全流程」拆出来——
+这类条目既抬误报又白耗裁定调用，让「扩表不抬高误报率」的前提失效。
+`typo-traps.txt` 就是拦这个的，发现新误报时把那句话原样加进去，只增不减。
 
 改动词表或规则包后，先跑这两个自检再跑全量：
 

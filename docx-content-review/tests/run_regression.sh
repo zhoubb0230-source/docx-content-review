@@ -356,7 +356,16 @@ echo "══ 9. 支线：错别字与范式（P 类） ══"
 
 # 词表与规则包自检——扩表/加规则后最容易踩的四类坑，先卡住
 python3 "$S/typo_scan.py" lint >/dev/null 2>&1
-check "错词表自检通过（无同形项/单字项/白名单冲突/超 A1 闸门）" "$?" 0
+check "错词表自检通过（同形/单字/白名单冲突/超 A1 闸门/撞负向语料）" "$?" 0
+LT=$(python3 "$S/typo_scan.py" lint)
+ge "负向语料条数（合法句子，命中即误报）" "$(echo "$LT" | jget "['traps']")" 30
+
+# 负向对照：加一个碎片式左串（「按全」会被「按全流程」拆出来），自检必须失败。
+# 用 --typos 指向副本，**不碰技能目录**——它在运行期只读，第 1 节有断言。
+cp "$SKILL/assets/dict/common-typos.txt" "$WORK/ct-bad.txt"
+printf '按全\t安全\t负向对照\n' >> "$WORK/ct-bad.txt"
+python3 "$S/typo_scan.py" lint --typos "$WORK/ct-bad.txt" >/dev/null 2>&1
+check "负向对照：碎片式左串被负向语料抓出" "$?" 10
 LINT=$(python3 "$S/scan_patterns.py" lint)
 ge "内置范式规则数" "$(echo "$LINT" | jget "['rules']")" 2
 ge "范式规则携带的正反例数" "$(echo "$LINT" | jget "['examples_total']")" 6

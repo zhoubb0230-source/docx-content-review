@@ -42,8 +42,8 @@ from workspace import SKILL_ROOT, guard_write_path, load_config, resolve_path  #
 DICT_DIR = SKILL_ROOT / "assets" / "dict"
 
 
-def _load_pairs(name: str) -> list[tuple[str, str, str]]:
-    p = DICT_DIR / name
+def _load_pairs(name: str, override: str | None = None) -> list[tuple[str, str, str]]:
+    p = Path(override) if override else DICT_DIR / name
     out = []
     if not p.exists():
         return out
@@ -58,19 +58,26 @@ def _load_pairs(name: str) -> list[tuple[str, str, str]]:
     return out
 
 
-def _load_list(name: str) -> set[str]:
-    p = DICT_DIR / name
+def _load_list(name: str, override: str | None = None) -> set[str]:
+    p = Path(override) if override else DICT_DIR / name
     if not p.exists():
         return set()
     return {ln.strip() for ln in p.read_text(encoding="utf-8").splitlines()
             if ln.strip() and not ln.startswith("#")}
 
 
-def lint() -> dict:
+def lint(typos_path: str | None = None, traps_path: str | None = None) -> dict:
     """词表自检。扩表是提召回的唯一手段，也是最容易引入误报的地方——
-    这四项都是实际踩过的坑，扩表后必跑。"""
-    rows = [(w, r) for w, r, _ in _load_pairs("common-typos.txt")]
+    下面每一项都是实际踩过的坑，扩表后必跑。
+
+    最要紧的是 `false_positive`：拿每条左串去撞 `typo-traps.txt` 里的合法句子。
+    **只验"能查出错"不算验，还要验"不会把对的判成错"**——
+    「按全」会被「按全流程」拆出来，「以经」会被「以经验」拆出来，
+    这类条目让"扩表不抬高误报率"这个前提失效，必须改写或删除。
+    """
+    rows = [(w, r) for w, r, _ in _load_pairs("common-typos.txt", typos_path)]
     whitelist = _load_list("typo-whitelist.txt")
+    traps = [t for t in _load_list("typo-traps.txt", traps_path)]
     seen, dup = set(), []
     for w, _ in rows:
         (dup.append(w) if w in seen else seen.add(w))
@@ -85,8 +92,12 @@ def lint() -> dict:
         # 差异超出 A1 闸门（长度差 ≤2 且编辑距离 ≤3）→ 永远落不了笔，只会降级成批注
         "over_a1_gate": [w for w, r in rows
                          if abs(len(w) - len(r)) > 2 or levenshtein(w, r) > 3],
+        # 负向语料：命中即误报。白名单能拦下的不算。
+        "false_positive": [f"{w} ← 「{t}」" for w, _ in rows for t in traps
+                           if w in t and not (w in whitelist
+                                              or any(x in t and w in x for x in whitelist))],
     }
-    return {"entries": len(rows), "whitelist": len(whitelist),
+    return {"entries": len(rows), "whitelist": len(whitelist), "traps": len(traps),
             "ok": not any(problems.values()), "problems": problems}
 
 
@@ -205,10 +216,13 @@ def main(argv: list[str]) -> int:
     p.add_argument("--run-dir", required=True)
     p.add_argument("--chunk", required=True)
     p.add_argument("--config")
-    sub.add_parser("lint", help="自检词表，不需要 run 目录")
+    p = sub.add_parser("lint", help="自检词表，不需要 run 目录")
+    # 允许指向别处的词表：技能目录在运行期只读，负向对照不该去改它
+    p.add_argument("--typos", help="错词表路径；默认用内置的")
+    p.add_argument("--traps", help="负向语料路径；默认用内置的")
     args = ap.parse_args(argv)
     if args.cmd == "lint":
-        res = lint()
+        res = lint(getattr(args, "typos", None), getattr(args, "traps", None))
         emit({"ok": res["ok"], **res})
         return EX.OK if res["ok"] else EX.PARSE
     run_dir = Path(args.run_dir).resolve()
