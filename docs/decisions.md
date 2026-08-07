@@ -449,3 +449,35 @@ L 规则表、目录结构、配置项）不在此重复。
 - **影响**：`assets/dict/common-typos.txt`（231 条）、
   新增 `assets/dict/typo-traps.txt`（35 条）、`scripts/typo_scan.py`、
   `tests/run_regression.sh`、`CLAUDE.md` 测试一节。
+
+## ADR-029　Pass 4 的准入策略必须 fail-closed，且三处调用点共用一份
+
+- **日期**：2026-08-06
+- **发现**：`apply_comments` / `apply_revisions` / `report` 三处各写了一遍
+  `if v and v.get("verdict") == "NOT_CONFLICT": continue`。
+  `v is None`（Pass 4 没跑、跑了一半、或那条漏答）时条件不成立，
+  **候选照常写进文档**。实测：把 `conflicts-verified.jsonl` 清空，
+  `apply_comments plan` 依旧计划写入 22 条批注——
+  **「Pass 4 完全跳过」与「全部裁定为 CONFLICT」产出一模一样。**
+- **同时，UNSURE 也没有被按判定表处理**：`prompts/pass4-adjudicate.md` 写明
+  「UNSURE 按 NOT_CONFLICT 处理，仅 Critical 保留」，但代码里只排除 NOT_CONFLICT，
+  于是全部裁定为 UNSURE 也是 22 条批注。
+- **这违反了三处已经写死的东西**：底线三「不确定即无问题」、
+  `logic-rules.md`「所有 L 规则的输出都是候选，必须过 Pass 4 裁定后才进交付物」、
+  以及 prompt 自己的判定表。
+- **决策**：策略收进 `_common.py` 的 `conflict_admitted(candidate, verdict)`，
+  三处调用点共用。CONFLICT 准入；NOT_CONFLICT 丢弃；
+  UNSURE 丢弃（Critical 例外，标注「需人工确认」）；
+  **未裁定丢弃，Critical 也没有例外**——未裁定说明流程没走完，
+  与"模型拿不准"不是一回事，不该享受同样的宽容。
+- **但不得静默隐藏**：未准入的候选照常进报告与 `issues.xlsx`，
+  并在报告「本次未覆盖范围」按原因计数。
+  静默隐藏与 fail-open 一样糟——用户会以为文档里已经没有这些冲突了。
+- **回归覆盖四条路径**（全 CONFLICT / 未裁定 / 全 NOT_CONFLICT / 全 UNSURE）
+  加一条「未裁定的候选仍在报告中可见」。
+- **教训与 ADR-026 同源**：同一份策略在三处各写一遍，就会有一处写错，
+  而且错的那一处是**默认放行**。凡是"某某必须通过 X 才能进交付物"的规则，
+  实现上都应该是一个准入函数，而不是三个排除条件。
+- **影响**：`scripts/_common.py`、`apply_comments.py`、`apply_revisions.py`、
+  `report.py`、`references/logic-rules.md`、`prompts/pass4-adjudicate.md`、
+  `docs/SPEC.md` §9.5、`tests/run_regression.sh`。

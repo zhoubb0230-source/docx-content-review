@@ -712,5 +712,63 @@ CONS=$(python3 "$S/verify_pass2.py" consistency --run-dir "$RUN4")
 check "两种排列判定一致率可计算且达标" "$(echo "$CONS" | jget "['meets_threshold']")" True
 
 echo
+echo "══ 12. Pass 4 裁定缺失时必须 fail-closed ══"
+
+# RUN2 是 logic-injection，已有全部冲突候选。逐一验四条路径。
+CVF="$RUN2/work/conflicts-verified.jsonl"
+cp "$CVF" "$WORK/cv.bak" 2>/dev/null || true
+setverdict() { python3 - "$RUN2" "$1" <<'PYEOF'
+import json,glob,sys,pathlib
+run,v=sys.argv[1],sys.argv[2]
+rows=[] if v=="none" else [
+  {"conflict_id":c["conflict_id"],"verdict":v,"note":"回归"}
+  for f in glob.glob(f"{run}/work/conflicts/conflicts-candidate.*.json")
+  for c in json.load(open(f,encoding="utf-8"))["candidates"]]
+pathlib.Path(run,"work","conflicts-verified.jsonl").write_text(
+  "".join(json.dumps(r,ensure_ascii=False)+"\n" for r in rows),encoding="utf-8")
+PYEOF
+}
+plancount() { python3 "$S/apply_comments.py" plan --run-dir "$RUN2" | jget "['comments']"; }
+
+setverdict CONFLICT; BASE=$(plancount)
+ge "全部裁定 CONFLICT 时有批注（基准）" "$BASE" 5
+
+# 这条是本节的核心：Pass 4 没跑过，一条批注都不许进文档。
+# 原实现三处都写 `if v and v.get("verdict")=="NOT_CONFLICT"`，v 为 None 时条件不成立，
+# 于是「Pass 4 完全跳过」与「全部裁定为 CONFLICT」产出一模一样。
+setverdict none
+check "Pass 4 未裁定 → 零批注（不得 fail-open）" "$(plancount)" 0
+setverdict NOT_CONFLICT
+check "全部裁定 NOT_CONFLICT → 零批注" "$(plancount)" 0
+
+# UNSURE 按 NOT_CONFLICT 处理，唯一例外是 Critical 级（prompts/pass4-adjudicate.md 判定表）
+setverdict UNSURE
+NU=$(plancount)
+python3 - "$RUN2" <<'PYEOF'
+import json,sys
+items=json.load(open(f"{sys.argv[1]}/work/commentlist.json",encoding="utf-8"))["comments"]
+bad=[i for i in items if i["severity"]!="Critical"]
+noflag=[i for i in items if "需人工确认" not in i["text"]]
+for i in bad:    print("    非 Critical 的 UNSURE 混进来了：", i["text"][:30])
+for i in noflag: print("    Critical 的 UNSURE 未标注待人工确认：", i["text"][:30])
+sys.exit(1 if bad or noflag or not items else 0)
+PYEOF
+check "UNSURE 只保留 Critical 级且标注待人工确认" "$?" 0
+[ "$NU" -lt "$BASE" ] && ok "UNSURE 保留数少于全 CONFLICT（$NU < $BASE）" \
+                      || bad "UNSURE 未被收窄（$NU vs $BASE）"
+
+# 未准入的候选不得从报告里消失——静默隐藏和 fail-open 一样糟
+setverdict none
+python3 "$S/report.py" --run-dir "$RUN2" >/dev/null
+python3 - "$RUN2" <<'PYEOF'
+import glob,sys
+md=open(glob.glob(f"{sys.argv[1]}/output/*.report.md")[0],encoding="utf-8").read()
+sys.exit(0 if "未写入文档的冲突候选" in md else 1)
+PYEOF
+check "未裁定的候选仍在报告中列出（不静默隐藏）" "$?" 0
+
+cp "$WORK/cv.bak" "$CVF" 2>/dev/null || true
+
+echo
 printf '通过 \033[32m%d\033[0m，失败 \033[31m%d\033[0m\n' "$PASS" "$FAIL"
 [ "$FAIL" -eq 0 ]

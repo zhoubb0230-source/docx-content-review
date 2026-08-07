@@ -31,7 +31,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import ooxml as ox  # noqa: E402
 from _common import (  # noqa: E402
-    EX, SEVERITY_PREFIX, atomic_write_json, die, emit, read_json, read_jsonl, rule_label,
+    conflict_admitted, EX, SEVERITY_PREFIX, atomic_write_json, die, emit, read_json, read_jsonl, rule_label,
     run_cli, version_header, warn,
 )
 from workspace import (  # noqa: E402
@@ -106,6 +106,7 @@ def build_plan(run_dir: Path, cfg: dict) -> dict:
 
     verdicts = {c.get("conflict_id"): c for c in
                 read_jsonl(resolve_path(run_dir, "conflicts_verified"))}
+    withheld: dict[str, int] = {}      # 未准入交付物的候选，按原因计数
     cdir = resolve_path(run_dir, "conflicts_candidate")
     for path in sorted(cdir.glob("conflicts-candidate.*.json")):
         for c in (read_json(path, {}) or {}).get("candidates", []):
@@ -116,9 +117,11 @@ def build_plan(run_dir: Path, cfg: dict) -> dict:
             if action == "report_only" and not (rule in {"L29", "L30", "L31", "L32"} and to_comment):
                 continue
             v = verdicts.get(c["conflict_id"])
-            if v and v.get("verdict") == "NOT_CONFLICT":
+            ok, why = conflict_admitted(c, v)
+            if not ok:
+                withheld[why] = withheld.get(why, 0) + 1
                 continue
-            unsure = bool(v and v.get("verdict") == "UNSURE")
+            unsure = why == "unsure_critical"
             sides = c.get("sides") or []
             if not sides:
                 continue
@@ -163,7 +166,8 @@ def build_plan(run_dir: Path, cfg: dict) -> dict:
     path = resolve_path(run_dir, "work") / "commentlist.json"
     guard_write_path(path, run_dir)
     atomic_write_json(path, {**version_header(), "comments": items})
-    return {"comments": len(items), "path": str(path)}
+    return {"comments": len(items), "path": str(path), "withheld": withheld,
+            "withheld_total": sum(withheld.values())}
 
 
 # --------------------------------------------------------------------------

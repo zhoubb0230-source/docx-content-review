@@ -23,7 +23,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import ooxml as ox  # noqa: E402
 from _common import (  # noqa: E402
-    EX, atomic_write_json, die, emit, read_json, read_jsonl, run_cli, version_header,
+    conflict_admitted, EX, atomic_write_json, die, emit, read_json, read_jsonl, run_cli, version_header,
 )
 from workspace import (  # noqa: E402
     Heartbeat, guard_write_path, lease_verify, load_config, resolve_path,
@@ -63,8 +63,9 @@ def build_plan(run_dir: Path, cfg: dict) -> dict:
             if c.get("action") != "revision" or not sug.get("suggested_text"):
                 continue
             v = verified.get(c["conflict_id"])
-            if v and v.get("verdict") == "NOT_CONFLICT":
-                demoted.append({"id": c["conflict_id"], "reason": "Pass 4 裁定为非冲突"})
+            ok, why = conflict_admitted(c, v)
+            if not ok:
+                demoted.append({"id": c["conflict_id"], "reason": why})
                 continue
             patches.append({
                 "patch_id": c["conflict_id"], "pid": c["sides"][0]["pid"],

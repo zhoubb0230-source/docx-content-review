@@ -42,6 +42,10 @@ Pass 1 的子 Agent 是失忆的，只有到这一步才第一次看得见两侧
 | `CONFLICT` | 进入交付物（批注或修订，按规则的 action） |
 | `NOT_CONFLICT` | 丢弃 |
 | `UNSURE` | **按 NOT_CONFLICT 处理**；但 Critical 级的 UNSURE 保留，并在批注中标注"待人工确认" |
+| **漏答 / 没跑到** | **同样不进交付物。** 这一档比 UNSURE 更严：Critical 也没有例外——它说明流程没走完，不是模型拿不准 |
+
+这张表由脚本执行（`_common.py` 的 `conflict_admitted`），三处调用点共用同一份策略。
+**你漏答一条，那条就不会进文档**，因此宁可如实答 UNSURE，也不要跳过。
 
 ## 结果写回
 

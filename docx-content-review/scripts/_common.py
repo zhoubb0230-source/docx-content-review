@@ -233,6 +233,33 @@ LOGIC_GROUP_LABELS = {
 SEVERITY_PREFIX = {"Critical": "[严重]", "High": "[重要]", "Medium": "[提示]", "Low": "[提示]"}
 
 
+def conflict_admitted(candidate: dict, verdict: dict | None) -> tuple[bool, str]:
+    """Pass 4 裁定 → 该冲突候选是否准入交付物。三处调用点必须用同一份策略。
+
+    **未裁定与 UNSURE 都是"不确定"，一律不进交付物**——这是底线三，
+    也是 `logic-rules.md` 写死的"所有 L 规则的输出都是候选，必须过 Pass 4 裁定后
+    才进交付物"。
+
+    早先三处调用点各写了一遍 `if v and v.get("verdict") == "NOT_CONFLICT": continue`，
+    于是 `v is None`（Pass 4 没跑或跑了一半）时条件不成立，候选**照常写进文档**——
+    Pass 4 完全跳过与全部裁定为 CONFLICT，产出一模一样。这是 fail-open。
+
+    唯一的例外是 Critical 级的 UNSURE：数值/日期/状态矛盾漏掉的代价更大，
+    保留但必须在批注里标注"待人工确认"（见 prompts/pass4-adjudicate.md 判定表）。
+    **未裁定没有这个例外**——它说明流程没走完，不是模型拿不准。
+    """
+    v = (verdict or {}).get("verdict")
+    if v == "CONFLICT":
+        return True, ""
+    if v == "NOT_CONFLICT":
+        return False, "裁定为不构成矛盾"
+    if v == "UNSURE":
+        if (candidate.get("severity") or "") == "Critical":
+            return True, "unsure_critical"
+        return False, "UNSURE 按不构成矛盾处理（不确定即无问题）"
+    return False, "未经 Pass 4 裁定，不进交付物"
+
+
 def rule_label(rule: str) -> str:
     """规则号 → 面向读者的中文标签。未登记的规则原样返回。"""
     return CATEGORY_LABELS.get(rule) or LOGIC_GROUP_LABELS.get(rule) or rule

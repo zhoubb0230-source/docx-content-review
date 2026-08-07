@@ -14,7 +14,7 @@
 技能包结构完整、可运行：`SKILL.md` + 7 份 references + 7 份 prompt 模板
 + 24 个脚本 + 配置与词典/规则包资源 + 6 份 fixture。
 
-`tests/run_regression.sh`：**96 项检查全部通过**，约 50 秒，不调用任何 LLM。
+`tests/run_regression.sh`：**102 项检查全部通过**，约 55 秒，不调用任何 LLM。
 
 ### 2026-08-06 按用户五条需求对齐（详见 `requirements-alignment.md`、ADR-021…023）
 
@@ -142,7 +142,18 @@
 `typo_scan.py lint` 每次都会拿全部左串去撞一遍。详见 ADR-028。
 改写后 13 句真错字仍全部命中，**召回没有损失**。
 
-**这四份基线的效力边界要说清楚**：跑它的模型能力高于本技能面向的"中等能力模型"，
+**第五轮：Pass 4 准入策略——发现它 fail-open**
+
+`apply_comments` / `apply_revisions` / `report` 三处各写了一遍
+`if v and v.get("verdict") == "NOT_CONFLICT"`，`v is None` 时条件不成立。
+实测把 `conflicts-verified.jsonl` 清空，**依旧计划写入 22 条批注**——
+「Pass 4 完全跳过」与「全部裁定为 CONFLICT」产出一模一样。
+全部裁定为 UNSURE 同样是 22 条，判定表里「UNSURE 按 NOT_CONFLICT 处理」没被执行。
+
+已收进 `_common.py` 的 `conflict_admitted()`，三处共用；未准入的候选仍在报告里可见。
+详见 ADR-029。
+
+**这五份基线的效力边界要说清楚**：跑它的模型能力高于本技能面向的"中等能力模型"，
 所以 0% 误报是**上限而非典型值**。它证明的是「prompt 与不改清单本身不诱导误报」，
 不能替代中等模型上的实测。A/B 盲测的位置一致率（M2 验收项）也还没测。
 
@@ -161,9 +172,10 @@
 - 范式要件裁定的一致性
 
 `pass1-review` / `pass1-extract` / `pass2-verify` 三份已覆盖（后者是补齐了脚本侧）。
-**剩下：`pass0-glossary`、`pass4-adjudicate`，以及 `pass1-typo` / `pass1-pattern`
-两份新 prompt 的裁定准确率。** 错别字这一侧的噪音已经从词表层压掉了一大块
-（ADR-028），裁定要面对的硬例子因此少了很多，但仍未实测。
+**剩下 `pass0-glossary`，以及 `pass1-typo` / `pass1-pattern` / `pass4-adjudicate`
+三份 prompt 的裁定准确率。** 三者的脚本侧现在都已 fail-closed，
+漏答不会变成误报，只会变成漏报——这让"未实测"的风险从"可能写错东西"
+降到了"可能少写东西"。
 
 **M2 的位置一致率现在可测但未在中等模型上测过**，这是它真正的用武之地。
 

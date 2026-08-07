@@ -782,6 +782,16 @@ Pass 3 不得将全量 facts 一次性载入内存。3000 页文档的台账条�
 
 ### 9.5 Pass 4 裁定 prompt 要点
 
+**裁定结果的准入策略是 fail-closed 的**：`CONFLICT` 进交付物；`NOT_CONFLICT` 丢弃；
+`UNSURE` 按 `NOT_CONFLICT` 处理，仅 Critical 级保留并标注"需人工确认"；
+**没有裁定结果的候选一律不进交付物，Critical 也没有例外**——
+未裁定说明流程没走完，与"模型拿不准"是两回事。
+该策略由 `_common.py` 的 `conflict_admitted()` 统一实现，
+`apply_comments` / `apply_revisions` / `report` 三处共用，不得各写一份。
+未准入的候选**不得静默消失**：报告与 `issues.xlsx` 照常列出，并在
+「本次未覆盖范围」按原因给出计数。
+
+
 - 同时给出冲突双方的 `original_text` + 各自的 `heading_path`。
 - 唯一问题：「这两处描述是否构成真实矛盾？还是因适用范围/前提条件不同而并不矛盾？回答 CONFLICT / NOT_CONFLICT / UNSURE，并用一句话（≤30 字）说明范围差异。」
 - **UNSURE 按 NOT_CONFLICT 处理**（除 Critical 级，Critical 级 UNSURE 保留并标注"待人工确认"）。

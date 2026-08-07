@@ -23,7 +23,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from _common import (  # noqa: E402
-    EX, atomic_write_text, emit, now_iso, read_json, read_jsonl, rule_label, run_cli,
+    conflict_admitted, EX, atomic_write_text, emit, now_iso, read_json, read_jsonl, rule_label, run_cli,
     version_header,
 )
 from workspace import (  # noqa: E402
@@ -77,8 +77,11 @@ def load_rows(run_dir: Path, cfg: dict) -> list[dict]:
     for path in sorted(cdir.glob("conflicts-candidate.*.json")):
         for c in (read_json(path, {}) or {}).get("candidates", []):
             v = verdicts.get(c["conflict_id"])
-            if v and v.get("verdict") == "NOT_CONFLICT":
-                continue
+            ok, why = conflict_admitted(c, v)
+            if not ok and why == "裁定为不构成矛盾":
+                continue                       # 明确判否的才丢
+            # 未裁定 / 非 Critical 的 UNSURE 不进交付物，但**必须在报告里可见**——
+            # 静默隐藏和 fail-open 一样糟，用户会以为文档里已经没有这些冲突了
             sides = c.get("sides") or [{}]
             rows.append({
                 "id": c["conflict_id"], "severity": c.get("severity") or "Medium",
@@ -92,6 +95,7 @@ def load_rows(run_dir: Path, cfg: dict) -> list[dict]:
                 "memory_hit": False, "note": c.get("note") or c.get("description") or "",
                 "kind": "conflict", "sides": sides, "chapter_span": c.get("chapter_span"),
                 "description": c.get("description"),
+                "admitted": ok, "withheld_reason": "" if ok else why,
             })
 
     for r in rows:
@@ -367,6 +371,12 @@ def render_markdown(run_dir: Path, rows: list[dict], cfg: dict) -> str:
           "错别字召回上限 = common-typos.txt 的覆盖范围 |")
     if not pr.get("enabled"):
         w("| 场景描述范式 | — | pattern_review 未启用（需先提供范式规则包） |")
+    # 未准入交付物的冲突候选必须在这里露面：它们在报告里有，但文档里没有
+    held = [r for r in rows if r.get("kind") == "conflict" and r.get("admitted") is False]
+    if held:
+        by = Counter(r.get("withheld_reason") or "?" for r in held)
+        for reason, n in by.most_common():
+            w(f"| 未写入文档的冲突候选 | {n} | {reason}；仅在本报告与 issues.xlsx 中列出 |")
     if not (cfg.get("argument_review") or {}).get("enabled"):
         w("| 论证链审查 | — | argument_review 默认关闭（无客观阈值，误报不可收敛） |")
     w("| 格式/排版规范 | — | 本技能不做格式审查，且不修改任何样式（D9） |")
