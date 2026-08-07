@@ -481,3 +481,33 @@ L 规则表、目录结构、配置项）不在此重复。
 - **影响**：`scripts/_common.py`、`apply_comments.py`、`apply_revisions.py`、
   `report.py`、`references/logic-rules.md`、`prompts/pass4-adjudicate.md`、
   `docs/SPEC.md` §9.5、`tests/run_regression.sh`。
+
+## ADR-030　N7 的 fallback 压制必须与"是否动了该术语"挂钩
+
+- **日期**：2026-08-06
+- **背景**：审 `pass0-glossary` 时注意到术语表有个别处没有的性质——
+  **它是唯一一个用来压制发现的输入**（N7 抑制误报、L05 概念族）。
+  放行方向的 fail-open 会多写东西，压制方向的 fail-open 会少写东西，
+  而后者在输出里没有任何痕迹。
+- **发现**：`filter_neverflag` 的 N7 判据是
+  `if term and len(term) >= 2 and term in normalize_key(text): return "N7"`——
+  **只要跨度里出现该 fallback 术语就压制**。用户表里放一个「系统」或「平台」，
+  技术文档里几乎每句话都含这两个字，于是含它们的发现全部被静默吞掉。
+  实测：「通过帐号登录系统」「认真的完成了平台建设」「改善了平台的响应速度问题」
+  三条全被 N7 丢弃。
+- **这个场景很容易发生**，不是构造出来的：SKILL.md 明确建议用户把
+  Pass 0 抽出的 `glossary.json` 人工修订后作为下一轮的输入，
+  而 `glossary_scan.py` 的 `min_term_freq: 3` 预筛只会让高频通用词更容易入选。
+- **决策**：fallback 层的意义是「别改它」，因此压制条件改为
+  **建议里该术语没了**——说明这条问题确实要动术语本身：
+  `if sugg and term in nt and term not in ns`。
+  B 类没有建议、不改任何字，"别改它"对它不适用，因此不参与本条压制。
+- **一个已知的边界**：把 fallback 术语「星云」改成「星云平台」时，
+  术语仍是建议的子串，不会被压制。这类"要求展开别名"的情形由 N7 的
+  别名组分支（`_alias_groups`）覆盖，暂不额外处理。
+- **与 ADR-029 是一对**：那条是放行方向 fail-open（未裁定照样写进文档），
+  这条是压制方向 fail-open（术语沾边就吞掉发现）。
+  **凡是"某个条件成立就跳过检查"的判据，都要问一句：这个条件在真实语料上
+  会有多大比例成立？** 若接近全集，它就不是过滤器，是开关。
+- **影响**：`scripts/filter_neverflag.py`、`references/never-flag.md` N7 一节、
+  `tests/run_regression.sh`。

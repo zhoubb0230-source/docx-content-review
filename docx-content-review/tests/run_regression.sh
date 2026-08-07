@@ -770,5 +770,39 @@ check "未裁定的候选仍在报告中列出（不静默隐藏）" "$?" 0
 cp "$WORK/cv.bak" "$CVF" 2>/dev/null || true
 
 echo
+echo "══ 13. N7 压制必须有比例：fallback 术语不得吞掉整份审查 ══"
+
+# fallback 层的意义是「别改它」。若判成「跨度里出现该术语就压制」，
+# 用户表里只要有「系统」「平台」这类两字词，含这两个字的发现就全被静默吞掉——
+# 压制方向的 fail-open 比放行方向更危险：它表现为"什么都没查出来"。
+python3 - "$S" <<'PYEOF'
+import sys
+sys.path.insert(0, sys.argv[1])
+import filter_neverflag as nf
+glo={"entries":[{"key":"系统","preferred":"系统","source":"fallback","enforce":"off"},
+                {"key":"平台","preferred":"平台","source":"fallback","enforce":"off"},
+                {"key":"数据 owner","preferred":"数据 owner","source":"fallback","enforce":"off"}]}
+g,fb=nf._alias_groups(glo),nf._fallback_terms(glo)
+def hit(cat,text,sugg):
+    return nf.check({"original_text":text,"category":cat,"suggested_text":sugg},
+                    {"text":text},{"skip":{}},glo,g,fb)
+bad=[]
+# 术语只是出现在跨度里、建议并未改动它 → 必须保留
+for cat,t,s2 in [("A1","通过帐号登录系统","通过账号登录系统"),
+                 ("A2","认真的完成了平台建设","认真地完成了平台建设"),
+                 ("A5","改善了平台的响应速度问题","改善了平台的响应速度")]:
+    if hit(cat,t,s2): bad.append(f"{cat} 「{t}」被误压制")
+# B 类不改任何字，「别改它」对它不适用 → 必须保留
+if hit("B1","它的接口规范尚未确定，涉及系统与平台",""):
+    bad.append("B 类被 fallback 术语压制")
+# 建议确实动了 fallback 术语 → 必须压制（这是 N7 本来的用途）
+if hit("A5","数据 owner 审批","数据责任人审批") != "N7":
+    bad.append("确实改动 fallback 术语时未被 N7 压制")
+for b in bad: print("   ", b)
+sys.exit(1 if bad else 0)
+PYEOF
+check "N7 只在建议动了 fallback 术语时压制" "$?" 0
+
+echo
 printf '通过 \033[32m%d\033[0m，失败 \033[31m%d\033[0m\n' "$PASS" "$FAIL"
 [ "$FAIL" -eq 0 ]

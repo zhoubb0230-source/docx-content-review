@@ -140,9 +140,20 @@ def check(issue: dict, para: dict | None, cfg: dict, glossary: dict,
         for g in groups:
             if any(f in a for f in g) and any(f in b for f in g):
                 return "N7"
-    for term in fallback:
-        if term and len(term) >= 2 and term in normalize_key(text):
-            return "N7"
+    # fallback 层的意义是「别改它」，所以只有当这条问题**确实要动这个术语**时才压制：
+    # 建议里该术语没了，说明修改落在术语本身上。
+    #
+    # 早先的条件是「跨度里出现该术语就压制」。这在真实文档里等于关掉大半个审查——
+    # 用户的 fallback 表里只要有「系统」「平台」「数据」这类两字词，
+    # 每一条含这两个字的发现都会被静默吞掉，而输出里没有任何痕迹。
+    # 压制方向的 fail-open 比放行方向更危险：它表现为"什么都没查出来"。
+    #
+    # B 类没有建议，不改任何字，"别改它"对它不适用，因此不参与本条压制。
+    if sugg:
+        nt, ns = normalize_key(text), normalize_key(sugg)
+        for term in fallback:
+            if term and len(term) >= 2 and term in nt and term not in ns:
+                return "N7"
 
     # N8 行业惯用简称、产品代号、内部代号
     tokens = re.findall(r"[A-Za-z][A-Za-z0-9]{0,9}", normalize_width(text))
