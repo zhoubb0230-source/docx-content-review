@@ -184,9 +184,9 @@ def build_plan(run_dir: Path, cfg: dict) -> dict:
             lines = [rule_label(rule)]
             if other and rule in RIVAL_RULES:
                 where = " > ".join(other.get("heading_path") or []) or "文档其他位置"
-                lines.append(f"本处与「{where}」（第 {other.get('page_hint')} 页）的描述不一致：")
-                lines.append(f"　此处：{sides[0].get('text','')[:80]}")
-                lines.append(f"　彼处：{other.get('text','')[:80]}")
+                # 只引另一处。本处那一句批注范围已经精确圈住了，再抄一遍是重复。
+                lines.append(f"与「{where}」（第 {other.get('page_hint')} 页）的描述不一致："
+                             f"{other.get('text','')[:80]}")
                 # 不判断哪一处是对的——文档之外的事实不在模型视野里
                 lines.append("请确认以哪一处为准。")
             else:
