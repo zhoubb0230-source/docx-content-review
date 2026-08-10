@@ -218,6 +218,62 @@ def comment_range_nodes(para, needle: str = "") -> tuple:
     return a, b
 
 
+def _split_run_at(run, offset: int):
+    """把一只可拆分 run 在第 offset 个字符处切成两只，返回 (前, 后)。
+
+    文本逐字不变、rPr 深拷贝，因此「拒绝修订视图的逐字符 (字, rPr)」与
+    「每段用到的 rPr 指纹集合」都不变——这正是 D9 校验的两个判据。
+    """
+    text = run_text(run)
+    if offset <= 0:
+        return None, run
+    if offset >= len(text):
+        return run, None
+    rpr = clone_rpr(run)
+    left, right = new_run(rpr, text[:offset]), new_run(rpr, text[offset:])
+    parent = run.getparent()
+    i = list(parent).index(run)
+    parent.remove(run)
+    parent.insert(i, left)
+    parent.insert(i + 1, right)
+    return left, right
+
+
+def isolate_span(para, needle: str) -> list | None:
+    """把 needle 精确切成独立的 run，返回构成该跨度的 run 列表（已在文档中就位）。
+
+    批注范围的边界只能落在 run 之间，所以要让范围精确到字符，就得先让跨度
+    自成 run。合并后的段落常常整段只有一只 run，不拆的话「一句话有语病」
+    会圈住整段两百多字，评审人根本看不出问题在哪。
+
+    只切边界的两只 run，中间的原样保留；只动可拆分 run（`locate_span` 已保证）。
+    定位不到返回 None，由调用方退回整段。
+    """
+    loc = locate_span(para, needle)
+    if not loc:
+        return None
+    start, end, runs = loc
+    covered = []
+    pos = 0
+    for r in runs:
+        t = run_text(r)
+        s, e = pos, pos + len(t)
+        pos = e
+        if not t or e <= start or s >= end:
+            continue
+        covered.append([r, max(0, start - s), min(len(t), end - s)])
+    if not covered:
+        return None
+    # 先切尾再切头：先切头会让尾部那只 run 的偏移失效（单 run 跨度时是同一只）
+    r, s0, e0 = covered[-1]
+    if e0 < len(run_text(r)):
+        covered[-1][0] = _split_run_at(r, e0)[0]
+    r, s0, e0 = covered[0]
+    if s0 > 0:
+        covered[0][0] = _split_run_at(r, s0)[1]
+    return [c[0] for c in covered]
+
+
 def split_for_span(runs: list, start: int, end: int) -> dict:
     """把 [start, end) 覆盖的 run 拆为 前段 / 目标段 / 后段。
 

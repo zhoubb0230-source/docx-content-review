@@ -208,7 +208,11 @@ rows=[{"id":"I-0001","pid":pid("帐号"),"category":"A1","original_text":"通过
       # 只出批注不落修订的一条：锚点是整段（跨三个不同 rPr 的 run）
       {"id":"I-0003","pid":pid("本段前半部分"),"category":"B1",
        "original_text":ptext("本段前半部分"),"verify":{"result":"pass"},
-       "severity":"Medium","evidence":"全段语义重复"}]
+       "severity":"Medium","evidence":"全段语义重复"},
+      # 锚点只是段落里的一小截：范围必须精确到字符，不能圈住整段
+      {"id":"I-0004","pid":pid("编号列表第 1 项"),"category":"B1",
+       "original_text":"内容为三号仿宋","verify":{"result":"pass"},
+       "severity":"Low","evidence":"指代不明"}]
 pathlib.Path(run,"work","issues-verified.jsonl").write_text(
     "".join(json.dumps(r,ensure_ascii=False)+"\n" for r in rows),encoding="utf-8")
 PY
@@ -241,8 +245,12 @@ for pid_ in prov["applied"]:
     it=rev.get(pid_)
     if not it:
         bad.append(f"修订 {pid_} 没有对应的说明批注"); continue
-    if "修订" not in it["text"]:
-        bad.append(f"修订 {pid_} 的批注没说明这是修订：{it['text'][:30]}")
+    head,*rest=it["text"].split("\n")
+    # 抬头只有类别标签，不带「已在此处标为修订，请确认后接受或拒绝」这类套话
+    if "—" in head or len(head)>12:
+        bad.append(f"修订 {pid_} 的批注抬头带了套话：{head}")
+    if len(rest)<2:
+        bad.append(f"修订 {pid_} 的批注没给出改动理由：{it['text']}")
     c=cov.get(str(it["comment_id"]))
     if not c:
         bad.append(f"修订 {pid_} 的批注没有锚定范围"); continue
@@ -256,6 +264,30 @@ for b in bad: print("   ",b)
 sys.exit(1 if bad else 0)
 PY
 check "每处修订都有说明批注，且精确锚在该处改动上" "$?" 0
+
+# 锚点是段落里的一小截时，范围必须精确到字符——真实文档上验一遍，
+# 顺带证明「为锚定而拆 run」没有动到正文与 rPr（四项校验在上面已经跑过）
+python3 - "$RUN3" "$S" <<'PY'
+import json,sys; sys.path.insert(0,sys.argv[2])
+from lxml import etree
+import ooxml as ox
+run=sys.argv[1]
+items=json.load(open(f"{run}/work/commentlist.json",encoding="utf-8"))["comments"]
+root=etree.parse(f"{run}/work/unpacked/word/document.xml").getroot()
+cov=ox.comment_coverage(root)
+paras={f"p-{i:06d}":p for i,p in enumerate(root.iter(ox.q("p")),1)}
+bad=[]
+for it in items:
+    if it.get("kind")=="revision" or not it.get("anchor"): continue
+    got=cov.get(str(it["comment_id"]),{}).get("reject","")
+    if got!=it["anchor"]:
+        whole="".join(t.text or "" for t in paras[it["pid"]].iter(ox.q("t")))
+        bad.append(f"批注 {it['comment_id']} 圈住 {len(got)} 字，锚点 {len(it['anchor'])} 字"
+                   f"（全段 {len(whole)} 字）：{got[:40]!r}")
+for b in bad: print("   ",b)
+sys.exit(1 if bad else 0)
+PY
+check "批注范围精确到锚点字符边界（不放大到整段）" "$?" 0
 
 # 批注范围必须覆盖完整正文。旧实现拿「可拆分 run」的首尾当边界，
 # 于是含 w:br/w:tab/图形的 run 被排除在外——在 Word 里就是「只选中前面几行」。
@@ -287,10 +319,21 @@ for name,p in cases.items():
     _anchor_paragraph(p,"",1)
     got=covered(p)
     if got!=want: bad.append(f"{name}：整段锚定只圈住 {got!r}，应为 {want!r}")
-# 给了锚点时不能反过来变成整段
+# 给了锚点就必须精确到字符：合并后整段常常只有一只 run，
+# 边界若只能落在 run 之间，「一句话有语病」会圈住整段两百多字。
 p=para(("t","第一句有语病"),("t","第二句没问题"))
 _anchor_paragraph(p,"有语病",1)
-if covered(p)!="第一句有语病": bad.append(f"精确锚点被放大成整段：{covered(p)!r}")
+if covered(p)!="有语病": bad.append(f"精确锚点未切到字符边界：{covered(p)!r}")
+long_p="本节说明系统的整体架构与关键取舍。"*5+"为了更好的支撑业务增长，平台采用分层设计。"+"其余部分从略。"*4
+p=para(("t",long_p))
+before=[ox.rpr_key(r) for r in p.iter(ox.q("r"))]
+_anchor_paragraph(p,"为了更好的支撑业务增长",1)
+if covered(p)!="为了更好的支撑业务增长":
+    bad.append(f"单 run 长段落里的锚点被放大：{len(covered(p))} 字 / 全段 {len(long_p)} 字")
+if "".join(t.text or "" for t in p.iter(ox.q("t")))!=long_p:
+    bad.append("为锚定而拆 run 改动了正文")
+if set(before)!={ox.rpr_key(r) for r in p.iter(ox.q("r")) if ox.run_text(r)}:
+    bad.append("为锚定而拆 run 引入了新的 rPr 指纹（违反 D9）")
 # 同段第二条批注不受第一条的引用符影响
 p=para(("t","甲乙丙"),("t","丁戊"))
 _anchor_paragraph(p,"",1); _anchor_paragraph(p,"丁戊",2)

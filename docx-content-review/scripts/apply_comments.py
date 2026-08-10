@@ -73,8 +73,11 @@ def _revision_reason(head: str, rid: str, evidence: str, patch: dict) -> str:
     改成了什么，修订标记本身已经显示；评审人缺的是改动理由——
     没有理由的修订只能整批接受或整批拒绝，等于把判断重新丢回给人。
     没有 evidence 时才退回「原文 → 改为」，避免与修订标记重复。
+
+    抬头只有类别标签。**不写「已在此处标为修订，请确认后接受或拒绝」**——
+    批注就锚在修订上，这句话没有增加任何信息，只是把正文撑长、让人抓不住重点。
     """
-    lines = [f"{head} — 已在此处标为修订，请确认后接受或拒绝"]
+    lines = [head]
     if evidence:
         lines.append(evidence)
     else:
@@ -176,7 +179,9 @@ def build_plan(run_dir: Path, cfg: dict) -> dict:
             # 两侧落在同一段落时不构成"此处/彼处"，否则会出现自己跟自己冲突的怪文案
             if other is not None and other.get("pid") == sides[0].get("pid"):
                 other = None
-            lines = [f"{rule_label(rule)} — {c.get('description','')}"]
+            # 抬头只有类别标签。规则的通用描述（「同一术语出现多个不同定义」）
+            # 与标签（「术语不一致」）说的是同一件事，下一行的 note 才是本条的具体内容。
+            lines = [rule_label(rule)]
             if other and rule in RIVAL_RULES:
                 where = " > ".join(other.get("heading_path") or []) or "文档其他位置"
                 lines.append(f"本处与「{where}」（第 {other.get('page_hint')} 页）的描述不一致：")
@@ -297,6 +302,19 @@ def _anchor_paragraph(para, anchor: str, cid: int, rev: dict | None = None) -> b
     ref = etree.SubElement(ref_run, ox.q("commentReference")); ref.set(ox.q("id"), str(cid))
 
     first, last = _revision_nodes(para, rev)
+    if first is None and anchor:
+        # 精确路径：把锚点切成独立的 run，范围就能落在字符边界上。
+        # 不切的话，合并后整段只有一只 run 时「一句话有语病」会圈住整段两百多字。
+        spans = ox.isolate_span(para, anchor)
+        if spans:
+            fp = spans[0].getparent()
+            fp.insert(list(fp).index(spans[0]), start)
+            lp = spans[-1].getparent()
+            lp.insert(list(lp).index(spans[-1]) + 1, end)
+            # 引用符放回段落层：锚点若在超链接里，引用符不该被算进链接
+            top = ox.top_level_node(para, end)
+            para.insert(list(para).index(top if top is not None else end) + 1, ref_run)
+            return True
     if first is None:
         first, last = ox.comment_range_nodes(para, anchor)
     if first is None or last is None:
