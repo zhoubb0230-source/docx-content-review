@@ -136,6 +136,7 @@ def apply_plan(run_dir: Path, cfg: dict) -> dict:
             new_nodes.append(ox.new_run(ox.clone_rpr(src), text))
         # 2) 被删段：包进 w:del，w:t → w:delText，rPr 深拷贝自各自来源 run
         del_el = etree.Element(ox.q("del"))
+        del_id = rid
         del_el.set(ox.q("id"), str(rid)); rid += 1
         del_el.set(ox.q("author"), author)
         del_el.set(ox.q("date"), stamp)
@@ -144,6 +145,7 @@ def apply_plan(run_dir: Path, cfg: dict) -> dict:
         new_nodes.append(del_el)
         # 3) 新增段：包进 w:ins，继承首个受影响 run 的 rPr
         ins_el = etree.Element(ox.q("ins"))
+        ins_id = rid
         ins_el.set(ox.q("id"), str(rid)); rid += 1
         ins_el.set(ox.q("author"), author)
         ins_el.set(ox.q("date"), stamp)
@@ -162,7 +164,10 @@ def apply_plan(run_dir: Path, cfg: dict) -> dict:
 
         produced = [ox.rpr_key(r) for n in new_nodes
                     for r in ([n] if n.tag == ox.q("r") else list(n.iter(ox.q("r"))))]
+        # del_id / ins_id 让 apply_comments 能把「修订原因」批注**精确**锚在这处改动上：
+        # 改动落地后原文已进了 w:del，按原文再定位一次必然失败（见 ooxml.para_runs）。
         provenance.append({"patch_id": patch["patch_id"], "pid": patch["pid"],
+                           "del_id": str(del_id), "ins_id": str(ins_id),
                            "source_rpr": src_rpr_key, "produced_rpr": produced,
                            "consistent": all(k == src_rpr_key for k in produced)})
         applied.append(patch["patch_id"])

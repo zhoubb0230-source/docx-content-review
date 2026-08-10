@@ -189,7 +189,11 @@ def check_style(run_dir: Path, unpacked: Path) -> dict:
             "style_parts_checked": len(expect), "new_rpr_fingerprints": len(rpr_added)}
 
 
-def check_comments(unpacked: Path) -> dict:
+def _norm(s: str) -> str:
+    return "".join(str(s or "").split())
+
+
+def check_comments(run_dir: Path, unpacked: Path) -> dict:
     from lxml import etree
 
     problems = []
@@ -217,7 +221,43 @@ def check_comments(unpacked: Path) -> dict:
     for cid in sorted(declared - refs):
         problems.append(f"comments.xml 声明了批注 {cid}，但正文中无 commentReference（批注不可见）")
 
+    # 锚定「存在」不等于锚定「圈对了」。Start/End 齐备但范围里没有正文，或者
+    # 范围只盖住计划锚点的前半截，在 Word 里就是「批注选不中/只选中前面几行」。
+    cover = ox.comment_coverage(root)
+    empty = {cid for cid in refs
+             if not _norm((cover.get(cid) or {}).get("reject") or "")
+             and not _norm((cover.get(cid) or {}).get("accept") or "")}
+    for cid in sorted(empty):
+        problems.append(f"批注 {cid} 的锚定范围内没有任何正文（Word 中选不中文字）")
+
+    # 计划里的锚点是**独立于回写过程**的预期：commentlist.json 由 plan 写，
+    # 不是 apply 写的自述，因此可以拿来判定「文档是否实现了预期」。
+    plan = read_json(resolve_path(run_dir, "work") / "commentlist.json", {}) or {}
+    ptext: dict[str, str] = {}
+    for i, p in enumerate(root.iter(ox.q("p")), 1):
+        ptext[f"p-{i:06d}"] = _norm("".join(
+            t.text or "" for t in p.iter(ox.q("t"), ox.q("delText"))))
+    partial = 0
+    for it in plan.get("comments") or []:
+        cid = str(it.get("comment_id"))
+        want = _norm(it.get("anchor"))
+        got = cover.get(cid)
+        if not want or got is None or cid in empty:
+            continue
+        # 范围内若含刚写入的修订，原文只在「拒绝修订」视图里连续，两视图取其一即可
+        if want in _norm(got["reject"]) or want in _norm(got["accept"]):
+            continue
+        # 锚点在本段里根本不存在（跨段落、或原文已被另一处修订改写）不算锚定缺陷
+        if want not in ptext.get(it.get("pid") or "", ""):
+            continue
+        partial += 1
+        shown = got["reject"] or got["accept"]
+        problems.append(f"批注 {cid} 的锚定范围未覆盖完整锚点："
+                        f"计划「{str(it.get('anchor'))[:20]}…」，"
+                        f"实际只圈住「{shown[:20]}…」")
+
     return {"name": "批注锚定完整", "pass": not problems, "comments": len(declared),
+            "empty_ranges": len(empty), "partial_ranges": partial,
             "problems": problems[:20]}
 
 
@@ -233,7 +273,7 @@ def main(argv: list[str]) -> int:
         check_structure(unpacked, args.xsd),
         check_untracked(run_dir, unpacked),
         check_style(run_dir, unpacked),
-        check_comments(unpacked),
+        check_comments(run_dir, unpacked),
     ]
     ok = all(c["pass"] for c in checks)
     report = {**version_header(), "pass": ok, "checks": checks}

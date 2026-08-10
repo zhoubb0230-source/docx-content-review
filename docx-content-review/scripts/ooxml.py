@@ -139,6 +139,85 @@ def locate_span(para, needle: str) -> tuple[int, int, list] | None:
     return idx, idx + len(needle), runs
 
 
+# 段落中承载正文的直接子节点。批注范围必须以这一层为边界：
+# w:commentRangeEnd 若插进 w:ins/w:del 内部，会被当成修订的一部分。
+ANCHORABLE_TAGS = {"r", "hyperlink", "ins", "del", "moveFrom", "moveTo",
+                   "smartTag", "sdt", "fldSimple", "subDoc", "customXml"}
+
+
+def para_content_nodes(para) -> list:
+    """段落里承载正文的直接子节点（w:pPr、书签、拼写标记等不算）。
+
+    只含 commentReference / footnoteReference 的 run 也不算——它们是标记不是正文，
+    否则同段落写第二条批注时，范围会把上一条批注的引用符也圈进去。
+    """
+    out = []
+    for c in para:
+        if not isinstance(c.tag, str) or not c.tag.startswith(f"{{{W}}}"):
+            continue
+        if c.tag[len(W) + 2:] not in ANCHORABLE_TAGS:
+            continue
+        if c.tag == q("r") and c.find(q("commentReference")) is not None:
+            continue
+        out.append(c)
+    return out
+
+
+def top_level_node(para, node):
+    """把段落内任意后代节点抬到「w:p 的直接子节点」这一层。"""
+    cur = node
+    while cur is not None and cur.getparent() is not para:
+        cur = cur.getparent()
+    return cur
+
+
+def comment_range_nodes(para, needle: str = "") -> tuple:
+    """批注范围该插在哪两个节点的前后，返回 (起点节点, 终点节点)。
+
+    **定位与锚定是两件事，不能共用同一份 run 集合。**
+    定位只能在「可拆分 run」（不在修订标记内、只含 rPr 与 w:t）上做，
+    但批注范围绝不能只覆盖这些 run——含换行 `w:br`、制表 `w:tab`、图形的 run，
+    以及既有/新写入的 `w:ins`/`w:del`，同样是这段正文的一部分。
+    早先的实现直接拿可拆分 run 的首尾当边界，于是：
+
+      - 段落末尾的 run 含软换行时，范围止于换行之前 —— 表现为「只选中前面几行」；
+      - 整段文字都在一个含 `w:br` 的 run 里时，一个可拆分 run 都没有，
+        范围退化成段首的零长度点 —— 表现为「批注选不中任何正文」；
+      - 段末刚写入修订时，范围止于修订之前。
+
+    因此定位不到 needle（或压根没给）时一律退回**整段**，
+    而不是退回「可拆分 run 的首尾」。
+    """
+    nodes = para_content_nodes(para)
+    if not nodes:
+        return None, None
+    whole = (nodes[0], nodes[-1])
+    if not needle:
+        return whole
+    loc = locate_span(para, needle)
+    if not loc:
+        return whole
+    start, end, runs = loc
+    first = last = None
+    pos = 0
+    for r in runs:
+        t = run_text(r)
+        if first is None and pos + len(t) > start:
+            first = r
+        if pos < end:
+            last = r
+        pos += len(t)
+    if first is None or last is None:
+        return whole
+    a, b = top_level_node(para, first), top_level_node(para, last)
+    if a is None or b is None:
+        return whole
+    kids = list(para)
+    if kids.index(a) > kids.index(b):
+        return whole
+    return a, b
+
+
 def split_for_span(runs: list, start: int, end: int) -> dict:
     """把 [start, end) 覆盖的 run 拆为 前段 / 目标段 / 后段。
 
@@ -222,6 +301,46 @@ def text_view(root, *, accept: bool) -> str:
             # 拒绝视图里 delText 要还原为正文
         parts.append(node.text or "")
     return "".join(parts)
+
+
+def comment_coverage(root) -> dict:
+    """每条批注实际圈住的正文，返回 {批注 id: {"reject": 串, "accept": 串}}。
+
+    只看磁盘上的文档本身：按文档顺序走一遍，`commentRangeStart`/`End` 之间的
+    文字就是 Word 里会被高亮的那一段。给出拒绝/接受两种修订视图，
+    因为范围内若含刚写入的修订，原文只在拒绝视图里是连续的。
+    """
+    cover: dict = {}
+    active: set = set()
+    for node in root.iter():
+        if not isinstance(node.tag, str):
+            continue
+        if node.tag == q("commentRangeStart"):
+            cid = node.get(q("id"))
+            if cid is not None:
+                active.add(cid)
+                cover.setdefault(cid, {"reject": [], "accept": []})
+            continue
+        if node.tag == q("commentRangeEnd"):
+            active.discard(node.get(q("id")))
+            continue
+        if node.tag not in (q("t"), q("delText")) or not active:
+            continue
+        in_ins = in_del = False
+        anc = node.getparent()
+        while anc is not None:
+            if anc.tag == q("ins"):
+                in_ins = True
+            elif anc.tag == q("del"):
+                in_del = True
+            anc = anc.getparent()
+        text = node.text or ""
+        for cid in active:
+            if not (in_ins):
+                cover[cid]["reject"].append(text)
+            if not (in_del or node.tag == q("delText")):
+                cover[cid]["accept"].append(text)
+    return {cid: {k: "".join(v) for k, v in views.items()} for cid, views in cover.items()}
 
 
 def styled_char_view(root, *, accept: bool) -> list[tuple[int, str, str]]:

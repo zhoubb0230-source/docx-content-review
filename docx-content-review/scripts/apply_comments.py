@@ -67,23 +67,60 @@ ENHANCED = {
 
 
 # --------------------------------------------------------------------------
+def _revision_reason(head: str, rid: str, evidence: str, patch: dict) -> str:
+    """修订处的批注正文：只回答「为什么改」。
+
+    改成了什么，修订标记本身已经显示；评审人缺的是改动理由——
+    没有理由的修订只能整批接受或整批拒绝，等于把判断重新丢回给人。
+    没有 evidence 时才退回「原文 → 改为」，避免与修订标记重复。
+    """
+    lines = [f"{head} — 已在此处标为修订，请确认后接受或拒绝"]
+    if evidence:
+        lines.append(evidence)
+    else:
+        lines.append(f"「{patch.get('original_text','')}」→「{patch.get('suggested_text','')}」")
+    lines.append(f"（检测规则 {rid}）")
+    return "\n".join(x for x in lines if x)
+
+
 def build_plan(run_dir: Path, cfg: dict) -> dict:
-    """批注来源：降级为批注的局部问题 + 裁定成立的逻辑冲突。"""
+    """批注来源：降级为批注的局部问题 + 裁定成立的逻辑冲突 + **每一处已落笔的修订**。"""
     logic_cfg = cfg.get("logic") or {}
     to_comment = bool(logic_cfg.get("coverage_rules_to_comment"))
     paras = {p["pid"]: p for p in read_jsonl(resolve_path(run_dir, "paragraphs"))}
     items = []
 
-    demoted = {d["id"] for d in
-               (read_json(resolve_path(run_dir, "patchlist"), {}) or {}).get("demoted_to_comment", [])
-               if d.get("id")}
-    revised = {p["patch_id"] for p in
-               (read_json(resolve_path(run_dir, "patchlist"), {}) or {}).get("patches", [])}
+    patchlist = read_json(resolve_path(run_dir, "patchlist"), {}) or {}
+    demoted = {d["id"] for d in patchlist.get("demoted_to_comment", []) if d.get("id")}
+    patch_by_id = {p["patch_id"]: p for p in patchlist.get("patches", [])}
+
+    # 本步在 apply_revisions.py apply 之后跑（SKILL.md 第 8 步），因此溯源记录已存在。
+    # 缺失时（只跑了 plan 就来做批注）退回「按计划都落笔了」，保持旧行为。
+    prov = read_json(resolve_path(run_dir, "work") / "revision-provenance.json", {}) or {}
+    applied = set(prov.get("applied") or []) if prov else set(patch_by_id)
+    rev_anchor = {p["patch_id"]: p for p in prov.get("provenance") or []}
+
+    def _rev_item(pid: str, patch: dict, severity: str, text: str, ref: str) -> dict:
+        a = rev_anchor.get(patch["patch_id"]) or {}
+        return {
+            "comment_id": None, "pid": pid, "anchor": patch.get("original_text") or "",
+            "revision": {"del_id": a.get("del_id"), "ins_id": a.get("ins_id")},
+            "severity": severity, "text": text, "kind": "revision",
+            "source": patch.get("source") or "issue", "ref": ref,
+        }
 
     for rec in read_jsonl(resolve_path(run_dir, "issues_verified")):
         iid = rec.get("id")
-        if iid in revised:
-            continue                                  # 已落笔为修订，不再重复批注
+        patch = patch_by_id.get(iid)
+        if patch is not None and iid in applied:
+            # 已落笔为修订：不是「不用批注」，而是必须换一种批注——说明改动理由
+            cat = rec.get("category") or ""
+            items.append(_rev_item(
+                patch["pid"], patch, rec.get("severity") or "Medium",
+                _revision_reason(rule_label(cat), rec.get("rule_id") or cat,
+                                 rec.get("evidence") or "", patch), iid))
+            continue
+        # 计划了修订却没落笔（定位失败）时不能静默消失，照常出普通批注
         if rec.get("action") == "report_only" and iid not in demoted:
             continue                                  # 仅风格倾向：只进报告，不入文档
         cat = rec.get("category") or ""
@@ -113,7 +150,16 @@ def build_plan(run_dir: Path, cfg: dict) -> dict:
             action = c.get("action")
             rule = c.get("rule")
             if action == "revision":
-                continue                              # 由 apply_revisions 处理
+                patch = patch_by_id.get(c["conflict_id"])
+                if patch is None:
+                    continue          # 未准入或未生成补丁：由报告承载
+                if c["conflict_id"] in applied:
+                    items.append(_rev_item(
+                        patch["pid"], patch, c.get("severity") or "Medium",
+                        _revision_reason(rule_label(rule), rule, c.get("note") or "", patch),
+                        c["conflict_id"]))
+                    continue
+                # 补丁未落笔：往下走普通批注，不能静默丢失
             if action == "report_only" and not (rule in {"L29", "L30", "L31", "L32"} and to_comment):
                 continue
             v = verdicts.get(c["conflict_id"])
@@ -154,9 +200,15 @@ def build_plan(run_dir: Path, cfg: dict) -> dict:
             if unsure:
                 lines.append("（自动裁定为不确定，需人工确认）")
             lines.append(f"（检测规则 {rule}，详见审查报告）")
+            # 锚点取该侧句子；取不到才退回整段（anchor 为空 = 整段）。
+            # 这里曾写 `paras[pid]["text"][:40]`——40 字截断在 Word 里就是
+            # 「只选中了前面一两行」，评审人看不出批注究竟在说这一段的哪部分。
+            side_text = (sides[0].get("text") or "").strip()
+            para_text = paras.get(sides[0]["pid"], {}).get("text") or ""
+            anchor = side_text if side_text and side_text in para_text else ""
             items.append({
                 "comment_id": None, "pid": sides[0]["pid"],
-                "anchor": (paras.get(sides[0]["pid"], {}).get("text") or "")[:40],
+                "anchor": anchor,
                 "severity": c.get("severity") or "Medium",
                 "text": "\n".join(lines), "source": "conflict", "ref": c["conflict_id"],
             })
@@ -204,11 +256,38 @@ def _ensure_content_type(unpacked: Path, part: str, ctype: str) -> None:
     tree.write(str(ct), xml_declaration=True, encoding="UTF-8", standalone=True)
 
 
-def _anchor_paragraph(para, anchor: str, cid: int) -> bool:
+def _revision_nodes(para, rev: dict | None) -> tuple:
+    """按 w:id 找到本处修订的 w:del / w:ins，返回该段内的 (起点, 终点) 节点。
+
+    修订落地后原文已进 w:del，用原文再定位必然失败；改动理由的批注必须
+    精确圈住这处改动，只能按 id 找。
+    """
+    if not rev:
+        return None, None
+    found = []
+    for tag, key in ((ox.q("del"), "del_id"), (ox.q("ins"), "ins_id")):
+        want = rev.get(key)
+        if not want:
+            continue
+        for el in para.iter(tag):
+            if el.get(ox.q("id")) == str(want):
+                node = ox.top_level_node(para, el)
+                if node is not None:
+                    found.append(node)
+                break
+    if not found:
+        return None, None
+    kids = list(para)
+    found.sort(key=kids.index)
+    return found[0], found[-1]
+
+
+def _anchor_paragraph(para, anchor: str, cid: int, rev: dict | None = None) -> bool:
     """在段落中放置 commentRangeStart / End / Reference。
 
     锚定属于核心层，不可省略——只写 comments.xml 而不在 document.xml 中锚定，
-    批注在 Word 里根本不可见。
+    批注在 Word 里根本不可见。范围边界一律取 w:p 的直接子节点：
+    把 commentRangeEnd 插进 w:ins/w:del 内部会让它变成修订的一部分。
     """
     from lxml import etree
 
@@ -217,26 +296,11 @@ def _anchor_paragraph(para, anchor: str, cid: int) -> bool:
     ref_run = etree.Element(ox.q("r"))
     ref = etree.SubElement(ref_run, ox.q("commentReference")); ref.set(ox.q("id"), str(cid))
 
-    runs = [r for r in ox.para_runs(para) if ox.run_is_plain(r)]
-    first = last = None
-    if anchor and runs:
-        loc = ox.locate_span(para, anchor)
-        if loc:
-            s, e, rs = loc
-            pos = 0
-            for r in rs:
-                t = ox.run_text(r)
-                if first is None and pos + len(t) > s:
-                    first = r
-                if pos < e:
-                    last = r
-                pos += len(t)
+    first, last = _revision_nodes(para, rev)
     if first is None:
-        first = runs[0] if runs else None
-    if last is None:
-        last = runs[-1] if runs else None
+        first, last = ox.comment_range_nodes(para, anchor)
     if first is None or last is None:
-        # 空段落：锚到段落本身（pPr 之后）
+        # 段落里没有任何正文节点（真空段）：锚到 pPr 之后，范围为空但批注仍可见
         ppr = para.find(ox.q("pPr"))
         at = 1 if ppr is not None else 0
         para.insert(at, start)
@@ -244,11 +308,10 @@ def _anchor_paragraph(para, anchor: str, cid: int) -> bool:
         para.insert(at + 2, ref_run)
         return True
 
-    fp, lp = first.getparent(), last.getparent()
-    fp.insert(list(fp).index(first), start)
-    li = list(lp).index(last)
-    lp.insert(li + 1, end)
-    lp.insert(li + 2, ref_run)
+    para.insert(list(para).index(first), start)
+    li = list(para).index(last)
+    para.insert(li + 1, end)
+    para.insert(li + 2, ref_run)
     return True
 
 
@@ -295,7 +358,7 @@ def apply_comments(run_dir: Path, cfg: dict) -> dict:
             t = etree.SubElement(r, ox.q("t"))
             t.text = line
             t.set(ox.XML_SPACE, "preserve")
-        if _anchor_paragraph(para, it.get("anchor") or "", cid):
+        if _anchor_paragraph(para, it.get("anchor") or "", cid, it.get("revision")):
             anchored += 1
             written.append(it)
 

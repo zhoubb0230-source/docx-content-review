@@ -199,10 +199,16 @@ import json,sys,pathlib
 run=sys.argv[1]
 paras=[json.loads(l) for l in open(f"{run}/work/paragraphs.jsonl",encoding="utf-8")]
 def pid(s): return next(p["pid"] for p in paras if s in p["text"])
+def ptext(s): return next(p["text"] for p in paras if s in p["text"])
 rows=[{"id":"I-0001","pid":pid("帐号"),"category":"A1","original_text":"通过帐号登录",
-       "suggested_text":"通过账号登录","verify":{"result":"pass"},"severity":"High"},
+       "suggested_text":"通过账号登录","verify":{"result":"pass"},"severity":"High",
+       "evidence":"「帐号」为异体写法"},
       {"id":"I-0002","pid":pid("严格的执行"),"category":"A2","original_text":"严格的执行",
-       "suggested_text":"严格地执行","verify":{"result":"pass"},"severity":"High"}]
+       "suggested_text":"严格地执行","verify":{"result":"pass"},"severity":"High"},
+      # 只出批注不落修订的一条：锚点是整段（跨三个不同 rPr 的 run）
+      {"id":"I-0003","pid":pid("本段前半部分"),"category":"B1",
+       "original_text":ptext("本段前半部分"),"verify":{"result":"pass"},
+       "severity":"Medium","evidence":"全段语义重复"}]
 pathlib.Path(run,"work","issues-verified.jsonl").write_text(
     "".join(json.dumps(r,ensure_ascii=False)+"\n" for r in rows),encoding="utf-8")
 PY
@@ -213,6 +219,131 @@ python3 "$S/apply_comments.py" plan --run-dir "$RUN3" >/dev/null
 python3 "$S/apply_comments.py" apply --run-dir "$RUN3" >/dev/null
 python3 "$S/validate_docx.py" --run-dir "$RUN3" >/dev/null
 check "四项校验全部通过" "$?" 0
+
+# 每一处修订都必须带上「为什么改」的批注：只有修订标记的话，
+# 评审人只能整批接受或整批拒绝，等于把判断又丢回给人。
+python3 - "$RUN3" "$S" <<'PY'
+import json,sys
+sys.path.insert(0,sys.argv[2])
+from lxml import etree
+import ooxml as ox
+run=sys.argv[1]
+prov=json.load(open(f"{run}/work/revision-provenance.json",encoding="utf-8"))
+patches={p["patch_id"]:p for p in
+         json.load(open(f"{run}/work/patchlist.json",encoding="utf-8"))["patches"]}
+items=json.load(open(f"{run}/work/commentlist.json",encoding="utf-8"))["comments"]
+rev={i["ref"]:i for i in items if i.get("kind")=="revision"}
+root=etree.parse(f"{run}/work/unpacked/word/document.xml").getroot()
+cov=ox.comment_coverage(root)
+bad=[]
+if not prov["applied"]: bad.append("本轮没有任何修订，这条断言失去意义")
+for pid_ in prov["applied"]:
+    it=rev.get(pid_)
+    if not it:
+        bad.append(f"修订 {pid_} 没有对应的说明批注"); continue
+    if "修订" not in it["text"]:
+        bad.append(f"修订 {pid_} 的批注没说明这是修订：{it['text'][:30]}")
+    c=cov.get(str(it["comment_id"]))
+    if not c:
+        bad.append(f"修订 {pid_} 的批注没有锚定范围"); continue
+    # 范围必须严丝合缝地圈住这处改动：拒绝视图=原文，接受视图=建议
+    if c["reject"]!=patches[pid_]["original_text"]:
+        bad.append(f"修订 {pid_} 的批注圈住的原文不对："
+                   f"{c['reject']!r} != {patches[pid_]['original_text']!r}")
+    if c["accept"]!=patches[pid_]["suggested_text"]:
+        bad.append(f"修订 {pid_} 的批注圈住的新文不对：{c['accept']!r}")
+for b in bad: print("   ",b)
+sys.exit(1 if bad else 0)
+PY
+check "每处修订都有说明批注，且精确锚在该处改动上" "$?" 0
+
+# 批注范围必须覆盖完整正文。旧实现拿「可拆分 run」的首尾当边界，
+# 于是含 w:br/w:tab/图形的 run 被排除在外——在 Word 里就是「只选中前面几行」。
+python3 - "$S" <<'PY'
+import sys
+sys.path.insert(0,sys.argv[1])
+from lxml import etree
+import ooxml as ox
+from apply_comments import _anchor_paragraph
+W=ox.W
+def para(*specs):
+    p=etree.Element(ox.q("p"),nsmap={"w":W}); etree.SubElement(p,ox.q("pPr"))
+    for kind,txt in specs:
+        r=etree.SubElement(p,ox.q("r"))
+        if kind in ("t","tbr"):
+            t=etree.SubElement(r,ox.q("t")); t.text=txt
+        if kind in ("br","tbr"): etree.SubElement(r,ox.q("br"))
+    return p
+def covered(p,cid=1):
+    d=etree.Element(ox.q("document"),nsmap={"w":W}); d.append(p)
+    return ox.comment_coverage(d).get(str(cid),{}).get("reject","")
+bad=[]
+cases={"末尾 run 含软换行":para(("t","前文"),("tbr","后文")),
+       "整段只有一个含换行的 run":para(("tbr","第一行"),),
+       "每行都带软换行":para(("tbr","第一行"),("tbr","第二行"),("t","第三行")),
+       "普通多 run 段落":para(("t","甲乙丙"),("t","丁戊"))}
+for name,p in cases.items():
+    want="".join(t.text or "" for t in p.iter(ox.q("t")))
+    _anchor_paragraph(p,"",1)
+    got=covered(p)
+    if got!=want: bad.append(f"{name}：整段锚定只圈住 {got!r}，应为 {want!r}")
+# 给了锚点时不能反过来变成整段
+p=para(("t","第一句有语病"),("t","第二句没问题"))
+_anchor_paragraph(p,"有语病",1)
+if covered(p)!="第一句有语病": bad.append(f"精确锚点被放大成整段：{covered(p)!r}")
+# 同段第二条批注不受第一条的引用符影响
+p=para(("t","甲乙丙"),("t","丁戊"))
+_anchor_paragraph(p,"",1); _anchor_paragraph(p,"丁戊",2)
+d=etree.Element(ox.q("document"),nsmap={"w":W}); d.append(p)
+c=ox.comment_coverage(d)
+if c["1"]["reject"]!="甲乙丙丁戊" or c["2"]["reject"]!="丁戊":
+    bad.append(f"同段两条批注互相干扰：{c}")
+for b in bad: print("   ",b)
+sys.exit(1 if bad else 0)
+PY
+check "批注范围覆盖完整正文（含 w:br 等不可拆分 run）" "$?" 0
+
+cp "$RUN3/work/unpacked/word/document.xml" "$WORK/good.xml"
+# 负向对照一：范围塌成零长度 —— Start/End 齐备，但 Word 里选不中任何字
+python3 - "$RUN3" "$S" <<'PY'
+import sys; sys.path.insert(0,sys.argv[2])
+from lxml import etree
+import ooxml as ox
+p=f"{sys.argv[1]}/work/unpacked/word/document.xml"
+t=etree.parse(p); root=t.getroot()
+s=next(iter(root.iter(ox.q("commentRangeStart"))))
+cid=s.get(ox.q("id"))
+for e in root.iter(ox.q("commentRangeEnd")):
+    if e.get(ox.q("id"))==cid:
+        e.getparent().remove(e); break
+s.addnext(e)
+t.write(p,xml_declaration=True,encoding="UTF-8",standalone=True)
+PY
+python3 "$S/validate_docx.py" --run-dir "$RUN3" >/dev/null 2>&1
+check "负向对照：批注范围为空被校验抓到" "$?" 8
+cp "$WORK/good.xml" "$RUN3/work/unpacked/word/document.xml"
+
+# 负向对照二：范围只盖住锚点的前半截 —— 正是用户看到的「只选中前面几行」
+python3 - "$RUN3" "$S" <<'PY'
+import json,sys; sys.path.insert(0,sys.argv[2])
+from lxml import etree
+import ooxml as ox
+run=sys.argv[1]
+items=json.load(open(f"{run}/work/commentlist.json",encoding="utf-8"))["comments"]
+cid=str(next(i["comment_id"] for i in items if i.get("kind")!="revision"))
+p=f"{run}/work/unpacked/word/document.xml"
+t=etree.parse(p); root=t.getroot()
+end=next(e for e in root.iter(ox.q("commentRangeEnd")) if e.get(ox.q("id"))==cid)
+start=next(e for e in root.iter(ox.q("commentRangeStart")) if e.get(ox.q("id"))==cid)
+para=start.getparent()
+first=ox.para_content_nodes(para)[0]
+end.getparent().remove(end)
+first.addnext(end)                     # 范围缩到只剩第一个 run
+t.write(p,xml_declaration=True,encoding="UTF-8",standalone=True)
+PY
+python3 "$S/validate_docx.py" --run-dir "$RUN3" >/dev/null 2>&1
+check "负向对照：批注只圈住锚点前半截被校验抓到" "$?" 8
+cp "$WORK/good.xml" "$RUN3/work/unpacked/word/document.xml"
 
 # 负向对照：漏拷 rPr 是 D9 最容易被静默违反的地方，校验必须抓到
 cp "$RUN3/work/unpacked/word/document.xml" "$WORK/good.xml"

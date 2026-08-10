@@ -97,7 +97,10 @@ def collect(run_dir: Path, cfg: dict) -> dict:
     plan = read_json(resolve_path(run_dir, "patchlist"), {}) or {}
     actions["revision"] = len(plan.get("patches") or [])
     clist = read_json(resolve_path(run_dir, "work") / "commentlist.json", {}) or {}
-    actions["comment"] = len(clist.get("comments") or [])
+    comments = clist.get("comments") or []
+    # 说明修订理由的批注跟着修订走，不是另一个问题——算进 comment 会与 revision 重复计数
+    actions["revision_comment"] = sum(1 for c in comments if c.get("kind") == "revision")
+    actions["comment"] = len(comments) - actions["revision_comment"]
     actions["report_only"] = max(0, len(final) - actions["revision"] - actions["comment"])
 
     cdir = resolve_path(run_dir, "conflicts_candidate")
