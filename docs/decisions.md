@@ -617,3 +617,41 @@ L 规则表、目录结构、配置项）不在此重复。
   能抓住就不是取舍。
 - **影响**：`scripts/ooxml.py`、`apply_comments.py`、`references/ooxml.md` §4.1/4.3、
   `tests/run_regression.sh`（107 → 108 项）。
+
+## ADR-033　术语类规则整组可关，默认关闭
+
+- **日期**：2026-08-11
+- **背景**：用户明确「术语的检查先跳过，暂时不需要这部分检查」。
+- **范围**：按 `references/logic-rules.md` 的分组取两组共七条——
+  **术语与命名** L01（术语定义不一致）/ L02（缩略语不一致）/ L03（缩略语未展开）/
+  L04（名称写法不一致）/ L05（近义术语混用），
+  **术语规范** L25（禁用写法）/ L26（变体写法）。
+  由 `logic.term_rules` 一个开关统一控制，默认 `false`，改 `true` 即恢复，不改代码。
+- **Pass 0 的术语抽取一并跳过**。它不是检查，是喂这七条规则的输入
+  （2000 页约 10 次调用）；规则不跑，抽取就是纯浪费。
+  `glossary_scan.py` 自己判断并返回 `term_rules: false`，
+  不依赖 Agent 记得跳过——与 `scan_patterns.py` 在 `pattern_review.enabled=false`
+  时的处理一致。
+- **`import_glossary.py` 不受影响**：用户自备的术语表照常导入，
+  因为它还有另一个消费者——不改清单 N7 靠它避免把用户的专有写法当语病改掉。
+  **关掉"查术语"不等于关掉"别改术语"**，这两件事方向相反（见 ADR-030）。
+
+### 关掉必须留痕，否则等于没关
+
+- 下游 `apply_comments.py` / `report.py` 是按 `glob("conflicts-candidate.*.json")`
+  读候选目录的。**只是不跑规则的话，上一轮留下的候选文件照样会被读进文档**——
+  用户改了开关重跑，术语批注却还在。
+  因此关闭时把这七条的候选文件**清成空并标 `skipped_reason`**。
+- 反向同理：空文件不能被"已完成的规则不重算"当成已完成，
+  否则把开关重新打开也不会重算。判据加了 `not prev.get("skipped_reason")`。
+  回归里这两条各有一条断言，且"打开后 L01 重新检出"就是反向路径的证明。
+- **不静默隐藏**（ADR-029 的规矩）：报告的「本次未覆盖范围」新增一行写明这一维度没查；
+  「术语表覆盖率」一节加提示，避免被读成"术语已核对过"；
+  结尾的"下一轮更准"不再推销权威术语表——规则关着时传了表也不会有术语类发现，
+  那是误导。
+- SKILL.md 补一条判断题：**用户明确提到术语要不要统一时，把开关打开再跑，
+  不要在关闭状态下含糊带过**。技能的 description 仍保留"术语是否统一"作为触发词——
+  能力还在，只是默认不跑。
+- **影响**：`assets/config.default.yaml`、`scripts/detect_conflicts.py`、
+  `glossary_scan.py`、`report.py`、`SKILL.md`、`references/logic-rules.md`、
+  `tests/run_regression.sh`（108 → 110 项）。

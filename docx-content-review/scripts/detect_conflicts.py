@@ -72,6 +72,9 @@ RULES = {
     "L32": ("Low", "report_only", "章节标题承诺的内容缺失"),
 }
 COVERAGE_RULES = {"L29", "L30", "L31", "L32"}
+# 术语维度：`references/logic-rules.md` 的「术语与命名」+「术语规范」两组。
+# 由 logic.term_rules 统一开关，默认关闭（见 config.default.yaml 与 ADR-033）。
+TERM_RULES = {"L01", "L02", "L03", "L04", "L05", "L25", "L26"}
 
 NUM_RE = re.compile(r"-?\d+(?:[,，]\d{3})*(?:\.\d+)?")
 UNIT_ALIASES = {"毫秒": "ms", "秒": "s", "分钟": "min", "小时": "h", "天": "d",
@@ -962,6 +965,17 @@ def run(run_dir: Path, cfg: dict, rules: list[str] | None, force: bool) -> dict:
     cdir.mkdir(parents=True, exist_ok=True)
 
     todo = rules or sorted(RULES)
+    # 关掉的规则不是"跳过不算"，而是要把它此前留下的候选文件清成空——
+    # 下游 apply_comments / report 是按 glob 读候选目录的，留着旧文件等于没关。
+    term_on = bool((cfg.get("logic") or {}).get("term_rules"))
+    skipped = [] if term_on else [r for r in todo if r in TERM_RULES]
+    todo = [r for r in todo if term_on or r not in TERM_RULES]
+    for rule in skipped:
+        p = cdir / f"conflicts-candidate.{rule}.json"
+        guard_write_path(p, run_dir)
+        atomic_write_json(p, {**version_header(), "rule": rule, "severity": RULES[rule][0],
+                              "candidates": [], "skipped_reason": "logic.term_rules=false"})
+
     seq: dict[str, int] = {}
     summary, total = {}, 0
     try:
@@ -970,11 +984,13 @@ def run(run_dir: Path, cfg: dict, rules: list[str] | None, force: bool) -> dict:
             out_path = cdir / f"conflicts-candidate.{rule}.json"
             if fn is None:
                 continue
-            if out_path.exists() and not force:
-                prev = read_json(out_path, {}) or {}
+            prev = (read_json(out_path, {}) or {}) if out_path.exists() else {}
+            # 已完成的规则不重算。但上一轮因开关关闭留下的空文件不算"已完成"，
+            # 否则把开关重新打开也不会重算。
+            if prev and not force and not prev.get("skipped_reason"):
                 summary[rule] = len(prev.get("candidates", []))
                 total += summary[rule]
-                continue                       # 已完成的规则不重算
+                continue
             try:
                 found = fn(ctx, seq)
             except Exception as exc:  # noqa: BLE001 - 单条规则失败不拖垮整轮
@@ -990,7 +1006,7 @@ def run(run_dir: Path, cfg: dict, rules: list[str] | None, force: bool) -> dict:
         ctx.con.close()
 
     index = {**version_header(), "total": total, "by_rule": summary,
-             "rules_run": todo,
+             "rules_run": todo, "skipped_rules": skipped, "term_rules": term_on,
              "coverage_rules_to_comment": bool((cfg.get("logic") or {})
                                                .get("coverage_rules_to_comment"))}
     idx_path = cdir / "index.json"

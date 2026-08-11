@@ -115,6 +115,17 @@ def scan(run_dir: Path, cfg: dict) -> dict:
 
         die(EX.ERROR, "paragraphs.jsonl 不存在，请先执行 extract.py")
 
+    # 抽出来的术语只喂术语类规则（L01–L05）与 N7 的压制。规则关掉时这一步
+    # 是纯浪费——2000 页约 10 次调用。用户自备的表仍由 import_glossary.py 导入。
+    if not (cfg.get("logic") or {}).get("term_rules"):
+        out = {**version_header(), "candidates": [], "batches": [], "clusters": [],
+               "skipped_reason": "logic.term_rules=false"}
+        path = resolve_path(run_dir, "glossary_candidates")
+        guard_write_path(path, run_dir)
+        atomic_write_json(path, out)
+        return {"term_rules": False, "candidates": 0, "batches": 0, "path": str(path),
+                "note": "logic.term_rules=false，Pass 0 术语抽取整步跳过（不需要发起任何调用）"}
+
     g = cfg.get("glossary") or {}
     min_freq = int(g.get("min_term_freq") or 3)
     max_cand = int(g.get("max_candidates") or 500)

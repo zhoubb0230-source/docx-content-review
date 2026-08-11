@@ -271,6 +271,10 @@ def render_markdown(run_dir: Path, rows: list[dict], cfg: dict) -> str:
     # 5 术语表覆盖率
     w("## 5. 术语表覆盖率")
     w()
+    if not (cfg.get("logic") or {}).get("term_rules"):
+        w("> **本轮未做术语一致性检查**（`logic.term_rules: false`）。以下只是术语表现状，"
+          "不代表文档中的术语已核对过。需要这一维度时把该项改成 true 重跑。")
+        w()
     entries = gl.get("entries") or []
     layers = gl.get("layers") or {}
     text_all = "\n".join(p["text"] for p in paras)
@@ -371,6 +375,9 @@ def render_markdown(run_dir: Path, rows: list[dict], cfg: dict) -> str:
           "错别字召回上限 = common-typos.txt 的覆盖范围 |")
     if not pr.get("enabled"):
         w("| 场景描述范式 | — | pattern_review 未启用（需先提供范式规则包） |")
+    if not (cfg.get("logic") or {}).get("term_rules"):
+        w("| 术语一致性 | — | logic.term_rules 未启用：术语定义/缩略语/名称写法（L01–L05）"
+          "与权威表的禁用写法、变体写法（L25/L26）本轮均未检查，Pass 0 术语抽取一并跳过 |")
     # 未准入交付物的冲突候选必须在这里露面：它们在报告里有，但文档里没有
     held = [r for r in rows if r.get("kind") == "conflict" and r.get("admitted") is False]
     if held:
@@ -404,10 +411,17 @@ def render_markdown(run_dir: Path, rows: list[dict], cfg: dict) -> str:
     w()
     w("---")
     w()
-    w("> **如何让下一轮更准**：本次自建的术语表已输出为 `output/glossary.merged.json`。"
-      "人工修订后（补充标准写法、别名、禁用写法），下次运行时通过 "
-      "`--authoritative <文件>` 传入，误报率会显著下降，且命名不一致类问题可从"
-      "「批注」升级为可直接接受的「修订」。这是从「无参照物」走向「有参照物」的唯一路径。")
+    if (cfg.get("logic") or {}).get("term_rules"):
+        w("> **如何让下一轮更准**：本次自建的术语表已输出为 `output/glossary.merged.json`。"
+          "人工修订后（补充标准写法、别名、禁用写法），下次运行时通过 "
+          "`--authoritative <文件>` 传入，误报率会显著下降，且命名不一致类问题可从"
+          "「批注」升级为可直接接受的「修订」。这是从「无参照物」走向「有参照物」的唯一路径。")
+    else:
+        # 术语规则关着时不能推销术语表——用户传了表也不会有术语类发现，那是误导
+        w("> **术语一致性本轮未检查**（`logic.term_rules: false`）。需要这一维度时把它改成 "
+          "`true` 重跑；配合 `--authoritative <文件>` 传入权威术语表，"
+          "命名不一致类问题还可从「批注」升级为可直接接受的「修订」。"
+          "用户自备的术语表当前仍在生效，作用是避免把专有写法当语病改掉（不改清单 N7）。")
     w()
     w("> 评审完成后，可在 `issues.xlsx` 的「人工决策」列填写 `accept` / `ignore`，"
       "再执行 `import_decisions.py` 回灌审查记忆；被驳回的表述在后续文档中会自动降级，"

@@ -119,7 +119,34 @@ python3 "$S/extract.py" --run-dir "$RUN2" >/dev/null
 python3 "$S/chunk.py" --run-dir "$RUN2" >/dev/null
 seed_facts "$RUN2" logic-injection.facts.json
 python3 "$S/ledger.py" build --run-dir "$RUN2" >/dev/null
-C=$(python3 "$S/detect_conflicts.py" --run-dir "$RUN2")
+# 术语类七条默认关闭（logic.term_rules: false）。关掉不等于不留痕：
+# 下游是按 glob 读候选目录的，旧候选文件必须被清成空，否则等于没关。
+C0=$(python3 "$S/detect_conflicts.py" --run-dir "$RUN2")
+python3 - "$RUN2" "$C0" <<'PYEOF'
+import json,sys,pathlib
+run,out=sys.argv[1],json.loads(sys.argv[2])
+TERM={"L01","L02","L03","L04","L05","L25","L26"}
+bad=[]
+if set(out.get("by_rule",{}))&TERM: bad.append(f"关闭状态下仍产出了术语类候选：{out['by_rule']}")
+idx=json.load(open(f"{run}/work/conflicts/index.json",encoding="utf-8"))
+if set(idx.get("skipped_rules") or [])!=TERM: bad.append(f"index 未记全跳过的规则：{idx.get('skipped_rules')}")
+for r in sorted(TERM):
+    p=pathlib.Path(run,"work","conflicts",f"conflicts-candidate.{r}.json")
+    if not p.exists(): bad.append(f"{r} 的候选文件不存在（下游 glob 读不到 = 状态不明）"); continue
+    d=json.load(open(p,encoding="utf-8"))
+    if d.get("candidates"): bad.append(f"{r} 关闭后仍留着 {len(d['candidates'])} 条候选")
+    if not d.get("skipped_reason"): bad.append(f"{r} 的空文件没标 skipped_reason")
+for b in bad: print("   ",b)
+sys.exit(1 if bad else 0)
+PYEOF
+check "术语类 L01–L05/L25/L26 默认不跑，旧候选被清空" "$?" 0
+G0=$(python3 "$S/glossary_scan.py" --run-dir "$RUN2")
+check "关闭时 Pass 0 术语抽取整步跳过（零 batch，不需发起调用）" \
+  "$(echo "$G0" | jget "['batches']")" 0
+
+# 打开开关后必须重算——空文件不能被当成「已完成」，否则开了也不生效
+printf 'logic:\n  term_rules: true\n' > "$WORK/term-on.yaml"
+C=$(python3 "$S/detect_conflicts.py" --run-dir "$RUN2" --config "$WORK/term-on.yaml")
 FIRED=$(echo "$C" | python3 -c "import json,sys;d=json.load(sys.stdin)['by_rule'];print(sum(1 for k,v in d.items() if v))")
 ge "触发的 L 规则数（不含需术语表/TOC 的 L05/L17/L25/L26/L32）" "$FIRED" 25
 for r in L01 L02 L06 L08 L11 L12 L20 L23 L24 L27 L29 L30; do
@@ -130,7 +157,7 @@ done
 cp "$RUN2/work/conflicts/index.json" "$WORK/before.json"
 rm -f "$RUN2/work/ledger.db"
 python3 "$S/ledger.py" rebuild --run-dir "$RUN2" >/dev/null
-python3 "$S/detect_conflicts.py" --run-dir "$RUN2" --force >/dev/null
+python3 "$S/detect_conflicts.py" --run-dir "$RUN2" --force --config "$WORK/term-on.yaml" >/dev/null
 python3 - "$WORK/before.json" "$RUN2/work/conflicts/index.json" <<'PY'
 import json,sys
 a=json.load(open(sys.argv[1]))["by_rule"]; b=json.load(open(sys.argv[2]))["by_rule"]
@@ -182,7 +209,7 @@ done
 # 权威术语表激活 L25/L26；表自身矛盾时必须终止
 python3 "$S/import_glossary.py" --run-dir "$RUN2" \
   --authoritative "$F/sample-authoritative.csv" --fallback "$F/sample-fallback.txt" >/dev/null
-C2=$(python3 "$S/detect_conflicts.py" --run-dir "$RUN2" --force --rules L25,L26)
+C2=$(python3 "$S/detect_conflicts.py" --run-dir "$RUN2" --force --rules L25,L26 --config "$WORK/term-on.yaml")
 ge "L25 禁用写法（需权威表）" "$(echo "$C2" | jget "['by_rule']['L25']")" 1
 ge "L26 变体写法（需权威表）" "$(echo "$C2" | jget "['by_rule']['L26']")" 1
 printf '术语,标准写法\n边缘节点,边缘节点\n边缘节点,边沿节点\n' > "$WORK/bad.csv"
