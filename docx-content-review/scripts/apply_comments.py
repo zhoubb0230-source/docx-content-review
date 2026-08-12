@@ -86,6 +86,19 @@ def _revision_reason(head: str, rid: str, evidence: str, patch: dict) -> str:
     return "\n".join(x for x in lines if x)
 
 
+def _anchor_or_whole(anchor: str, para_text: str) -> str:
+    """锚点在段内不唯一时置空 → 由 `_anchor_paragraph` 退回整段。
+
+    圈错一处比圈住整段更糟：评审人会照着高亮去找问题，而问题不在那里。
+    **判定必须放在 plan 里，依据是原始段落文本**——apply 的时候段落已经被修订
+    改过（被替换的那一处进了 w:del，不再参与定位），在那时判会得到与计划
+    不一致的结论：计划说"说不清是哪一处"，落笔却精确圈住了剩下的那一处。
+    `commentlist.json` 由 plan 写，`validate_docx` 也拿它做预期，三者必须一致。
+    """
+    a = (anchor or "").strip()
+    return a if a and para_text.count(a) == 1 else ""
+
+
 def build_plan(run_dir: Path, cfg: dict) -> dict:
     """批注来源：降级为批注的局部问题 + 裁定成立的逻辑冲突 + **每一处已落笔的修订**。"""
     logic_cfg = cfg.get("logic") or {}
@@ -138,7 +151,9 @@ def build_plan(run_dir: Path, cfg: dict) -> dict:
             lines.append(f"建议改为：{rec['suggested_text']}")
         lines.append(f"（检测规则 {rid}）")
         items.append({
-            "comment_id": None, "pid": rec["pid"], "anchor": rec.get("original_text") or "",
+            "comment_id": None, "pid": rec["pid"],
+            "anchor": _anchor_or_whole(rec.get("original_text"),
+                                       (paras.get(rec["pid"]) or {}).get("text") or ""),
             "severity": rec.get("severity") or "Medium",
             "text": "\n".join(x for x in lines if x),
             "source": "issue", "ref": iid,
@@ -210,7 +225,7 @@ def build_plan(run_dir: Path, cfg: dict) -> dict:
             # 「只选中了前面一两行」，评审人看不出批注究竟在说这一段的哪部分。
             side_text = (sides[0].get("text") or "").strip()
             para_text = paras.get(sides[0]["pid"], {}).get("text") or ""
-            anchor = side_text if side_text and side_text in para_text else ""
+            anchor = _anchor_or_whole(side_text, para_text)
             items.append({
                 "comment_id": None, "pid": sides[0]["pid"],
                 "anchor": anchor,
@@ -302,6 +317,10 @@ def _anchor_paragraph(para, anchor: str, cid: int, rev: dict | None = None) -> b
     ref = etree.SubElement(ref_run, ox.q("commentReference")); ref.set(ox.q("id"), str(cid))
 
     first, last = _revision_nodes(para, rev)
+    # 锚点在段内出现多次时不猜是哪一处，退回整段。
+    # 圈错一处比圈住整段更糟：评审人会照着高亮去找问题，而问题不在那里。
+    if first is None and anchor and ox.span_count(para, anchor) != 1:
+        anchor = ""
     if first is None and anchor:
         # 精确路径：把锚点切成独立的 run，范围就能落在字符边界上。
         # 不切的话，合并后整段只有一只 run 时「一句话有语病」会圈住整段两百多字。

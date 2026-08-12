@@ -71,6 +71,8 @@ def build_plan(run_dir: Path, cfg: dict) -> dict:
                 "patch_id": c["conflict_id"], "pid": c["sides"][0]["pid"],
                 "category": c["rule"], "original_text": sug["original_text"],
                 "suggested_text": sug["suggested_text"], "source": "conflict",
+                # 术语规范化的语义是"这一段里的这个写法全部换掉"，不是"改某一处"
+                "all_occurrences": bool(sug.get("all_occurrences")),
             })
 
     # 修订总数超限时超出部分降级为批注（超大量修订会让 Word 打开缓慢甚至无响应）
@@ -115,59 +117,90 @@ def apply_plan(run_dir: Path, cfg: dict) -> dict:
         if para is None:
             failed.append({**patch, "reason": "pid 不存在"})
             continue
-        loc = ox.locate_span(para, patch["original_text"])
-        if loc is None:
+
+        # 唯一性守卫：`locate_span` 取的是首个匹配，跨度在段内出现多次时
+        # "改哪一处"没有依据——问题记录里只有 pid 与 original_text，没有偏移量。
+        # 「本期指标目标为 200ms，实测值为 1200ms。」里改「200ms」，改中的是
+        # 目标值还是实测值取决于 find 而不是取决于判定。**不确定即不落笔**：
+        # 未落笔的条目会照常出普通批注（见 apply_comments），不会静默消失。
+        #
+        # 例外是术语规范化（L25/L26）：那里的语义本来就是"这一段里的这个写法
+        # 全部换掉"，不存在"改哪一处"的问题。它带 all_occurrences 标记，
+        # 走下面的循环逐处替换——顺带修掉一个存量缺陷：原实现只换首处，
+        # 剩下的原样留着，文档会变成半规范化状态。
+        every = bool(patch.get("all_occurrences"))
+        occ = ox.span_count(para, patch["original_text"])
+        if occ > 1 and not every:
+            failed.append({**patch, "reason": f"原文在该段落中出现 {occ} 次，无法唯一定位，未落笔"})
+            continue
+
+        marks: list[tuple[str, str]] = []
+        produced: list[str] = []
+        src_rpr_key = ""
+        while True:
+            loc = ox.locate_span(para, patch["original_text"])
+            if loc is None:
+                break
+            start, end, runs = loc
+            parts = ox.split_for_span(runs, start, end)
+            if not parts or not parts["target"]:
+                break
+
+            anchor = parts["anchor"]
+            parent = anchor.getparent()
+            insert_at = list(parent).index(anchor)
+            src_rpr_key = ox.rpr_key(anchor)
+
+            # 1) 前段：保留，rPr 深拷贝自其来源 run
+            new_nodes = []
+            for src, text in parts["head"]:
+                new_nodes.append(ox.new_run(ox.clone_rpr(src), text))
+            # 2) 被删段：包进 w:del，w:t → w:delText，rPr 深拷贝自各自来源 run
+            del_el = etree.Element(ox.q("del"))
+            del_id = rid
+            del_el.set(ox.q("id"), str(rid)); rid += 1
+            del_el.set(ox.q("author"), author)
+            del_el.set(ox.q("date"), stamp)
+            for src, text in parts["target"]:
+                del_el.append(ox.new_run(ox.clone_rpr(src), text, deleted=True))
+            new_nodes.append(del_el)
+            # 3) 新增段：包进 w:ins，继承首个受影响 run 的 rPr
+            ins_el = etree.Element(ox.q("ins"))
+            ins_id = rid
+            ins_el.set(ox.q("id"), str(rid)); rid += 1
+            ins_el.set(ox.q("author"), author)
+            ins_el.set(ox.q("date"), stamp)
+            ins_el.append(ox.new_run(copy.deepcopy(ox.clone_rpr(parts["target"][0][0])),
+                                     patch["suggested_text"]))
+            new_nodes.append(ins_el)
+            # 4) 后段：保留
+            for src, text in parts["tail"]:
+                new_nodes.append(ox.new_run(ox.clone_rpr(src), text))
+
+            for r in parts["affected"]:
+                if r.getparent() is not None:
+                    r.getparent().remove(r)
+            for offset, node in enumerate(new_nodes):
+                parent.insert(min(insert_at + offset, len(parent)), node)
+
+            produced += [ox.rpr_key(r) for n in new_nodes
+                         for r in ([n] if n.tag == ox.q("r") else list(n.iter(ox.q("r"))))]
+            marks.append((str(del_id), str(ins_id)))
+            # 换完一处后原文已进 w:del，而 para_runs 跳过修订标记内的 run，
+            # 所以下一轮 locate_span 自然找到下一处，不需要额外的偏移记账。
+            if not every:
+                break
+
+        if not marks:
             failed.append({**patch, "reason": "原文在段落中定位失败"})
             continue
-        start, end, runs = loc
-        parts = ox.split_for_span(runs, start, end)
-        if not parts or not parts["target"]:
-            failed.append({**patch, "reason": "run 拆分失败"})
-            continue
 
-        anchor = parts["anchor"]
-        parent = anchor.getparent()
-        insert_at = list(parent).index(anchor)
-        src_rpr_key = ox.rpr_key(anchor)
-
-        # 1) 前段：保留，rPr 深拷贝自其来源 run
-        new_nodes = []
-        for src, text in parts["head"]:
-            new_nodes.append(ox.new_run(ox.clone_rpr(src), text))
-        # 2) 被删段：包进 w:del，w:t → w:delText，rPr 深拷贝自各自来源 run
-        del_el = etree.Element(ox.q("del"))
-        del_id = rid
-        del_el.set(ox.q("id"), str(rid)); rid += 1
-        del_el.set(ox.q("author"), author)
-        del_el.set(ox.q("date"), stamp)
-        for src, text in parts["target"]:
-            del_el.append(ox.new_run(ox.clone_rpr(src), text, deleted=True))
-        new_nodes.append(del_el)
-        # 3) 新增段：包进 w:ins，继承首个受影响 run 的 rPr
-        ins_el = etree.Element(ox.q("ins"))
-        ins_id = rid
-        ins_el.set(ox.q("id"), str(rid)); rid += 1
-        ins_el.set(ox.q("author"), author)
-        ins_el.set(ox.q("date"), stamp)
-        ins_el.append(ox.new_run(copy.deepcopy(ox.clone_rpr(parts["target"][0][0])),
-                                 patch["suggested_text"]))
-        new_nodes.append(ins_el)
-        # 4) 后段：保留
-        for src, text in parts["tail"]:
-            new_nodes.append(ox.new_run(ox.clone_rpr(src), text))
-
-        for r in parts["affected"]:
-            if r.getparent() is not None:
-                r.getparent().remove(r)
-        for offset, node in enumerate(new_nodes):
-            parent.insert(min(insert_at + offset, len(parent)), node)
-
-        produced = [ox.rpr_key(r) for n in new_nodes
-                    for r in ([n] if n.tag == ox.q("r") else list(n.iter(ox.q("r"))))]
         # del_id / ins_id 让 apply_comments 能把「修订原因」批注**精确**锚在这处改动上：
         # 改动落地后原文已进了 w:del，按原文再定位一次必然失败（见 ooxml.para_runs）。
+        # 整段替换时锚在首处，批注正文说明的是这个写法本身，不针对某一处。
         provenance.append({"patch_id": patch["patch_id"], "pid": patch["pid"],
-                           "del_id": str(del_id), "ins_id": str(ins_id),
+                           "del_id": marks[0][0], "ins_id": marks[0][1],
+                           "occurrences": len(marks),
                            "source_rpr": src_rpr_key, "produced_rpr": produced,
                            "consistent": all(k == src_rpr_key for k in produced)})
         applied.append(patch["patch_id"])

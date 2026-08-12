@@ -1215,5 +1215,159 @@ PYEOF
 check "同段之内：豁免区域外保留、区域内压制" "$?" 0
 
 echo
+echo "══ 17. 定位歧义：跨度在段内不唯一时不得落笔 ══"
+
+# locate_span 取的是首个匹配。「本期指标目标为 200ms，实测值为 1200ms。」里
+# 把「200ms」改掉，改中的是目标值还是实测值，取决于 find 而不是取决于判定。
+INIT7=$(python3 "$S/workspace.py" init --source "$F/logic-injection.docx" \
+        --output-dir "$DELIVER" --temp-dir "$WORK/t17")
+RUN7=$(echo "$INIT7" | jget "['run_dir']")
+python3 "$S/unpack.py" run --run-dir "$RUN7" >/dev/null
+python3 "$S/extract.py" --run-dir "$RUN7" >/dev/null
+
+python3 - "$RUN7" <<'PYEOF'
+import json,sys,pathlib
+run=pathlib.Path(sys.argv[1])
+paras=[json.loads(l) for l in open(run/"work"/"paragraphs.jsonl",encoding="utf-8")]
+def find(sub): return next(p for p in paras if sub in p["text"])
+amb  = find("实测值为")            # 「200ms」出现两次（1200ms 里也含 200ms）
+uniq = amb                          # 同一段里另取一个唯一跨度
+term = find("QPS 提升至")           # 「QPS」出现两次，术语规范化要全换
+assert amb["text"].count("200ms")==2, amb["text"]
+assert term["text"].count("QPS")==2, term["text"]
+patches=[
+  {"patch_id":"AMB","pid":amb["pid"],"category":"A8",
+   "original_text":"200ms","suggested_text":"200 ms","source":"issue"},
+  {"patch_id":"UNI","pid":uniq["pid"],"category":"A8",
+   "original_text":"实测值为 1200ms","suggested_text":"实测值为 1100ms","source":"issue"},
+  {"patch_id":"ALL","pid":term["pid"],"category":"L26",
+   "original_text":"QPS","suggested_text":"qps","source":"conflict",
+   "all_occurrences":True},
+]
+(run/"work"/"patchlist.json").write_text(
+    json.dumps({"patches":patches,"demoted_to_comment":[]},ensure_ascii=False),encoding="utf-8")
+# 未落笔的条目必须照常出普通批注 → 需要它在 issues-verified 里有对应记录
+rows=[{"id":"AMB","chunk_id":"0001","pid":amb["pid"],"category":"A8","rule_id":"A8",
+       "severity":"High","original_text":"200ms","suggested_text":"200 ms",
+       "evidence":"单位写法","action":"revision","verify":{"result":"pass"}}]
+(run/"work"/"issues-verified.jsonl").write_text(
+    "".join(json.dumps(r,ensure_ascii=False)+"\n" for r in rows),encoding="utf-8")
+(run/"work"/"conflicts").mkdir(parents=True,exist_ok=True)
+PYEOF
+
+AR=$(python3 "$S/apply_revisions.py" apply --run-dir "$RUN7")
+check "歧义跨度不落笔，唯一跨度与整段替换照常落笔" "$(echo "$AR" | jget "['applied']")" 2
+check "歧义跨度记为失败" "$(echo "$AR" | jget "['failed']")" 1
+python3 - "$RUN7" <<'PYEOF'
+import json,sys
+prov=json.load(open(f"{sys.argv[1]}/work/revision-provenance.json",encoding="utf-8"))
+assert set(prov["applied"])=={"UNI","ALL"}, prov["applied"]
+f=prov["failed"][0]
+assert f["patch_id"]=="AMB" and "出现 2 次" in f["reason"], f
+# 术语规范化必须把该段里的两处都换掉——只换首处会让文档半规范化
+allp=next(p for p in prov["provenance"] if p["patch_id"]=="ALL")
+assert allp["occurrences"]==2, f"整段替换只落了 {allp['occurrences']} 处"
+uni=next(p for p in prov["provenance"] if p["patch_id"]=="UNI")
+assert uni["occurrences"]==1 and uni["consistent"], uni
+PYEOF
+check "失败原因指明出现次数；整段替换覆盖全部两处" "$?" 0
+
+# 改中的必须是「实测值」那一处，不是目标值那一处
+python3 - "$S" "$RUN7" <<'PYEOF'
+import sys
+from lxml import etree
+sys.path.insert(0, sys.argv[1])
+import ooxml as ox
+root=etree.parse(f"{sys.argv[2]}/work/unpacked/word/document.xml").getroot()
+acc, rej = ox.text_view(root, accept=True), ox.text_view(root, accept=False)
+assert "目标为 200ms" in acc, "目标值被误改（改中了首个匹配）"
+assert "实测值为 1100ms" in acc, "唯一跨度未按预期落笔"
+assert "由 1000 qps 提升至 1500 qps" in acc, f"术语未全部替换"
+assert "由 1000 QPS 提升至 1500 QPS" in rej, "拒绝修订视图与原文不一致"
+PYEOF
+check "接受视图改的是实测值那一处，拒绝视图逐字还原" "$?" 0
+
+python3 "$S/apply_comments.py" plan --run-dir "$RUN7" >/dev/null
+python3 - "$RUN7" <<'PYEOF'
+import json,sys
+cl=json.load(open(f"{sys.argv[1]}/work/commentlist.json",encoding="utf-8"))["comments"]
+amb=[c for c in cl if c.get("ref")=="AMB"]
+assert amb, "计划了修订但未落笔的条目静默消失了（既无修订也无批注）"
+assert amb[0].get("kind")!="revision", "未落笔的条目不该出修订理由批注"
+PYEOF
+check "未落笔的条目照常出普通批注，不静默丢失" "$?" 0
+
+python3 "$S/apply_comments.py" apply --run-dir "$RUN7" >/dev/null
+python3 - "$S" "$RUN7" <<'PYEOF'
+import json,sys
+from lxml import etree
+sys.path.insert(0, sys.argv[1])
+import ooxml as ox
+run=sys.argv[2]
+root=etree.parse(f"{run}/work/unpacked/word/document.xml").getroot()
+cover=ox.comment_coverage(root)
+cl=json.load(open(f"{run}/work/commentlist.json",encoding="utf-8"))["comments"]
+amb=next(c for c in cl if c.get("ref")=="AMB")
+got=cover[str(amb["comment_id"])]["reject"]
+# 锚点「200ms」在段内出现两次 → 不猜是哪一处，退回整段。
+# 圈错一处比圈住整段更糟：评审人会照着高亮去找问题，而问题不在那里。
+assert got.count("200ms")==2, f"歧义锚点被圈到了其中一处：{got!r}"
+PYEOF
+check "歧义锚点退回整段，而不是圈住首个匹配" "$?" 0
+
+python3 "$S/validate_docx.py" --run-dir "$RUN7" >/dev/null 2>&1
+check "多处替换 + 歧义退让之后，四项校验仍全过（D9 未被放松）" "$?" 0
+
+# 负向对照：关掉唯一性守卫，歧义跨度会落到首个匹配上
+python3 - "$S" "$F" "$WORK" <<'PYEOF'
+import json,subprocess,sys,shutil,pathlib
+S,F,W=sys.argv[1],sys.argv[2],sys.argv[3]
+out=subprocess.run([sys.executable,f"{S}/workspace.py","init","--source",f"{F}/logic-injection.docx",
+                    "--output-dir",f"{W}/d17b","--temp-dir",f"{W}/t17b"],capture_output=True,text=True)
+run=pathlib.Path(json.loads(out.stdout)["run_dir"])
+for cmd in (["unpack.py","run"],["extract.py"]):
+    subprocess.run([sys.executable,f"{S}/{cmd[0]}"]+cmd[1:]+["--run-dir",str(run)],capture_output=True)
+paras=[json.loads(l) for l in open(run/"work"/"paragraphs.jsonl",encoding="utf-8")]
+amb=next(p for p in paras if "实测值为" in p["text"])
+(run/"work"/"patchlist.json").write_text(json.dumps({"patches":[
+    {"patch_id":"AMB","pid":amb["pid"],"category":"A8","original_text":"200ms",
+     "suggested_text":"200 ms","source":"issue","all_occurrences":False}],
+    "demoted_to_comment":[]},ensure_ascii=False),encoding="utf-8")
+# 打桩：让 span_count 恒为 1，等于关掉守卫
+sys.path.insert(0,S)
+import ooxml as ox, apply_revisions as ar, workspace as ws
+ox.span_count=lambda para,needle: 1
+ar.apply_plan(run, ws.load_config(None))
+from lxml import etree
+root=etree.parse(str(run/"work"/"unpacked"/"word"/"document.xml")).getroot()
+acc=ox.text_view(root,accept=True)
+# 守卫关掉后，改中的是目标值那一处——这正是守卫要拦的现场
+sys.exit(0 if "目标为 200 ms" in acc else 1)
+PYEOF
+check "负向对照：关掉守卫即改中目标值那一处（说明守卫拦的是真现场）" "$?" 0
+
+# typo 通道：候选窗口自动撑到唯一，否则产出的候选注定落不了笔
+python3 - "$S" <<'PYEOF'
+import sys
+sys.path.insert(0, sys.argv[1])
+import typo_scan as ts
+# 整句重复：±6 的固定窗口在这里必然不唯一，必须一路撑到能区分两处为止
+t="系统布署完成后需要复核。系统布署完成后需要复核，并记录结论。"
+s=t.index("布署")
+lo,hi=ts._unique_window(t, s, s+2)
+assert t.count(t[lo:hi])==1, f"窗口仍不唯一，这条候选注定落不了笔：{t[lo:hi]!r}"
+assert "布署" in t[lo:hi]
+# 第二处也要能各自撑到唯一，且两处窗口不同（否则 merge 会把它们合成一条）
+s2=t.index("布署", s+1)
+lo2,hi2=ts._unique_window(t, s2, s2+2)
+assert t.count(t[lo2:hi2])==1 and (lo,hi)!=(lo2,hi2), "两处候选的窗口没有区分开"
+# 窗口里出现两次错词时按位置替换，不得全局 replace
+w, at = "布署与布署", 0
+assert w[:at]+"部署"+w[at+2:] == "部署与布署", "按位置替换写错了"
+assert w.replace("布署","部署") == "部署与部署", "全局 replace 会顺手改掉另一处"
+PYEOF
+check "错别字候选窗口自动撑到段内唯一" "$?" 0
+
+echo
 printf '通过 \033[32m%d\033[0m，失败 \033[31m%d\033[0m\n' "$PASS" "$FAIL"
 [ "$FAIL" -eq 0 ]

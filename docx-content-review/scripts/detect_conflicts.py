@@ -813,7 +813,10 @@ def r_L25(ctx, seq):
                     continue
                 c = make("L25", ctx, [ctx.side(p["pid"], {"form": form, "preferred": pref})],
                          pref, f"使用了禁用写法「{form}」，标准写法为「{pref}」", seq)
-                c["suggest"] = {"original_text": form, "suggested_text": pref}
+                # 该段落里这个禁用写法**全部**换掉：只换首处会让文档半规范化，
+                # 而且"换哪一处"在这里根本不是一个问题（见 apply_revisions 的唯一性守卫）
+                c["suggest"] = {"original_text": form, "suggested_text": pref,
+                                "all_occurrences": True}
                 out.append(c)
     return out
 
@@ -835,7 +838,8 @@ def r_L26(ctx, seq):
                     continue
                 c = make("L26", ctx, [ctx.side(p["pid"], {"form": v, "preferred": pref})],
                          pref, f"使用了变体「{v}」而非标准写法「{pref}」", seq)
-                c["suggest"] = {"original_text": v, "suggested_text": pref}
+                c["suggest"] = {"original_text": v, "suggested_text": pref,
+                                "all_occurrences": True}
                 out.append(c)
     return out
 

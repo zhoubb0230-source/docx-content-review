@@ -131,12 +131,28 @@ def locate_span(para, needle: str) -> tuple[int, int, list] | None:
     joined = "".join(run_text(r) for r in runs)
     idx = joined.find(needle)
     if idx < 0:
-        # 退一步：允许空白差异
-        compact = joined.replace(" ", "").replace("　", "")
-        if needle.replace(" ", "").replace("　", "") not in compact:
-            return None
         return None
     return idx, idx + len(needle), runs
+
+
+def span_count(para, needle: str) -> int:
+    """跨度在段落可定位文本中出现的次数。
+
+    `locate_span` 取的是**首个**匹配。跨度在同一段里出现多次时，"改哪一处"
+    就成了一个没有依据的选择——问题记录里只有 pid 与 original_text，没有偏移量。
+    「本期指标目标为 200ms，实测值为 1200ms。」里把「200ms」改掉，
+    改中的是目标值还是实测值，取决于 `find` 而不是取决于判定。
+    调用方据此决定：唯一才落笔，不唯一要么整段替换（术语规范化），要么不落笔。
+    """
+    runs = [r for r in para_runs(para) if run_is_plain(r)]
+    if not runs or not needle:
+        return 0
+    joined = "".join(run_text(r) for r in runs)
+    n, start = 0, 0
+    while (i := joined.find(needle, start)) != -1:
+        n += 1
+        start = i + 1
+    return n
 
 
 # 段落中承载正文的直接子节点。批注范围必须以这一层为边界：

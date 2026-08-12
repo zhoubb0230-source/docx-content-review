@@ -101,6 +101,26 @@ def lint(typos_path: str | None = None, traps_path: str | None = None) -> dict:
             "ok": not any(problems.values()), "problems": problems}
 
 
+def _unique_window(text: str, s: int, e: int, pad: int = 6, limit: int = 40) -> tuple[int, int]:
+    """取一段包含 [s,e) 且**在本段内唯一**的上下文窗口。
+
+    候选的 `original_text` 就是这个窗口，回写时按它定位。窗口不唯一时
+    `locate_span` 会落到首处——「本期指标目标为 200ms，实测值为 1200ms。」
+    这类段落里就会改错地方，而 `apply_revisions` 的唯一性守卫会直接拒绝落笔。
+    所以宁可把窗口撑宽一点，也不要产出一条注定落不了笔的候选。
+
+    撑到 limit 仍不唯一（整段是重复内容）就返回最宽的那个，由回写侧兜底。
+    """
+    while pad <= limit:
+        lo, hi = max(0, s - pad), min(len(text), e + pad)
+        if text.count(text[lo:hi]) == 1:
+            return lo, hi
+        if lo == 0 and hi == len(text):
+            break
+        pad += 6
+    return max(0, s - limit), min(len(text), e + limit)
+
+
 def scan(run_dir: Path, cfg: dict, chunk_id: str | None) -> dict:
     tc = cfg.get("typo_check") or {}
     if not tc.get("enabled"):
@@ -144,11 +164,14 @@ def scan(run_dir: Path, cfg: dict, chunk_id: str | None) -> dict:
                 if wrong in whitelist:
                     continue
                 for m in re.finditer(re.escape(wrong), text):
-                    lo, hi = max(0, m.start() - 6), min(len(text), m.end() + 6)
+                    lo, hi = _unique_window(text, m.start(), m.end())
                     cands.append({"pid": pid, "wrong": wrong, "right": right,
                                   "rule": "common-typos" if (wrong, right, why) in typos
                                           else "glossary-forbidden",
                                   "reason": why, "context": text[lo:hi],
+                                  # 窗口里可能不止一个 `wrong`（撑宽之后更容易），
+                                  # 所以记下本处的偏移，merge 时按位置替换而不是全局 replace
+                                  "wrong_at": m.start() - lo,
                                   "original_text": text[lo:hi]})
             # 单字混淆集（shape / pinyin）**刻意不用于生成候选**：
             # 按单字命中会把「度」「作」「帐」这类高频字全部拉成候选，噪音淹没一切。
@@ -190,10 +213,17 @@ def merge(run_dir: Path, cfg: dict, chunk_id: str) -> dict:
         c = cands.get((v.get("pid"), v.get("wrong"), v.get("context"))) or {}
         if not c:
             continue
+        # 只替换裁定针对的那一处：窗口里可能出现两次同一个错词
+        # （「1200ms」里就含着「200ms」），全局 replace 会顺手改掉不该改的那个。
+        orig, at = c["original_text"], c.get("wrong_at")
+        if isinstance(at, int) and orig[at:at + len(c["wrong"])] == c["wrong"]:
+            sugg = orig[:at] + c["right"] + orig[at + len(c["wrong"]):]
+        else:
+            sugg = orig.replace(c["wrong"], c["right"], 1)
         rows.append({
             "chunk_id": chunk_id, "pid": c["pid"], "category": "A1", "rule_id": "A1",
-            "severity": "High", "original_text": c["original_text"],
-            "suggested_text": c["original_text"].replace(c["wrong"], c["right"]),
+            "severity": "High", "original_text": orig,
+            "suggested_text": sugg,
             "evidence": (c.get("reason") or "错别字")[:25],
             "source": "typo_channel", "action": "revision",
         })
