@@ -24,19 +24,29 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from _common import (  # noqa: E402
     EX, atomic_write_json, atomic_write_jsonl, die, emit, normalize_key, normalize_width,
-    read_json, read_jsonl, run_cli,
+    normalize_ws, read_json, read_jsonl, run_cli,
 )
 from workspace import guard_write_path, load_config, resolve_path  # noqa: E402
 
-# N10：引用的法规/标准/合同原文
-QUOTE_PATTERNS = [
-    re.compile(r"《[^》]{2,60}》\s*第[〇零一二三四五六七八九十百千0-9]+[条款章节项]"),
-    re.compile(r"(?:法|条例|办法|规定|标准|规范|合同|协议)\s*第[〇零一二三四五六七八九十百千0-9]+[条款项]"),
-    re.compile(r"(?:规定|约定|要求)[：:][""「『]"),
-    re.compile(r"^[""「『].{4,}[""」』]$"),
+OPEN_Q = "“「『\""      # “ 「 『 "
+CLOSE_Q = "”」』\""     # ” 」 』 "
+# N10：引用的法规/标准/合同原文。**这里只是"援引"的标志，不等于整段都是引文**——
+# 引文本体要么被引号括住，要么跟在「规定：」「约定：」之后。
+# 条号允许小数分节（「合同第 3.2 条」）与两侧空格——`never-flag.md` 自己举的
+# 那个例子早先就匹配不上，负向语料把它撞出来了。
+_ART = r"第\s*[〇零一二三四五六七八九十百千0-9]+(?:\.[0-9]+)*\s*"
+CITATION_PATTERNS = [
+    re.compile(rf"《[^》]{{2,60}}》\s*{_ART}[条款章节项]"),
+    re.compile(rf"(?:法|条例|办法|规定|标准|规范|合同|协议)\s*{_ART}[条款项]"),
     re.compile(r"\bGB/?T?\s*\d{3,}"),
     re.compile(r"\bISO\s*\d{3,}"),
 ]
+# 整段就是一句引文
+WHOLE_QUOTE_RE = re.compile(f"^[{OPEN_Q}].{{4,}}[{CLOSE_Q}]$")
+# 引号括住的引文本体
+QUOTED_BODY_RE = re.compile(f"[{OPEN_Q}][^{CLOSE_Q}]{{4,400}}[{CLOSE_Q}]")
+# 「…规定：」之后到段末是逐字引文（仅在同段出现了援引标志时才算）
+QUOTE_LEAD_RE = re.compile(r"(?:规定|约定|要求|明确)\s*[：:]")
 # N12：图表标题、编号、页眉页脚的固定格式
 CAPTION_PATTERNS = [
     re.compile(r"^\s*(?:图|表|附图|附表|Figure|Fig\.?|Table)\s*[0-9０-９]+\s*[-–—.－][0-9０-９]+"),
@@ -92,6 +102,96 @@ def _fallback_terms(glossary: dict) -> set[str]:
     return out
 
 
+SENT_END = "。！？；!?;"
+
+
+def _norm_map(text: str) -> tuple[str, list[int]]:
+    """去空白串 + 「去空白位置 → 原串位置」的映射。"""
+    buf, idx = [], []
+    for i, ch in enumerate(text):
+        if not ch.isspace():
+            buf.append(ch)
+            idx.append(i)
+    return "".join(buf), idx
+
+
+def _span_range(ptext: str, span: str) -> tuple[int, int] | None:
+    """跨度在段落原串中的字符区间。定位不到返回 None。
+
+    闸门② 已保证 `normalize_ws(跨度)` 是段落的子串，所以这里在去空白空间里
+    定位再映射回原串，不受换行与全角空格的干扰。
+    """
+    nt, idx = _norm_map(ptext)
+    ns = normalize_ws(span)
+    if not ns:
+        return None
+    i = nt.find(ns)
+    if i < 0:
+        return None
+    return idx[i], idx[i + len(ns) - 1] + 1
+
+
+def exempt_regions(ptext: str, para: dict | None, issue: dict, skip: dict) -> list[tuple]:
+    """段落内被位置类规则豁免的字符区间 [(起, 止, 规则号)]，整段豁免为 (0, len)。
+
+    **N9/N10/N12 判的是区域，不是段落。** 三条规则的原文都是"这个区域内的内容
+    不审查"：代码块、引文、图表标题各自是一块区域。早先的实现把它们写成了
+    "段落里出现该特征就整段免检"，而技术文档里一句话带一条 URL、一个
+    `cpu_usage=80%`、一句「按照本办法第五条执行」都极常见——按整段判，
+    含这些特征的段落里所有语病都被静默吞掉，输出里没有任何痕迹。
+
+    这与 ADR-030 修 N7 时定下的判据是同一条：**凡是"某个条件成立就跳过检查"
+    的判据，都要问一句：这个条件在真实语料上会有多大比例成立？若接近全集，
+    它就不是过滤器，是开关。** 负向语料见 `tests/fixtures/neverflag-traps.json`。
+    """
+    n = len(ptext)
+    out: list[tuple] = []
+    stripped = ptext.strip()
+    off = ptext.find(stripped) if stripped else 0
+
+    # N9 代码块、命令行、配置示例、日志片段、文件路径
+    if skip.get("code_blocks", True):
+        if (para or {}).get("is_code") or issue.get("is_code"):
+            # 整段就是代码。这个判定来自 extract.py，那里已按中文字符占比排除了散文。
+            out.append((0, n, "N9"))
+        else:
+            for rx in CODE_PATTERNS:
+                for m in rx.finditer(ptext):
+                    out.append((m.start(), m.end(), "N9"))
+
+    # N10 引用的法规/标准/合同原文
+    if skip.get("quoted_regulations", True):
+        if (para or {}).get("is_quote") or WHOLE_QUOTE_RE.match(stripped):
+            out.append((0, n, "N10"))
+        else:
+            cited = False
+            for rx in CITATION_PATTERNS:
+                for m in rx.finditer(ptext):
+                    cited = True
+                    out.append((m.start(), m.end(), "N10"))   # 条号本身不得改动
+            for m in QUOTED_BODY_RE.finditer(ptext):
+                out.append((m.start(), m.end(), "N10"))
+            # 「《X 法》第 N 条规定：」之后到段末是逐字引文——引文常常不带引号，
+            # 只靠这个冒号分界。没有援引标志时不适用，否则任何「要求：」都会免检。
+            if cited:
+                lead = QUOTE_LEAD_RE.search(ptext)
+                if lead:
+                    out.append((lead.end(), n, "N10"))
+
+    # N12 图表标题、编号、页眉页脚的固定格式
+    for rx in CAPTION_PATTERNS:
+        m = rx.search(stripped)
+        if not m:
+            continue
+        # 整行就是标签 → 整段免检；标签后面还跟着成句的正文（「表 3 中列出的各项
+        # 指标改善了…问题。」）→ 只免检标签本身，正文照常审查。
+        if not any(ch in stripped for ch in SENT_END):
+            out.append((0, n, "N12"))
+        else:
+            out.append((off + m.start(), off + m.end(), "N12"))
+    return out
+
+
 def _digits_only_diff(a: str, b: str) -> bool:
     """差异是否只在「阿拉伯数字 ↔ 汉字数字」之间。"""
     def strip_nums(s: str) -> str:
@@ -108,25 +208,23 @@ def check(issue: dict, para: dict | None, cfg: dict, glossary: dict,
     ptext = (para or {}).get("text") or text
     skip = cfg.get("skip") or {}
 
-    # N9 代码块、命令行、配置示例、日志片段、文件路径
-    if skip.get("code_blocks", True):
-        if (para or {}).get("is_code") or issue.get("is_code"):
-            return "N9"
-        if any(rx.search(ptext) for rx in CODE_PATTERNS):
-            return "N9"
-
-    # N11 表格单元格内的省略式表述
+    # N11 表格单元格内的省略式表述——单元格本身就是区域，整体不做语病审查
     if skip.get("tables_language_check", True) and ((para or {}).get("in_table") or issue.get("in_table")):
         return "N11"
 
-    # N10 引用的法规/标准/合同原文
-    if skip.get("quoted_regulations", True):
-        if (para or {}).get("is_quote") or any(rx.search(ptext) for rx in QUOTE_PATTERNS):
-            return "N10"
-
-    # N12 图表标题、编号、页眉页脚
-    if any(rx.search(ptext.strip()) for rx in CAPTION_PATTERNS):
-        return "N12"
+    # N9 / N10 / N12：位置类规则。命中的条件是**跨度落进了被豁免的区域**，
+    # 而不是"段落里出现过该特征"（见 exempt_regions 的说明）。
+    regions = exempt_regions(ptext, para, issue, skip)
+    if regions:
+        rng = _span_range(ptext, text)
+        if rng is None:
+            # 跨度在段落里定位不到（闸门②本应保证能定位）。此时无从判断落在哪，
+            # 退回旧的整段语义：宁可压制，也不要把可能落在代码/引文里的改动放出去。
+            return regions[0][2]
+        s, e = rng
+        for a, b, rule in regions:
+            if s < b and a < e:                # 有重叠即压制
+                return rule
 
     # P 类到此为止：N7/N8/N13/N14 判的是「改动本身该不该做」，而 P 类不改任何字，
     # 它的 original_text 是整个段落。拿整段去撞 fallback 术语表必然命中，
@@ -198,6 +296,32 @@ def process_chunk(run_dir: Path, chunk_id: str, cfg: dict, paras: dict,
     return {"chunk_id": chunk_id, "dropped": total, "kept": len(kept), "by_rule": hits}
 
 
+def traps(path: Path, cfg: dict) -> dict:
+    """负向语料自检：拿一组（段落, 跨度, 期望）去撞 check()。
+
+    **只验"该压制的压住了"不算验，还要验"不该压制的没被压住"**——
+    与 `typo_scan.py lint` 的 `typo-traps.txt`、`validate_docx.py` 的负向对照同性质。
+    压制方向的 fail-open 比放行方向更危险：它表现为"什么都没查出来"，
+    输出里没有任何痕迹（ADR-030）。改 N9–N14 前后必跑。
+    """
+    data = read_json(path)
+    if not isinstance(data, dict) or not isinstance(data.get("cases"), list):
+        die(EX.PARSE, f"负向语料格式不对（应为 {{\"cases\": [...]}}）：{path}")
+    bad = []
+    for i, c in enumerate(data["cases"], 1):
+        para = {"text": c["para"], "is_code": bool(c.get("is_code")),
+                "in_table": bool(c.get("in_table")), "is_quote": bool(c.get("is_quote")),
+                "is_heading": bool(c.get("is_heading"))}
+        issue = {"original_text": c["span"], "category": c.get("category") or "A5",
+                 "suggested_text": c.get("suggested_text") or ""}
+        got = check(issue, para, cfg, {}, [], set()) or ""
+        want = c.get("expect") or ""
+        if got != want:
+            bad.append(f"#{i} {c.get('note') or c['para'][:20]}："
+                       f"期望 {want or '保留'}，实际 {got or '保留'}")
+    return {"cases": len(data["cases"]), "ok": not bad, "problems": bad}
+
+
 def main(argv: list[str]) -> int:
     ap = argparse.ArgumentParser(prog="filter_neverflag.py", description="闸门③不改清单过滤")
     ap.add_argument("--run-dir")
@@ -207,9 +331,19 @@ def main(argv: list[str]) -> int:
                                    "侧通道（错别字/范式）用它指向自己的产物")
     ap.add_argument("--config")
     ap.add_argument("--probe", help="直接检查一段文本（调试用）")
+    ap.add_argument("--traps", help="负向语料自检（改 N9–N14 前后必跑），"
+                                    "见 tests/fixtures/neverflag-traps.json")
     ap.add_argument("--category", default="A5")
     args = ap.parse_args(argv)
     cfg = load_config(args.config)
+
+    if args.traps:
+        res = traps(Path(args.traps), cfg)
+        for p in res["problems"]:
+            die_msg = f"   {p}"
+            sys.stderr.write(die_msg + "\n")
+        emit({"ok": res["ok"], **res})
+        return EX.OK if res["ok"] else EX.PARSE
 
     if args.probe:
         rule = check({"original_text": args.probe, "category": args.category},

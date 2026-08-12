@@ -45,6 +45,7 @@
 | token 计量、分片策略 | `scripts/tokenizer.py` / `chunk.py` | `references/schemas.md` |
 | **新增/修改一个 A/B/C 类别** | `scripts/verify_span.py` 的 `edit_gate` | `references/taxonomy.md` + `prompts/pass1-review.md` + `tests/fixtures` |
 | **新增一条不改清单规则** | `scripts/filter_neverflag.py` 的 `check` | `references/never-flag.md` + 负样本 fixture |
+| 位置类规则（N9/N10/N12）的豁免边界 | `filter_neverflag.py` 的 `exempt_regions` | **必须往 `tests/fixtures/neverflag-traps.json` 补正反两向的句子** |
 | 闸门④盲测 A/B（拼装、判定表、一致率） | `scripts/verify_pass2.py` | `prompts/pass2-verify.md`；**改动必须重跑泄题检查** |
 | **某个类别进不进交付物** | `verify_pass2.py` 的 `KEEP_SCOPE`（**不是** `REVIEW_SCOPE`） | `prompts/pass2-verify.md` 触发范围表 |
 | **新增一条 L 规则** | `scripts/detect_conflicts.py`（加 `RULES` 项 + `r_LNN` 函数） | `references/logic-rules.md` + `logic-injection.facts.json` + 回归断言 |
@@ -124,12 +125,18 @@ P 类无建议文本、裁定 U 不成条目、三通道产物互不覆盖）、
 这类条目既抬误报又白耗裁定调用，让「扩表不抬高误报率」的前提失效。
 `typo-traps.txt` 就是拦这个的，发现新误报时把那句话原样加进去，只增不减。
 
-改动词表或规则包后，先跑这两个自检再跑全量：
+改动词表、规则包或不改清单后，先跑这三个自检再跑全量：
 
 ```bash
 python3 docx-content-review/scripts/typo_scan.py lint
 python3 docx-content-review/scripts/scan_patterns.py lint --patterns <你的包>
+python3 docx-content-review/scripts/filter_neverflag.py \
+        --traps docx-content-review/tests/fixtures/neverflag-traps.json
 ```
+
+第三个是**闸门③的负向语料**：既验"该压制的压住了"，也验"不该压制的没被压住"。
+压制方向的 fail-open 比放行方向更危险——它表现为"什么都没查出来"，
+输出里没有任何痕迹。在真实语料上发现新的误压制时，把那一段原样加进去，**只增不减**。
 
 `corpus/` 放大型真实语料（不入 git）。小 fixture 跑快速回归，大语料只在里程碑跑。
 

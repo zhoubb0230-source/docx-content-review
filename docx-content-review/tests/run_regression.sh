@@ -1165,5 +1165,55 @@ check "负向对照：纪元不匹配仍以 exit 9 拒绝" "$?" 9
 python3 "$S/workspace.py" lease release --doc-dir "$DOC5" --session s-flow --generation "$OWN5" >/dev/null
 
 echo
+echo "══ 16. 闸门③ 的位置类规则判的是区域，不是整段 ══"
+
+# N9/N10/N12 讲的都是"这个区域内的内容不审查"。早先实现成"段落里出现该特征就
+# 整段免检"——技术文档里一句话带一条 URL、一个 cpu_usage=80%、一句"按照本办法
+# 第五条执行"都极常见，按整段判等于把大半个审查静默关掉，且输出里没有任何痕迹。
+python3 "$S/filter_neverflag.py" --traps "$F/neverflag-traps.json" >/dev/null 2>&1
+check "不改清单负向语料全部符合预期（该压的压住、不该压的没压）" "$?" 0
+TR=$(python3 "$S/filter_neverflag.py" --traps "$F/neverflag-traps.json")
+ge "负向语料条数（正向 + 反向）" "$(echo "$TR" | jget "['cases']")" 20
+
+# 负向对照：把跨度定位关掉 → 退回整段语义，这组语料必须失败
+python3 - "$S" "$F/neverflag-traps.json" <<'PYEOF'
+import sys
+from pathlib import Path
+sys.path.insert(0, sys.argv[1])
+import filter_neverflag as nf
+nf._span_range = lambda ptext, span: None      # 定位不到即退回旧的整段语义
+res = nf.traps(Path(sys.argv[2]), nf.load_config(None))
+for p in res["problems"][:3]:
+    print("   ", p)
+sys.exit(0 if (not res["ok"] and len(res["problems"]) >= 5) else 1)
+PYEOF
+check "负向对照：按整段免检时语料必然失败（说明这组语料咬得住）" "$?" 0
+
+# 逐条落到具体现场：同一段里，落在豁免区域外的语病必须活下来
+python3 - "$S" <<'PYEOF'
+import sys
+sys.path.insert(0, sys.argv[1])
+import filter_neverflag as nf
+cfg = nf.load_config(None)
+def hit(para, span, cat="A2"):
+    return nf.check({"original_text": span, "category": cat, "suggested_text": ""},
+                    {"text": para}, cfg, {}, [], set())
+bad = []
+# 跨度落在区域外 → 保留；落在区域内 → 压制。同一个段落，两种结果。
+para = "详见 https://example.internal/docs 的说明，该文档认真的记录了接口约定。"
+if hit(para, "认真的记录了接口约定"):        bad.append("URL 段落里的正文语病被误压制")
+if hit(para, "https://example.internal/docs") != "N9": bad.append("跨度就是 URL 时未被 N9 压制")
+para = "《网络安全法》第二十一条规定：国家实行网络安全等级保护制度。"
+if hit(para, "国家实行网络安全等级保护制度", "A4") != "N10": bad.append("引文本体未被 N10 保护")
+if hit(para, "《网络安全法》第二十一条", "A3") != "N10":       bad.append("条号未被 N10 保护")
+para = "表 3 中列出的各项指标改善了系统的响应速度问题，需在下一轮复核。"
+if hit(para, "改善了系统的响应速度问题", "A5"): bad.append("以「表 3」开头的正文句被 N12 误压制")
+if not hit("图 3-7 系统总体架构图", "系统总体架构图", "A4"): bad.append("真正的图题未被 N12 压制")
+for b in bad: print("   ", b)
+sys.exit(1 if bad else 0)
+PYEOF
+check "同段之内：豁免区域外保留、区域内压制" "$?" 0
+
+echo
 printf '通过 \033[32m%d\033[0m，失败 \033[31m%d\033[0m\n' "$PASS" "$FAIL"
 [ "$FAIL" -eq 0 ]
