@@ -194,6 +194,16 @@ def cmd_run(args) -> int:
     guard_write_path(snap, run_dir)
     snap.write_bytes(doc_xml.read_bytes())
     baseline["document_baseline"] = str(snap)
+
+    # 既有批注的快照。送审文档常常已经带着别人的批注，而本技能要往同一份
+    # comments.xml 里追加——校验必须能证明"原有的一条都没少、一个字都没变"，
+    # 而这只能靠回写前的现场，不能靠回写时的自述（ADR-008 的教训）。
+    cx = dest / "word" / "comments.xml"
+    if cx.exists():
+        csnap = resolve_path(run_dir, "work") / "comments.baseline.xml"
+        guard_write_path(csnap, run_dir)
+        csnap.write_bytes(cx.read_bytes())
+        baseline["comments_baseline"] = str(csnap)
     out = resolve_path(run_dir, "work") / "unpack-baseline.json"
     guard_write_path(out, run_dir)
     atomic_write_json(out, baseline)

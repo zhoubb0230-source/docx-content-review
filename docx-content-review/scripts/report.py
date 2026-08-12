@@ -90,7 +90,11 @@ def load_rows(run_dir: Path, cfg: dict) -> list[dict]:
                 "page_hint": sides[0].get("page_hint"),
                 "original_text": sides[0].get("text") or "",
                 "suggested_text": (c.get("suggest") or {}).get("suggested_text") or "",
-                "action": c.get("action") or "comment",
+                # 未准入交付物的候选照常进报告（不静默隐藏，ADR-029），
+                # 但动作必须记成 report_only——它没有写进文档。
+                # 否则「交付动作：批注 N」会比文档里实际的批注数多出一截，
+                # 而 Agent 正是照着这个数字向用户口头汇报的。
+                "action": (c.get("action") or "comment") if ok else "report_only",
                 "verify": (v or {}).get("verdict") or "n/a",
                 "memory_hit": False, "note": c.get("note") or c.get("description") or "",
                 "kind": "conflict", "sides": sides, "chapter_span": c.get("chapter_span"),

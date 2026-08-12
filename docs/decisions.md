@@ -867,3 +867,63 @@ L 规则表、目录结构、配置项）不在此重复。
 
 - **影响**：`scripts/ledger.py`、`scripts/metrics.py`、`SKILL.md` 第 4.5 步、
   `tests/run_regression.sh`（134 → 137）。
+
+## ADR-038　送审文档已带批注时不得覆盖；计数口径必须与文档一致
+
+- **日期**：2026-08-12
+- **背景**：第二轮通读。前一轮盯的是"通道断没断"，这一轮盯的是
+  **"输入不是白纸时会怎样"**——六份 fixture 里没有一份带既有批注或既有修订，
+  这条路径从没被走过。
+
+### 一、审查一份已经带批注的文档，会把原有批注全部抹掉（且四项校验全绿）
+
+- **复现**：在 `sample-basic.docx` 上挂一条「张三：这一段请业务方再确认一次。」
+  （id=1），跑完批注回写后：
+
+  ```
+  id=1 author=内容审查 text=[提示] 指代不明（检测规则 B1）
+  ```
+
+  张三的批注**连人带话没了**，而 `validate_docx` 四项全过、退出码 0。
+- **两层原因**：
+  ① `apply_comments` 另起一份 `comments.xml` 整份写入，既有批注不在其中；
+  ② 编号从 1 开始，与正文里既有的 `commentRangeStart id=1` 撞号——
+     旧锚点转而指向新批注。
+- **为什么校验看不出来**：第四项查的是「每个 `commentReference` 都有配对的
+  Start/End 且 id 在 comments.xml 中声明」。撞号之后 `refs` 与 `declared`
+  都含 "1"、覆盖范围也非空，**每一条都成立**。
+  这与 ADR-008（D9 校验读溯源而非现场）、ADR-031（锚定"存在"不等于"圈对了"）
+  是同一类错误的第三次出现：**校验的判据描述了结构，没有描述"用户的东西还在不在"。**
+- **决策**：
+  - `apply_comments` 在既有 `comments.xml` 上**追加**；编号从
+    `max(既有 id) + 1` 起（`_next_comment_id`，同时看正文锚点与 comments.xml）。
+  - 增强层降级时**恢复原内容而不是删文件**——那些部件可能是文档自带的
+    （别人的已解决标记、回复线程），删掉等于替用户丢数据。
+  - `unpack` 存下 `comments.baseline.xml`，`validate_docx` 据此新增一项：
+    **源文档原有的每条批注必须仍在，且正文逐字不变**。判据取自回写前的现场，
+    不是回写时的自述。
+  - `check_structure` 增加批注 id 唯一性检查（`commentRangeStart` 与 `comment` 各一条）。
+  - 新增 fixture `existing-comments.docx`（`make_fixtures.py` 里只用 lxml 生成，
+    因此顶层的 python-docx 导入改为惰性）。
+- **负向对照**：退回"另起一份"后，三条断言全部失败，**其中包括第四项校验
+  以退出码 8 抓住**——这正是原实现缺的那道。
+
+### 二、截断的去重键漏掉了原文
+
+`(pid, category)` 会把同一段落里同一类别的**不同**问题折叠成一条，
+回填时被当成"已选过"跳过。实测：`cap=3`、输入 1×A2 + 5×B1（同一 pid），
+**只保留 2 条**——配额没用满，还丢了一条真问题。
+改为与分片内去重同源的 `(pid, category, normalize_ws(original_text))`。
+
+### 三、未准入的冲突候选被记成了「批注」
+
+`report.py` 的「交付动作」直接取候选的 `action`，而未过 Pass 4 准入的候选
+**并没有写进文档**。实测 28 条被记成 `comment`——
+而 SKILL.md 要求 Agent 正是照着这份报告向用户口头汇报。
+改为 `admitted is False` 时记 `report_only`；它们仍照常出现在报告与 xlsx 里
+（ADR-029：不静默隐藏），只是不再虚报批注数。
+
+- **影响**：`scripts/apply_comments.py`、`unpack.py`、`validate_docx.py`、
+  `verify_span.py`、`report.py`、`tests/fixtures/make_fixtures.py`、
+  新增 `tests/fixtures/existing-comments.docx`、`references/schemas.md`、
+  `tests/run_regression.sh`（137 → 144）。

@@ -311,16 +311,19 @@ def process(run_dir: Path, chunk_id: str, raw_path: Path, cfg: dict,
         # 不是为了反过来让它独占。cap 小于席位数时（如 --cap 1）必须让位给高严重度项。
         reserved = min(len(b_items), floor, cap // 2)
         head = [r for r in kept if r["category"] not in B_CLASSES][:cap - reserved]
-        head_keys = {(r["pid"], r["category"]) for r in head}
-        # 先按原顺序补满 B 类保底席位，再用剩余名额按严重度回填
+        # 去重键必须带上原文，与下面的分片内去重同源。只用 (pid, category) 会把
+        # 同一段落里同一类别的**不同**问题折叠成一条——回填时被当成"已选过"跳过，
+        # 于是配额没用满、真问题却被丢掉（实测 cap=3 只保留 2 条）。
+        def key(r):
+            return (r["pid"], r["category"], normalize_ws(r["original_text"]))
         picked = head + b_items[:reserved]
-        picked_keys = head_keys | {(r["pid"], r["category"]) for r in b_items[:reserved]}
+        picked_keys = {key(r) for r in picked}
         for r in kept:
             if len(picked) >= cap:
                 break
-            if (r["pid"], r["category"]) not in picked_keys:
+            if key(r) not in picked_keys:
                 picked.append(r)
-                picked_keys.add((r["pid"], r["category"]))
+                picked_keys.add(key(r))
         picked.sort(key=lambda r: (severity_rank(r["severity"]), r["pid"]))
         counters["truncated"] = len(kept) - len(picked)
         counters["b_class_reserved"] = reserved

@@ -69,9 +69,14 @@
 再补：
 
 ```json
-{"verify":{"result":"pass|drop","method":"blind_ab|closed_yesno","position":"A|B"},
+{"verify":{"result":"pass|drop","method":"blind_ab|closed_single|not_reviewed","position":"A|B"},
  "memory_hit":false,"memory_reason":null}
 ```
+
+`method: not_reviewed` = 该类别不进闸门④（C 类、P 类，以及建议已被闸门②清空的 A 类）。
+**不复核不等于淘汰**：这些条目 `result` 恒为 `pass`，按各自的 `action` 决定去向。
+这个文件是 report / apply_comments / apply_revisions / metrics 四处的唯一入口，
+被它漏掉的类别在报告里也会一并消失。
 
 ---
 
@@ -135,6 +140,16 @@
    "sides":[{"pid":"p-000418","text":"……","heading_path":["1 总则"],"page_hint":1,"value":"200","unit":"ms"},
             {"pid":"p-000905","text":"……","heading_path":["2 架构设计"],"page_hint":2,"value":"500","unit":"ms"}]}]}
 ```
+
+生成修订的规则（L10/L25/L26）另带 `suggest`：
+
+```json
+{"suggest":{"original_text":"星云","suggested_text":"星云平台","all_occurrences":true}}
+```
+
+`all_occurrences` = 该段落里这个写法**全部**替换（术语规范化的语义就是如此）。
+不带这个标记时，跨度在段内出现多次即拒绝落笔——"改哪一处"没有依据
+（见 `references/ooxml.md` §2.1）。
 
 ## conflicts-verified.jsonl（Pass 4 输出 ← 你写这个，append-only）
 

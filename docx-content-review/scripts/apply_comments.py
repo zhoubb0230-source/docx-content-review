@@ -86,6 +86,34 @@ def _revision_reason(head: str, rid: str, evidence: str, patch: dict) -> str:
     return "\n".join(x for x in lines if x)
 
 
+def _existing_comment_ids(unpacked: Path) -> set[str]:
+    """文档里已经用掉的批注 id（正文的锚点 + comments.xml 的声明）。"""
+    from lxml import etree
+
+    ids: set[str] = set()
+    for part, tags in ((unpacked / "word" / "document.xml",
+                        ("commentRangeStart", "commentRangeEnd", "commentReference")),
+                       (unpacked / CORE_PART, ("comment",))):
+        if not part.exists():
+            continue
+        try:
+            root = etree.parse(str(part)).getroot()
+        except etree.XMLSyntaxError:
+            continue
+        for tag in tags:
+            for el in root.iter(ox.q(tag)):
+                v = el.get(ox.q("id"))
+                if v:
+                    ids.add(str(v))
+    return ids
+
+
+def _next_comment_id(run_dir: Path) -> int:
+    used = {int(v) for v in _existing_comment_ids(resolve_path(run_dir, "unpacked"))
+            if str(v).lstrip("-").isdigit()}
+    return (max(used) + 1) if used else 1
+
+
 def _anchor_or_whole(anchor: str, para_text: str) -> str:
     """锚点在段内不唯一时置空 → 由 `_anchor_paragraph` 退回整段。
 
@@ -233,7 +261,10 @@ def build_plan(run_dir: Path, cfg: dict) -> dict:
                 "text": "\n".join(lines), "source": "conflict", "ref": c["conflict_id"],
             })
 
-    for i, it in enumerate(items, 1):
+    # 编号必须避开文档里既有的批注 id。送审文档常常已经带着别人的批注，
+    # 从 1 开始编会与既有的 commentRangeStart/End 撞号——旧锚点会指向新批注，
+    # 而四项校验全都看不出来（refs 与 declared 都含这个 id，覆盖也非空）。
+    for i, it in enumerate(items, _next_comment_id(run_dir)):
         it["comment_id"] = i
     path = resolve_path(run_dir, "work") / "commentlist.json"
     guard_write_path(path, run_dir)
@@ -371,8 +402,20 @@ def apply_comments(run_dir: Path, cfg: dict) -> dict:
     by_pid = {f"p-{i:06d}": p for i, p in enumerate(paras, 1)}
 
     # ---- 核心层：comments.xml ----
-    nsmap = {"w": W}
-    croot = etree.Element(ox.q("comments"), nsmap=nsmap)
+    # **必须在既有 comments.xml 上追加，不能另起一份。** 送审文档常常已经带着
+    # 别人的批注；整份覆盖会把它们连同作者、日期一起抹掉，而正文里旧的
+    # commentRangeStart/End 还在——旧锚点转而指向我们的新批注。
+    # 四项校验对此全绿：refs 与 declared 都含那个 id，覆盖范围也非空。
+    cpath = unpacked / CORE_PART
+    kept_existing = 0
+    if cpath.exists():
+        try:
+            croot = etree.parse(str(cpath)).getroot()
+            kept_existing = sum(1 for _ in croot.iter(ox.q("comment")))
+        except etree.XMLSyntaxError:
+            croot = etree.Element(ox.q("comments"), nsmap={"w": W})
+    else:
+        croot = etree.Element(ox.q("comments"), nsmap={"w": W})
     anchored, failed = 0, []
     written = []
     for it in items:
@@ -399,7 +442,6 @@ def apply_comments(run_dir: Path, cfg: dict) -> dict:
             anchored += 1
             written.append(it)
 
-    cpath = unpacked / CORE_PART
     guard_write_path(cpath, run_dir)
     etree.ElementTree(croot).write(str(cpath), xml_declaration=True, encoding="UTF-8",
                                    standalone=True)
@@ -411,30 +453,42 @@ def apply_comments(run_dir: Path, cfg: dict) -> dict:
         "application/vnd.openxmlformats-officedocument.wordprocessingml.comments+xml")
 
     # ---- 增强层：失败即降级，不得导致整体失败 ----
+    # 降级时**只能回到原样，不能删文件**：这些部件可能是文档自带的
+    # （别人批注时留下的已解决标记、回复线程），删掉等于替用户丢数据。
+    backup = {part: (unpacked / part).read_bytes() if (unpacked / part).exists() else None
+              for part in ENHANCED}
     enhanced, enh_error = "written", None
     try:
+        def _open_or_new(rel: str, tag: str, nsmap: dict):
+            p = unpacked / rel
+            if p.exists():
+                try:
+                    return p, etree.parse(str(p)).getroot()
+                except etree.XMLSyntaxError:
+                    pass
+            return p, etree.Element(tag, nsmap=nsmap)
+
         para_ids = {it["comment_id"]: f"{(uuid.uuid4().int >> 96):08X}" for it in written}
-        ext = etree.Element(f"{{{W15}}}commentsEx", nsmap={"w15": W15, "w": W})
+        p, ext = _open_or_new("word/commentsExtended.xml", f"{{{W15}}}commentsEx",
+                              {"w15": W15, "w": W})
         for it in written:
             e = etree.SubElement(ext, f"{{{W15}}}commentEx")
             e.set(f"{{{W15}}}paraId", para_ids[it["comment_id"]])
             e.set(f"{{{W15}}}done", "0")
-        p = unpacked / "word/commentsExtended.xml"
         guard_write_path(p, run_dir)
         etree.ElementTree(ext).write(str(p), xml_declaration=True, encoding="UTF-8", standalone=True)
 
-        ids = etree.Element(f"{{{W16CID}}}commentsIds", nsmap={"w16cid": W16CID, "w": W})
+        p, ids = _open_or_new("word/commentsIds.xml", f"{{{W16CID}}}commentsIds",
+                              {"w16cid": W16CID, "w": W})
         for it in written:
             e = etree.SubElement(ids, f"{{{W16CID}}}commentId")
             e.set(f"{{{W16CID}}}paraId", para_ids[it["comment_id"]])
             e.set(f"{{{W16CID}}}durableId", f"{(uuid.uuid4().int >> 96):08X}")
-        p = unpacked / "word/commentsIds.xml"
         guard_write_path(p, run_dir)
         etree.ElementTree(ids).write(str(p), xml_declaration=True, encoding="UTF-8", standalone=True)
 
-        cex = etree.Element(f"{{{W16CEX}}}commentsExtensible",
-                            nsmap={"w16cex": W16CEX, "w": W})
-        p = unpacked / "word/commentsExtensible.xml"
+        p, cex = _open_or_new("word/commentsExtensible.xml",
+                              f"{{{W16CEX}}}commentsExtensible", {"w16cex": W16CEX, "w": W})
         guard_write_path(p, run_dir)
         etree.ElementTree(cex).write(str(p), xml_declaration=True, encoding="UTF-8", standalone=True)
 
@@ -443,11 +497,15 @@ def apply_comments(run_dir: Path, cfg: dict) -> dict:
             _ensure_content_type(unpacked, part, ctype)
     except Exception as exc:  # noqa: BLE001 - 增强层随 Word 版本演进，失败必须可降级
         enhanced, enh_error = "degraded", str(exc)[:200]
-        for part in ENHANCED:
-            (unpacked / part).unlink(missing_ok=True)
+        for part, data in backup.items():
+            if data is None:
+                (unpacked / part).unlink(missing_ok=True)   # 本来就没有，删掉半成品
+            else:
+                (unpacked / part).write_bytes(data)         # 文档自带的，原样还回去
         warn(f"批注增强层写入失败，已降级为仅核心层（批注仍可见）：{enh_error}")
 
     return {"comments": len(items), "anchored": anchored, "failed": len(failed),
+            "existing_comments_kept": kept_existing,
             "enhanced_layer": enhanced, "enhanced_error": enh_error,
             "failures": failed[:10]}
 

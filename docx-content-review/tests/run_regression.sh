@@ -1410,5 +1410,127 @@ PYEOF
 check "错别字候选窗口自动撑到段内唯一" "$?" 0
 
 echo
+echo "══ 18. 送审文档已带批注：不得覆盖，不得撞号 ══"
+
+# 评审场景里文档常常已经有别人的批注。原实现另起一份 comments.xml 整份写入，
+# 把既有批注连人带话抹掉；编号又从 1 开始，与正文里既有的 commentRangeStart
+# 撞号，旧锚点转而指向新批注。**四项校验对此曾经全绿**。
+INIT8=$(python3 "$S/workspace.py" init --source "$F/existing-comments.docx" \
+        --output-dir "$DELIVER" --temp-dir "$WORK/t18")
+RUN8=$(echo "$INIT8" | jget "['run_dir']")
+python3 "$S/unpack.py" run --run-dir "$RUN8" >/dev/null
+python3 "$S/extract.py" --run-dir "$RUN8" >/dev/null
+check "unpack 存下了既有批注的现场快照" \
+      "$([ -f "$RUN8/work/comments.baseline.xml" ] && echo yes || echo no)" yes
+
+python3 - "$RUN8" <<'PYEOF'
+import json,pathlib,sys
+run=pathlib.Path(sys.argv[1])
+paras=[json.loads(l) for l in open(run/"work"/"paragraphs.jsonl",encoding="utf-8")]
+p=next(x for x in paras if len(x["text"]) > 12 and not x["is_heading"])
+(run/"work"/"issues-verified.jsonl").write_text(json.dumps({
+  "id":"I1","chunk_id":"0001","pid":p["pid"],"category":"B1","rule_id":"B1",
+  "severity":"Medium","original_text":p["text"][:16],"suggested_text":"",
+  "evidence":"指代不明","action":"comment","verify":{"result":"pass"}},
+  ensure_ascii=False)+"\n",encoding="utf-8")
+(run/"work"/"conflicts").mkdir(parents=True,exist_ok=True)
+PYEOF
+python3 "$S/apply_comments.py" plan --run-dir "$RUN8" >/dev/null
+AC=$(python3 "$S/apply_comments.py" apply --run-dir "$RUN8")
+check "既有批注被保留" "$(echo "$AC" | jget "['existing_comments_kept']")" 1
+
+python3 - "$RUN8" <<'PYEOF'
+import json,sys
+from lxml import etree
+W="{http://schemas.openxmlformats.org/wordprocessingml/2006/main}"
+run=sys.argv[1]
+c=etree.parse(f"{run}/work/unpacked/word/comments.xml").getroot()
+by={x.get(W+"id"):(x.get(W+"author"),"".join(t.text or "" for t in x.iter(W+"t")))
+    for x in c.iter(W+"comment")}
+assert "1" in by, "源文档原有的批注被整份覆盖掉了"
+assert by["1"]==("张三","这一段请业务方再确认一次。"), f"原有批注被改写：{by['1']}"
+assert len(by)==2, f"新批注没写进去或与既有批注合并了：{list(by)}"
+new=[k for k in by if k!="1"]
+assert new and int(new[0])>1, f"新批注编号与既有批注撞号：{new}"
+# 正文里每个 id 的 commentRangeStart 必须只有一个
+d=etree.parse(f"{run}/work/unpacked/word/document.xml").getroot()
+ids=[e.get(W+"id") for e in d.iter(W+"commentRangeStart")]
+assert len(ids)==len(set(ids)), f"commentRangeStart 撞号：{ids}"
+PYEOF
+check "原批注逐字保留、新批注另行编号、锚点不撞号" "$?" 0
+
+python3 "$S/validate_docx.py" --run-dir "$RUN8" >/dev/null 2>&1
+check "四项校验通过" "$?" 0
+
+# 负向对照：退回"另起一份 comments.xml"，第四项校验必须以退出码 8 抓住
+python3 - "$RUN8" <<'PYEOF'
+import sys
+from lxml import etree
+W="{http://schemas.openxmlformats.org/wordprocessingml/2006/main}"
+p=f"{sys.argv[1]}/work/unpacked/word/comments.xml"
+root=etree.parse(p).getroot()
+for c in list(root.iter(W+"comment")):
+    if c.get(W+"id")=="1":
+        root.remove(c)          # 模拟"整份覆盖"：既有批注消失
+etree.ElementTree(root).write(p,xml_declaration=True,encoding="UTF-8",standalone=True)
+PYEOF
+python3 "$S/validate_docx.py" --run-dir "$RUN8" >/dev/null 2>&1
+check "负向对照：既有批注消失时校验必须失败" "$?" 8
+
+echo
+echo "══ 19. 计数口径：报给用户的数字必须与文档里的一致 ══"
+
+# 截断的去重键只用 (pid, category) 会把同段同类的**不同**问题折叠成一条，
+# 回填时被当成"已选过"跳过——配额没用满，真问题却被丢掉。
+python3 - "$S" <<'PYEOF'
+import json,sys,tempfile,pathlib
+sys.path.insert(0, sys.argv[1])
+import verify_span as vs, workspace as ws
+run=pathlib.Path(tempfile.mkdtemp())
+(run/"work"/"chunks").mkdir(parents=True); (run/"work"/"issues").mkdir(parents=True)
+text="甲方认真的完成了验收。乙的接口尚未定。丙的规范尚未定。丁的口径尚未定。戊的边界尚未定。己的范围尚未定。"
+para={"pid":"p-000001","index":1,"heading_path":[],"level":0,"is_heading":False,"style":"Normal",
+      "style_name":"Normal","text":text,"char_len":len(text),"in_table":False,"table_id":None,
+      "row_idx":None,"cell_idx":None,"is_list":False,"is_code":False,"is_quote":False,
+      "page_hint":1,"page_estimated":True}
+(run/"work"/"paragraphs.jsonl").write_text(json.dumps(para,ensure_ascii=False)+"\n",encoding="utf-8")
+(run/"work"/"chunks"/"chunk-0001.txt").write_text(f"[{para['pid']}] {text}\n",encoding="utf-8")
+json.dump({"chunks":[{"chunk_id":"0001","pids":["p-000001"],"review_pids":["p-000001"],
+                      "context_pids":[]}]},
+          open(run/"work"/"chunks"/"index.json","w",encoding="utf-8"),ensure_ascii=False)
+rows=[{"pid":"p-000001","category":"A2","original_text":"认真的完成了验收",
+       "suggested_text":"认真地完成了验收","evidence":"e","severity":"High"}]
+rows+=[{"pid":"p-000001","category":"B1","original_text":o,"suggested_text":"",
+        "evidence":"e","severity":"Medium"}
+       for o in ["乙的接口尚未定","丙的规范尚未定","丁的口径尚未定","戊的边界尚未定","己的范围尚未定"]]
+raw=run/"work"/"issues"/"r.jsonl"
+raw.write_text("".join(json.dumps(r,ensure_ascii=False)+"\n" for r in rows),encoding="utf-8")
+out=run/"work"/"issues"/"o.jsonl"
+vs.process(run,"0001",raw,ws.load_config(None),out,3)
+kept=[json.loads(l) for l in open(out,encoding="utf-8")]
+assert len(kept)==3, f"cap=3 只保留了 {len(kept)} 条，配额没用满"
+assert len({(r['category'],r['original_text']) for r in kept})==3, "保留的条目重复了"
+PYEOF
+check "截断按 (pid,类别,原文) 去重，配额用得满" "$?" 0
+
+# 未准入交付物的冲突候选不得记成「批注」——Agent 正是照着这个数字口头汇报的
+python3 - "$S" "$RUN2" <<'PYEOF'
+import json,pathlib,shutil,sys
+sys.path.insert(0, sys.argv[1])
+import report as rp, workspace as ws
+run=pathlib.Path(sys.argv[2])
+cv=run/"work"/"conflicts-verified.jsonl"
+bak=cv.read_text(encoding="utf-8") if cv.exists() else None
+cv.write_text("", encoding="utf-8")            # Pass 4 全部未裁定 → 一条都不进文档
+rows=rp.load_rows(run, ws.load_config(None))
+held=[r for r in rows if r.get("kind")=="conflict" and r.get("admitted") is False]
+assert held, "构造失败：没有未准入的候选"
+bad=[r for r in held if r["action"]!="report_only"]
+if bak is not None: cv.write_text(bak, encoding="utf-8")
+assert not bad, f"{len(bad)} 条未写进文档的候选被记成了「{bad[0]['action']}」"
+PYEOF
+check "未准入的冲突候选记为 report_only（不虚报批注数）" "$?" 0
+
+echo
 printf '通过 \033[32m%d\033[0m，失败 \033[31m%d\033[0m\n' "$PASS" "$FAIL"
 [ "$FAIL" -eq 0 ]

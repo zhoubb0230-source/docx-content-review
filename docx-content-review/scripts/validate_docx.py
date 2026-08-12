@@ -69,6 +69,23 @@ def check_structure(unpacked: Path, xsd_dir: str | None) -> dict:
         dup = [k for k, v in ids.items() if v > 1]
         if dup:
             problems.append(f"修订 id 重复：{dup[:5]}")
+        # 批注 id 必须唯一。撞号的后果是旧锚点指向新批注，而"配对齐全"这类
+        # 检查完全看不出来——既有批注被顶掉时四项校验曾经全绿。
+        cids = Counter()
+        for el in root.iter(ox.q("commentRangeStart")):
+            v = el.get(ox.q("id"))
+            if v is not None:
+                cids[v] += 1
+        dupc = [k for k, v in cids.items() if v > 1]
+        if dupc:
+            problems.append(f"批注 id 重复：{dupc[:5]}（旧锚点会指向新批注）")
+        cx = unpacked / "word" / "comments.xml"
+        if cx.exists():
+            cdup = Counter(c.get(ox.q("id")) for c in etree.parse(str(cx)).getroot()
+                           .iter(ox.q("comment")))
+            dupd = [k for k, v in cdup.items() if v > 1]
+            if dupd:
+                problems.append(f"comments.xml 中批注 id 重复：{dupd[:5]}")
         # w:del 内必须是 w:delText，不能是 w:t
         for d in root.iter(ox.q("del")):
             if d.getparent() is not None and d.getparent().tag == ox.q("rPr"):
@@ -256,7 +273,32 @@ def check_comments(run_dir: Path, unpacked: Path) -> dict:
                         f"计划「{str(it.get('anchor'))[:20]}…」，"
                         f"实际只圈住「{shown[:20]}…」")
 
+    # 既有批注必须一条不少、一个字不变。送审文档常常已经带着别人的批注，
+    # 而本技能往同一份 comments.xml 里追加——整份覆盖会把它们连人带话抹掉。
+    # 判据取自**回写前的现场快照**（unpack 时存的 comments.baseline.xml），
+    # 不是回写时的自述：溯源只描述"当时做了什么"，证明不了"现在的文档是什么样"。
+    base = resolve_path(run_dir, "work") / "comments.baseline.xml"
+    kept = 0
+    if base.exists():
+        def _texts(path: Path) -> dict:
+            try:
+                r = etree.parse(str(path)).getroot()
+            except etree.XMLSyntaxError:
+                return {}
+            return {c.get(ox.q("id")): _norm("".join(t.text or "" for t in c.iter(ox.q("t"))))
+                    for c in r.iter(ox.q("comment"))}
+        was, now = _texts(base), (_texts(cpath) if cpath.exists() else {})
+        for cid, text in was.items():
+            if cid not in now:
+                problems.append(f"源文档原有的批注 {cid} 在回写后消失了")
+            elif now[cid] != text:
+                problems.append(f"源文档原有的批注 {cid} 的正文被改写了："
+                                f"原「{text[:20]}…」→ 现「{now[cid][:20]}…」")
+            else:
+                kept += 1
+
     return {"name": "批注锚定完整", "pass": not problems, "comments": len(declared),
+            "existing_comments_kept": kept,
             "empty_ranges": len(empty), "partial_ranges": partial,
             "problems": problems[:20]}
 

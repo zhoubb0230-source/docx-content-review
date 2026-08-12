@@ -18,10 +18,20 @@ import argparse
 import json
 from pathlib import Path
 
-from docx import Document
-from docx.enum.text import WD_BREAK
-from docx.shared import Pt
-from docx.oxml.ns import qn
+try:
+    from docx import Document
+    from docx.enum.text import WD_BREAK
+    from docx.shared import Pt
+    from docx.oxml.ns import qn
+except ImportError:  # pragma: no cover
+    # `build_existing_comments` 是在已有 .docx 上加部件，只用 lxml。
+    # 顶层硬导入会让它在没装 python-docx 的环境里也跑不起来。
+    Document = WD_BREAK = Pt = qn = None
+
+
+def _need_docx() -> None:
+    if Document is None:
+        raise SystemExit("生成该 fixture 需要 python-docx：pip install python-docx")
 
 
 def _run(p, text, *, font=None, size=None, bold=False, italic=False):
@@ -37,6 +47,7 @@ def _run(p, text, *, font=None, size=None, bold=False, italic=False):
 
 
 def _doc():
+    _need_docx()
     d = Document()
     st = d.styles["Normal"]
     st.font.name = "仿宋"
@@ -461,6 +472,76 @@ def build_typo_pattern(outdir: Path) -> None:
     }, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
 
 
+def build_existing_comments(outdir: Path) -> None:
+    """在 sample-basic 上挂一条「别人已经写好的批注」。
+
+    送审文档常常已经带着评审人的批注，而本技能要往同一份 comments.xml 里追加。
+    整份覆盖会把它们连人带话抹掉，且旧的 commentRangeStart 会转而指向新批注——
+    这个现场此前没有任何 fixture 覆盖，四项校验对它全绿。
+
+    **只用 lxml 构造**（在既有 .docx 上加部件），不需要 python-docx。
+    """
+    import zipfile
+    from lxml import etree
+
+    W = "http://schemas.openxmlformats.org/wordprocessingml/2006/main"
+    REL = "http://schemas.openxmlformats.org/package/2006/relationships"
+    CT = "http://schemas.openxmlformats.org/package/2006/content-types"
+
+    def q(t):
+        return f"{{{W}}}{t}"
+
+    src, dst = outdir / "sample-basic.docx", outdir / "existing-comments.docx"
+    if not src.exists():
+        raise SystemExit("请先生成 sample-basic.docx")
+    parts = {}
+    with zipfile.ZipFile(src) as z:
+        for n in z.namelist():
+            parts[n] = z.read(n)
+
+    doc = etree.fromstring(parts["word/document.xml"])
+    target = next(p for p in doc.iter(q("p"))
+                  if "".join(t.text or "" for t in p.iter(q("t"))).strip())
+    runs = [c for c in target if isinstance(c.tag, str) and c.tag == q("r")]
+    start = etree.Element(q("commentRangeStart")); start.set(q("id"), "1")
+    end = etree.Element(q("commentRangeEnd")); end.set(q("id"), "1")
+    refr = etree.Element(q("r"))
+    etree.SubElement(refr, q("commentReference")).set(q("id"), "1")
+    target.insert(list(target).index(runs[0]), start)
+    target.insert(list(target).index(runs[-1]) + 1, end)
+    target.insert(list(target).index(end) + 1, refr)
+    parts["word/document.xml"] = etree.tostring(doc, xml_declaration=True,
+                                                encoding="UTF-8", standalone=True)
+
+    croot = etree.Element(q("comments"), nsmap={"w": W})
+    cm = etree.SubElement(croot, q("comment"))
+    cm.set(q("id"), "1"); cm.set(q("author"), "张三")
+    cm.set(q("date"), "2026-01-01T00:00:00Z"); cm.set(q("initials"), "ZS")
+    t = etree.SubElement(etree.SubElement(etree.SubElement(cm, q("p")), q("r")), q("t"))
+    t.text = "这一段请业务方再确认一次。"
+    parts["word/comments.xml"] = etree.tostring(croot, xml_declaration=True,
+                                                encoding="UTF-8", standalone=True)
+
+    rels = etree.fromstring(parts["word/_rels/document.xml.rels"])
+    etree.SubElement(
+        rels, f"{{{REL}}}Relationship", Id="rId900", Target="comments.xml",
+        Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/comments")
+    parts["word/_rels/document.xml.rels"] = etree.tostring(
+        rels, xml_declaration=True, encoding="UTF-8", standalone=True)
+
+    ct = etree.fromstring(parts["[Content_Types].xml"])
+    etree.SubElement(ct, f"{{{CT}}}Override", PartName="/word/comments.xml",
+                     ContentType="application/vnd.openxmlformats-officedocument."
+                                 "wordprocessingml.comments+xml")
+    parts["[Content_Types].xml"] = etree.tostring(ct, xml_declaration=True,
+                                                  encoding="UTF-8", standalone=True)
+
+    names = sorted(parts, key=lambda n: (n != "[Content_Types].xml", n))
+    with zipfile.ZipFile(dst, "w", zipfile.ZIP_DEFLATED) as z:
+        for n in names:
+            z.writestr(n, parts[n])
+
+
 def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--outdir", default=str(Path(__file__).resolve().parent))
@@ -473,6 +554,7 @@ def main() -> None:
     build_planning(out)
     build_style(out)
     build_typo_pattern(out)
+    build_existing_comments(out)   # 只用 lxml，在 sample-basic 上加批注部件
     print("fixtures written to", out)
 
 
