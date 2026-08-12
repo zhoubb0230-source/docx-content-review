@@ -25,7 +25,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from _common import EX, die, emit, read_json, run_cli  # noqa: E402
+from _common import EX, die, emit, read_json, run_cli, sha256_file  # noqa: E402
 from workspace import guard_write_path, resolve_path  # noqa: E402
 
 SCHEMA = """
@@ -100,15 +100,29 @@ def flatten(chunk_id: str, data: dict) -> list[tuple]:
 
 
 def ingest(run_dir: Path, con: sqlite3.Connection, only: list[str] | None = None) -> dict:
+    """增量导入。**判据是 facts 文件的 sha256，不是"这个分片入过库没有"。**
+
+    分片失败重跑时 `facts-<chunk>.json` 会被整个改写。只按 chunk_id 判重的话，
+    库里留的是上一轮的旧事实——而 Pass 3 的全部 L 规则都建立在这份台账上，
+    结论会指向文档里已经不存在的内容。`ingested.sha` 这一列本来就是为此留的，
+    早先写的是空串、也从不比对，等于没有。
+    """
     fdir = resolve_path(run_dir, "facts")
-    done = {r[0] for r in con.execute("SELECT chunk_id FROM ingested")}
-    added, total = 0, 0
+    done = {r[0]: r[1] for r in con.execute("SELECT chunk_id, sha FROM ingested")}
+    added, refreshed, total = 0, 0, 0
     for path in sorted(fdir.glob("facts-*.json")):
         cid = path.stem.split("-", 1)[1]
         if only and cid not in only:
             continue
+        sha = sha256_file(path)
         if cid in done:
-            continue
+            if done[cid] == sha:
+                continue
+            # 内容变了：先清掉这一片的旧行，再重新导入（保持幂等）
+            con.execute("DELETE FROM facts WHERE chunk_id=?", (cid,))
+            refreshed += 1
+        else:
+            added += 1
         data = read_json(path)
         if not isinstance(data, dict):
             continue
@@ -117,11 +131,10 @@ def ingest(run_dir: Path, con: sqlite3.Connection, only: list[str] | None = None
             "INSERT INTO facts(kind,chunk_id,pid,subject,value,unit,qualifier,scope,meta) "
             "VALUES (?,?,?,?,?,?,?,?,?)", rows)
         con.execute("INSERT OR REPLACE INTO ingested(chunk_id,rows,sha) VALUES (?,?,?)",
-                    (cid, len(rows), ""))
-        added += 1
+                    (cid, len(rows), sha))
         total += len(rows)
     con.commit()
-    return {"chunks_ingested": added, "rows_added": total}
+    return {"chunks_ingested": added, "chunks_refreshed": refreshed, "rows_added": total}
 
 
 def stats(con: sqlite3.Connection) -> dict:

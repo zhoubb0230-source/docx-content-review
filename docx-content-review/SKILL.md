@@ -219,6 +219,9 @@ filter_neverflag.py --run-dir <run> --chunk <id> --file work/issues/issues-<id>.
 **`--in` 与 `--out` 必须同时给且指向支线自己的文件**——不给 `--out` 会覆盖主通道的
 `issues-<id>.jsonl`。路径用 `workspace.py resolve --kind issues|typos|patterns` 取。
 
+两条支线的调用各自计量（`metrics.py bump --pass typo` / `--pass pattern`），
+不要并进 `pass1_review`——它们每片各多一次调用，压测时要能单独算出耗时占比。
+
 用户要求"重点查错别字"时，把 `typo_check.max_typos_per_chunk` 调高即可；
 **不要去放宽闸门②的 A1 阈值**——召回靠词表，不靠放松校验。
 

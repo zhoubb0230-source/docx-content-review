@@ -31,6 +31,20 @@ jget() { python3 -c "import json,sys;d=json.load(sys.stdin);print(eval('d'+sys.a
 cleanup(){ [ "$KEEP" = 1 ] && echo "工作目录保留于 $WORK" || rm -rf "$WORK"; }
 trap cleanup EXIT
 
+# 依赖预检。缺 lxml 时不预检的后果是几十个失败 + 满屏 traceback，
+# 而真正的原因只有一句话。退出码 3 = 环境缺失，与脚本自己的约定一致。
+MISSING=$(python3 - <<'PY'
+import importlib.util
+print(" ".join(m for m, pkg in (("lxml","lxml"),("yaml","pyyaml"),("openpyxl","openpyxl"))
+                if not importlib.util.find_spec(m)))
+PY
+)
+if [ -n "$MISSING" ]; then
+  printf '\033[31m[终止]\033[0m 缺少运行期依赖：%s\n' "$MISSING" >&2
+  echo "请先执行：pip install lxml openpyxl pyyaml" >&2
+  exit 3
+fi
+
 DELIVER="$WORK/deliver"; TEMP="$WORK/temp"
 mkdir -p "$DELIVER" "$TEMP"
 init_run() {   # $1=fixture 名，回显 run_dir
@@ -164,6 +178,33 @@ a=json.load(open(sys.argv[1]))["by_rule"]; b=json.load(open(sys.argv[2]))["by_ru
 sys.exit(0 if a==b else 1)
 PY
 check "删除 ledger.db 后重建结果一致" "$?" 0
+
+# 分片重跑后 facts 文件被改写，build 必须按 sha 重新入库——
+# 只按 chunk_id 判重的话，库里留的是上一轮的旧事实，而 Pass 3 全部建立在它之上
+python3 - "$RUN2" <<'PY'
+import json,sys,pathlib
+f=pathlib.Path(sys.argv[1],"work","facts","facts-0001.json")
+d=json.load(open(f,encoding="utf-8"))
+d.setdefault("metrics",[]).append({"pid":"p-000001","subject":"重跑后新增指标",
+                                   "value":"999","unit":"ms","kind":"目标"})
+f.write_text(json.dumps(d,ensure_ascii=False),encoding="utf-8")
+PY
+LB=$(python3 "$S/ledger.py" build --run-dir "$RUN2")
+check "facts 变更后 build 重新入库（不是按 chunk_id 判重）" \
+      "$(echo "$LB" | jget "['chunks_refreshed']")" 1
+python3 - "$RUN2" <<'PY'
+import sqlite3,sys
+con=sqlite3.connect(f"{sys.argv[1]}/work/ledger.db")
+n=con.execute("SELECT COUNT(*) FROM facts WHERE subject='重跑后新增指标'").fetchone()[0]
+d=con.execute("SELECT COUNT(*) FROM facts WHERE chunk_id='0001'").fetchone()[0]
+old=con.execute("SELECT rows FROM ingested WHERE chunk_id='0001'").fetchone()[0]
+sys.exit(0 if n==1 and d==old else 1)   # 新事实入库；旧行清干净，没有重复
+PY
+check "重新入库不产生重复行（先删旧行再导入，幂等）" "$?" 0
+LB2=$(python3 "$S/ledger.py" build --run-dir "$RUN2")
+check "内容未变时不重复入库" "$(echo "$LB2" | jget "['chunks_refreshed']")" 0
+python3 "$S/ledger.py" rebuild --run-dir "$RUN2" >/dev/null
+python3 "$S/detect_conflicts.py" --run-dir "$RUN2" --force --config "$WORK/term-on.yaml" >/dev/null
 
 # 参考台账不得凭空造事实。它是回归里「理想的 Pass 1 产出」，一旦掺进文档里
 # 根本没写的记录，被验证的就不是规则而是那条杜撰——L23 曾经就是这样"通过"的：

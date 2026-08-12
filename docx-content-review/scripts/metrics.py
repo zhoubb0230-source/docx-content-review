@@ -166,8 +166,10 @@ def main(argv: list[str]) -> int:
     p = sub.add_parser("bump")
     p.add_argument("--run-dir", required=True)
     p.add_argument("--pass", dest="pass_name", required=True,
+                   # 两条支线各有自己的计数：它们每片各多一次调用，
+                   # 压测时要能单独算出耗时占比，混进主审查就看不出来了
                    choices=["pass0", "pass1_review", "pass1_extract", "pass2_verify",
-                            "pass4", "typo"])
+                            "pass4", "typo", "pattern"])
     p.add_argument("--input-tokens", type=int, default=0)
     p.add_argument("--output-tokens", type=int, default=0)
     p.add_argument("--retry", choices=["json_parse", "chunk_failed", "chunk_skipped"])

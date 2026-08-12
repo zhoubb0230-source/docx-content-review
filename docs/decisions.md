@@ -838,3 +838,32 @@ L 规则表、目录结构、配置项）不在此重复。
   两个分支都 `return None` 的死代码）、`apply_revisions.py`、`apply_comments.py`、
   `detect_conflicts.py`（L25/L26）、`typo_scan.py`、`references/ooxml.md` §2.1、
   `tests/run_regression.sh`（125 → 134）。
+
+## ADR-037　三处小口子：台账按内容判重、支线单独计量、回归依赖预检
+
+- **日期**：2026-08-12
+- ADR-034 通读时记下的三条，单独拿出来一次清掉。共同点是**留了字段/参数但没接上**。
+
+### 一、`ledger.ingested.sha` 写空串且从不比对
+
+`build` 只按 `chunk_id` 判重。分片失败重跑时 `facts-<chunk>.json` 会被整个改写，
+但库里留的是**上一轮的旧事实**——而 Pass 3 的全部 L 规则都建立在这份台账上，
+结论会指向文档里已经不存在的内容。`sha` 这一列本来就是为此留的。
+
+改为按文件 sha256 判重；内容变了就先 `DELETE FROM facts WHERE chunk_id=?`
+再重新导入，保持幂等。回归加三条（内容变则重新入库 / 不产生重复行 / 未变则不重复入库），
+并验证过回退后前两条会失败。
+
+### 二、`metrics.py bump --pass` 的枚举里没有支线
+
+错别字有 `typo`，范式**一个都没有**，SKILL.md 第 4.5 步也没让 Agent 对支线计量。
+两条支线每片各多一次调用，混进 `pass1_review` 就算不出耗时占比——
+而 M7 压测的产出之一正是这个。加 `pattern`，SKILL.md 补一句。
+
+### 三、回归缺依赖预检
+
+缺 `lxml` 时脚本照跑，结果是 60 个失败 + 满屏 traceback，而真正的原因只有一句话
+（本轮开场就踩了一次）。开头加一句预检，退出码 3 = 环境缺失，与脚本自己的约定一致。
+
+- **影响**：`scripts/ledger.py`、`scripts/metrics.py`、`SKILL.md` 第 4.5 步、
+  `tests/run_regression.sh`（134 → 137）。

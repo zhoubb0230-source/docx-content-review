@@ -14,7 +14,7 @@
 技能包结构完整、可运行：`SKILL.md` + 7 份 references + 7 份 prompt 模板
 + 24 个脚本 + 配置与词典/规则包资源 + 6 份 fixture。
 
-`tests/run_regression.sh`：**134 项检查全部通过**，约 60 秒，不调用任何 LLM。
+`tests/run_regression.sh`：**137 项检查全部通过**，约 60 秒，不调用任何 LLM。
 
 ### 2026-08-12 全量通读发现四条断链（ADR-034）
 
@@ -361,9 +361,5 @@ N7 的 fallback 判据原本是「跨度里出现该术语就压制」——用�
   生成 2–8 gram（`O(字数×7)`），紧接着是 `for 段落 × for 候选词` 的子串匹配。
   3000 页开 `term_rules` 时这一步会先炸。同类的还有 `detect_conflicts` 的
   `r_L31`（commitment × 全部段落）与 `r_L25/L26`（条目 × 写法 × 段落）。
-- **`ledger.ingested.sha` 写空串且从不比对**，分片重跑后 `build` 不会重新入库
-  （只有 `rebuild` 能修）。字段留着说明本来就打算做。
-- **`metrics.py bump --pass` 的枚举没有 `pass1_pattern`**，范式通道的调用量无法计量；
-  SKILL.md 第 4.5 步也没让 Agent 对两条支线 bump。
-- **回归脚本缺依赖预检**：缺 lxml 时不 fail-fast，直接跑出满屏 traceback + 几十个失败。
-  开头加一句预检（退出码 3，与项目自己的约定一致）能省很多排障时间。
+- ~~`ledger.ingested.sha` 空转 / `metrics bump` 缺支线枚举 / 回归缺依赖预检~~
+  → **均已修，见 ADR-037**。
