@@ -63,6 +63,7 @@ patterns:
 
     severity: Medium            # Critical/High/Medium/Low，实际会被 severity_cap 压到 Medium
     action: comment             # comment | report_only。**没有 revision 这个选项**
+                                # 闸门②会原样保留 report_only，不会把它升回 comment
 
     examples:
       positive:
@@ -125,6 +126,14 @@ patterns:
   "风险表述分散在连续三段里"这种情况会被判成缺要件——
   规则该用 `min_chars` 或更严的 `paragraph_regex` 把这类段落排除在外。
 - **`scan` 只看 `review_pids`**，与主审查通道的可审查范围一致。
+- **P 类的跨度就是整段**，因此它的长度上限走 `pattern_review.max_span_chars`
+  （默认 `0` = 不限），不受 `verification.max_span_chars`（默认 120）约束。
+  两者的判据不同：后者是"跨度太长说明模型在圈整段"，对 P 类不成立——
+  它本来问的就是"这一段该有的要件齐不齐"。共用一个上限会把真实文档里
+  超过 120 字的风险条目、接口描述整组丢掉，且丢弃在报告里不露面。
+- **P 类不进闸门④，但会原样留在 `issues-verified.jsonl` 里。**
+  "不复核"不等于"淘汰"：它的裁定本就是封闭题，Pass 2 没有规则包再问一遍
+  只会得到信息更少的答案，所以直接标 `not_reviewed` 通过。
 
 ---
 

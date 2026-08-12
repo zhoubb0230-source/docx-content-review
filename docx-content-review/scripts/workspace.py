@@ -758,6 +758,9 @@ def cmd_init(args) -> int:
               "runid": run_dir.name, "source_sha256": sha,
               "stage": resume_candidate["stage"], "stats": resume_candidate.get("stats", {}),
               "local_fs": is_local_fs(base), "deliver_dir": str(deliver_root),
+              "lease": lease_status(doc_dir),
+              "next": "workspace.py lease acquire --doc-dir <doc_dir> --session <sid> "
+                      f"--runid {run_dir.name} --stage pass-1",
               "deliverables": deliver_all(run_dir)})
         return EX.OK
 
@@ -814,6 +817,13 @@ def cmd_init(args) -> int:
         "needs_conversion": ext == ".doc", "new_doc_dir": is_new_doc,
         "local_fs": is_local_fs(base), "fs_type": fs_type(base),
         "temp_root": str(temp_root), "deliver_dir": str(deliver_root),
+        # 租约不在 init 里自动获取：并发时要先把现状呈现给用户再由他选
+        # （加入协作 / 接管 / 独立重跑）。但**必须获取**——Pass 3/4 与回写的
+        # 全部脚本都会 lease_verify，没有 owner.json 时一律 exit 9，
+        # 而那条错误信息说的是"已被另一个会话接管"，与实情完全相反。
+        "lease": lease_status(doc_dir),
+        "next": "workspace.py lease acquire --doc-dir <doc_dir> --session <sid> "
+                f"--runid {runid} --stage pass-1",
         "deliverables": deliver_all(run_dir), "artifacts": artifact_all(run_dir),
     })
     return EX.OK

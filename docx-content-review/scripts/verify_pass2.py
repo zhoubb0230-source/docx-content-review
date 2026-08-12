@@ -38,18 +38,39 @@ from _common import (  # noqa: E402
 from workspace import guard_write_path, load_config, resolve_path  # noqa: E402
 
 ARRANGEMENTS = ("primary", "mirror")
+AB_CLASSES = {"A1", "A2", "A3", "A4", "A5", "A6", "A7", "A8", "L25", "L26"}
+SINGLE_CLASSES = {"B1", "B2", "B3", "B4", "B5"}
+C_CLASSES = {"C1", "C2"}
+P_CLASSES = {"P1"}
+SINGLE_ASPECT = {"B1": "指代", "B2": "歧义", "B3": "结构", "B4": "施受关系", "B5": "逻辑关系"}
+
 # 复核范围：A 类走 A/B 对照，B 类走封闭单问。
 #   C 类不复核——它不生成修订也不生成批注，复核没有意义（taxonomy.md）。
 #   P 类不复核——它的裁定本来就是封闭题，且当时**规则包的正反例在上下文里**；
 #     Pass 2 没有规则包，再问一遍只会得到信息更少的答案。
-AB_CLASSES = {"A1", "A2", "A3", "A4", "A5", "A6", "A7", "A8", "L25", "L26"}
-SINGLE_CLASSES = {"B1", "B2", "B3", "B4", "B5"}
-SINGLE_ASPECT = {"B1": "指代", "B2": "歧义", "B3": "结构", "B4": "施受关系", "B5": "逻辑关系"}
-STRICTNESS_SCOPE = {
+REVIEW_SCOPE = {
     "conservative": AB_CLASSES,
     "balanced": AB_CLASSES | SINGLE_CLASSES,
     "thorough": AB_CLASSES | SINGLE_CLASSES,
 }
+# 保留范围 ≠ 复核范围。**这两件事早先共用了一张表，于是"不复核"被实现成了"丢弃"**：
+# `issues-verified.jsonl` 是下游（report / apply_comments / apply_revisions / metrics）
+# 的唯一入口，被 collect 滤掉的类别在报告里也一并消失。实测后果：
+#   - P 类（范式支线）过完两道闸门后整组蒸发，需求 5 的产出到不了任何交付物；
+#   - thorough 与 balanced 完全等价，C 类连报告都进不去，
+#     而 taxonomy.md 与 pass2-verify.md 都写明它"只进报告"。
+# 与 ADR-029 是同一类错误：凡是"必须通过 X 才能进交付物"的规则，
+# 都该写成一个准入函数，而不是从集合里悄悄少掉几类。
+# P 类恒在保留范围内——它由 pattern_review.enabled 控制，与 strictness 无关。
+KEEP_SCOPE = {
+    "conservative": AB_CLASSES | P_CLASSES,
+    "balanced": AB_CLASSES | SINGLE_CLASSES | P_CLASSES,
+    "thorough": AB_CLASSES | SINGLE_CLASSES | C_CLASSES | P_CLASSES,
+}
+
+
+def _scope(cfg: dict, table: dict) -> set:
+    return table.get(str(cfg.get("strictness") or "balanced"), table["balanced"])
 
 
 def item_id(rec: dict) -> str:
@@ -60,9 +81,13 @@ def item_id(rec: dict) -> str:
 
 
 def collect(run_dir: Path, cfg: dict) -> list[dict]:
-    """主通道 + 两条支线的过闸产物。顺序按文件名，保证可复现。"""
+    """主通道 + 两条支线的过闸产物。顺序按文件名，保证可复现。
+
+    这里用的是**保留范围**（KEEP_SCOPE），不是复核范围：不进闸门④的类别
+    （C、P）照样要留下，只是在 merge 里标成 not_reviewed。
+    """
     idir = resolve_path(run_dir, "issues")
-    scope = STRICTNESS_SCOPE.get(str(cfg.get("strictness") or "balanced"), AB_CLASSES)
+    scope = _scope(cfg, KEEP_SCOPE)
     out, seen = [], set()
     for path in sorted(idir.glob("issues-*.jsonl")):
         if path.name.endswith(".raw.jsonl"):
@@ -126,9 +151,12 @@ def build(run_dir: Path, cfg: dict, arrangement: str) -> dict:
            if r["category"] in AB_CLASSES and (r.get("suggested_text") or "").strip()},
         key=len, reverse=True)
 
+    review = _scope(cfg, REVIEW_SCOPE)
     items, key = [], {}
     for rec in rows:
         cat, sugg = rec["category"], (rec.get("suggested_text") or "").strip()
+        if cat not in review:
+            continue          # C 类与 P 类不进复核集；它们仍在 collect 的保留范围内
         ctx = context_of(rec, paras, idx, masks)
         if cat in AB_CLASSES and sugg:
             # 位置逐条派生：同一 run 重跑得到同一排列；mirror 恒为其镜像
@@ -211,7 +239,8 @@ def merge(run_dir: Path, cfg: dict, arrangement: str) -> dict:
     for rec in collect(run_dir, cfg):
         k = key.get(rec["id"])
         if not k:
-            # 未进入复核集（A 类建议已被闸门②清空、或类别不在 strictness 范围内）
+            # 未进入复核集：A 类建议已被闸门②清空，或类别本就不复核（C 类、P 类）。
+            # **不复核不等于淘汰**——按原动作原样保留，由各自的 action 决定去向。
             rec["verify"] = {"result": "pass", "method": "not_reviewed",
                              "note": "未进入复核集，按原动作保留"}
             counters["not_reviewed"] += 1

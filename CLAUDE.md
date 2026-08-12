@@ -46,6 +46,7 @@
 | **新增/修改一个 A/B/C 类别** | `scripts/verify_span.py` 的 `edit_gate` | `references/taxonomy.md` + `prompts/pass1-review.md` + `tests/fixtures` |
 | **新增一条不改清单规则** | `scripts/filter_neverflag.py` 的 `check` | `references/never-flag.md` + 负样本 fixture |
 | 闸门④盲测 A/B（拼装、判定表、一致率） | `scripts/verify_pass2.py` | `prompts/pass2-verify.md`；**改动必须重跑泄题检查** |
+| **某个类别进不进交付物** | `verify_pass2.py` 的 `KEEP_SCOPE`（**不是** `REVIEW_SCOPE`） | `prompts/pass2-verify.md` 触发范围表 |
 | **新增一条 L 规则** | `scripts/detect_conflicts.py`（加 `RULES` 项 + `r_LNN` 函数） | `references/logic-rules.md` + `logic-injection.facts.json` + 回归断言 |
 | 事实台账字段 | `scripts/ledger.py` 的 `MAPPING` | `references/schemas.md` + `prompts/pass1-extract.md` |
 | 术语表格式、合并规则 | `scripts/import_glossary.py` | `references/schemas.md` |
@@ -131,6 +132,16 @@ python3 docx-content-review/scripts/scan_patterns.py lint --patterns <你的包>
 ```
 
 `corpus/` 放大型真实语料（不入 git）。小 fixture 跑快速回归，大语料只在里程碑跑。
+
+### 单元测试全绿不等于主流程能跑
+
+ADR-034 里四条断链有两条是这样漏掉的：范式支线的回归测到
+`issues-0001.patterns.jsonl` 为止就停了，从没跨过 `verify_pass2`；租约的单元行为
+（令牌栅栏、回写阶段禁止接管）测过，但没有一项测试是**照着 `SKILL.md` 的主流程
+从头跑一遍**。结果是两条通道各自都对，串起来第一步就断。
+
+加一条通道、加一个流程步骤时，除了给它自己的单元断言，还要问一句：
+**它的产物最终流进了哪个文件，那个文件有没有被断言过？**
 
 ### 加校验时必须同时加负向对照
 

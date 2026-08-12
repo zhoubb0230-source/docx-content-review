@@ -92,6 +92,22 @@ workspace.py init --source <文档路径> [--output-dir <交付目录>] [--temp-
 
 若返回中 `lease.held` 为 true，说明另一个会话正在处理同一文档 → 见下方「并发」。
 
+**拿到 run 之后立刻取独占租约**（`lease.held` 为 false 时直接取；为 true 时先按「并发」一节问过用户）：
+
+```
+workspace.py lease acquire --doc-dir <doc_dir> --session <sid> --runid <runid> --stage pass-1
+```
+
+`<sid>` 由你自取，本次运行内保持不变；返回的 `owner.generation` 就是后续所有
+`--generation <n>` 要填的值，一并记下。
+
+**这一步不能省。** Pass 3、Pass 4 与回写阶段的脚本都会校验租约，没有租约时一律以
+退出码 9 终止，而那条错误信息说的是「已被另一个会话接管」——与实情正好相反，
+会让你把一次正常运行误报成并发冲突。
+
+收尾（`state.py stage --value completed` 之后）用 `workspace.py lease release
+--doc-dir <doc_dir> --session <sid> --generation <n>` 释放。
+
 记下返回的 `run_dir`，后续所有脚本都用它。**不要自己拼接任何输出路径**——需要路径时用 `workspace.py resolve --run-dir <run> --kind <kind>`。
 
 ### 第 1 步：Pass -1　归一化
@@ -354,7 +370,12 @@ workspace.py clean-temp --run-dir <run>
 规则号只作为末尾的可追溯标记。**转述给用户时也用中文说法，不要念规则号**——
 评审人看到「L06」不知道是什么。
 
-**遇到 exit 9（NOT_OWNER）** —— 不重试、不降级。转达为人话：本会话写入权限已失效，该文档已被另一个会话接管；已完成的分片结果仍然有效并已保留；建议切换到另一个会话查看进度，或选择「独立重跑」。
+**遇到 exit 9（NOT_OWNER）** —— 先确认第 0 步的 `lease acquire` 到底跑过没有：
+**没取租约与被别人接管，报的是同一个退出码和同一句话**。用
+`workspace.py lease status --doc-dir <doc_dir>` 看一眼——`held: false` 就是自己没取，
+补取即可，不要转达给用户。
+
+确实被接管时（`held: true` 且 owner 不是本会话）不重试、不降级。转达为人话：本会话写入权限已失效，该文档已被另一个会话接管；已完成的分片结果仍然有效并已保留；建议切换到另一个会话查看进度，或选择「独立重跑」。
 
 ---
 

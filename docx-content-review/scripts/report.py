@@ -244,7 +244,10 @@ def render_markdown(run_dir: Path, rows: list[dict], cfg: dict) -> str:
         by_rule[r["rule_id"]].append(r)
     for rule in sorted(by_rule):
         rs = by_rule[rule]
-        kind = "语病/语义" if rule[0] in "ABC" else "逻辑一致性"
+        # P 类的 rule_id 是规则包给的开放标识（P-RISK-01），按首字母判会落到"逻辑一致性"
+        cat = (rs[0].get("category") or rule)[0]
+        kind = {"A": "语病/语义", "B": "语病/语义", "C": "语病/语义",
+                "P": "描述范式"}.get(cat, "逻辑一致性")
         act = Counter(x["action"] for x in rs).most_common(1)[0][0]
         w(f"| {kind} | {rule_label(rule)} | {rule} | {len(rs)} | {act} |")
     w()

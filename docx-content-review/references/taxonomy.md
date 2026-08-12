@@ -99,7 +99,9 @@ B 类即使给了建议也会被脚本清空——不存在唯一正确答案的
 ### C1 表达冗长
 ### C2 段落过长（≥600 字未分段）
 
-C 类不做二次复核，也不生成修订或批注。若 strictness 不是 `thorough`，**根本不要产出 C 类**。
+C 类不做二次复核，也不生成修订或批注——闸门②把它的动作固定为 `report_only`，
+所以它只出现在报告与 `issues.xlsx` 里。**不复核不等于丢弃**：`thorough` 下它照常
+留在 `issues-verified.jsonl` 中。若 strictness 不是 `thorough`，**根本不要产出 C 类**。
 
 ---
 

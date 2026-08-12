@@ -175,6 +175,13 @@ def process(run_dir: Path, chunk_id: str, raw_path: Path, cfg: dict,
     v = cfg.get("verification") or {}
     min_len = int(v.get("min_span_chars") or 4)
     max_len = int(v.get("max_span_chars") or 120)
+    # P 类的跨度上限必须与 A/B 类分开。
+    # `max_span_chars` 的判据是"跨度太长说明模型在圈整段"——那是针对"这句话哪里写错了"
+    # 的类别。P 类问的是"这一类段落该有的要件齐不齐"，它的 original_text **按设计就是
+    # 整段**（scan_patterns.merge）。两种语义共用一个上限的后果是确定的：
+    # 真实文档里的风险条目、接口描述普遍超过 120 字，实测 155 字即被 length_drop 丢弃，
+    # 且这个丢弃在报告里不露面。0 = 不限。
+    p_max = int((cfg.get("pattern_review") or {}).get("max_span_chars") or 0)
     cap = int(cap_override or (cfg.get("chunking") or {}).get("max_issues_per_chunk") or 20)
 
     counters = {"raw": 0, "bad_schema": 0, "unknown_category": 0, "context_pid": 0,
@@ -208,8 +215,9 @@ def process(run_dir: Path, chunk_id: str, raw_path: Path, cfg: dict,
             counters["hallucination_drop"] += 1   # pid 与原文对不上，同样按幻觉处理
             continue
 
-        # ③ 长度校验
-        if not (min_len <= len(orig) <= max_len):
+        # ③ 长度校验（上限按类别取，见上面 p_max 的说明）
+        upper = (p_max or 10 ** 9) if cat in P_CLASSES else max_len
+        if not (min_len <= len(orig) <= upper):
             counters["length_drop"] += 1
             continue
 
@@ -242,6 +250,16 @@ def process(run_dir: Path, chunk_id: str, raw_path: Path, cfg: dict,
         extra = {"pattern_name": (rec.get("pattern_name") or "").strip()} \
             if cat in P_CLASSES else {}
 
+        # 动作：默认由有无建议决定，但两种情形闸门不得擅自升级——
+        #   ① 上游明确声明了 report_only（范式规则包的 action、或只缺可选要件时的降级）。
+        #      早先这里无条件重算，把 report_only 覆盖成 comment，
+        #      于是 scan_patterns 的"只缺可选要件不打扰评审人"与规则包里的
+        #      `action: report_only` 全都失效。
+        #   ② C 类：taxonomy.md 写死"不生成修订也不生成批注"，只进报告。
+        action = "revision" if sugg else "comment"
+        if (rec.get("action") or "").strip() == "report_only" or cat in C_CLASSES:
+            action, sugg = "report_only", ""
+
         kept.append({
             "chunk_id": chunk_id,
             "pid": pid,
@@ -258,7 +276,7 @@ def process(run_dir: Path, chunk_id: str, raw_path: Path, cfg: dict,
             "is_code": bool((para or {}).get("is_code")),
             "gate_note": gate_note,
             "gates": {"exact": True, "edit": "pass" if sugg else "degraded_or_na"},
-            "action": "revision" if sugg else "comment",
+            "action": action,
         })
 
     # 闸门③ 必须在单片上限之前执行：否则不改清单里的噪音会先占满 20 条配额，

@@ -51,6 +51,10 @@ pattern_review:                 # P 类：特定场景的描述范式审查
   packs: []                     # 额外规则包路径；--patterns 可追加，同 id 后者覆盖前者
   max_pattern_issues_per_chunk: 20  # 独立配额，不占用 max_issues_per_chunk
   batch_size: 20
+  # P 类的跨度上限，独立于 verification.max_span_chars（0 = 不限）。
+  # 后者的判据是「跨度太长说明模型在圈整段」，而 P 类的 original_text 按设计就是整段——
+  # 共用一个上限会把真实文档里超过 120 字的风险条目、接口描述整组丢掉。
+  max_span_chars: 0
   severity_cap: Medium          # 依赖场景定位准确性，与 L29–L32 同理，不配 High
   unsure_as_present: true       # 「不确定」按要件齐备处理（不确定即无问题）
 

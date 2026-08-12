@@ -655,3 +655,88 @@ L 规则表、目录结构、配置项）不在此重复。
 - **影响**：`assets/config.default.yaml`、`scripts/detect_conflicts.py`、
   `glossary_scan.py`、`report.py`、`SKILL.md`、`references/logic-rules.md`、
   `tests/run_regression.sh`（108 → 110 项）。
+
+## ADR-034　保留范围与复核范围必须是两张表；跨度上限与动作按类别分离
+
+- **日期**：2026-08-12
+- **背景**：一次从设计到实现的通读。四条缺陷互相独立，但都指向同一个形状——
+  **某个为 A/B 类定的判据被无差别地套到了所有通道上**。
+
+### 一、闸门④ 的 strictness 表同时被当成了"要不要留下"
+
+- **发现**：`verify_pass2.collect()` 按 `STRICTNESS_SCOPE` 过滤，而 `merge()`
+  **只写 `collect()` 的结果**到 `issues-verified.jsonl`——那是 report / apply_comments /
+  apply_revisions / metrics 四处的**唯一入口**。该表三档都不含 `P1` / `C1` / `C2`。
+- **后果实测**（输入 A2 + C1 + P1，三档输出均为 `['A2']`）：
+  ① **P 类整条通道是断的**。范式支线过完两道闸门、产物写进 `issues-0001.patterns.jsonl`
+     之后原地蒸发，需求 5 在交付物和报告里都看不见。报告 §6 还会显示
+     「适用段落 N / 要件缺失 0」——读起来像"查过了，没问题"。
+  ② **`thorough` 与 `balanced` 完全等价**，C 类连报告都进不去，
+     而 `taxonomy.md` 与 `pass2-verify.md` 都写明它"只进报告"。
+- **为什么回归没发现**：`run_regression.sh` 第 9 节到
+  `issues-0001.patterns.jsonl` 为止就停了，从没跨过 `verify_pass2`。
+  110 项里没有一项走完"支线 → 闸门④ → 交付物"这条整链。
+- **决策**：拆成 `REVIEW_SCOPE`（进不进闸门④）与 `KEEP_SCOPE`（留不留在漏斗里）
+  两张表。`collect()` 用后者，`build()` 用前者；不复核的类别走
+  `merge()` 里既有的 `not_reviewed → result: pass` 通路（那条通路本来就在，
+  只是永远走不到）。P 类恒在保留范围内——它由 `pattern_review.enabled` 控制，
+  与 strictness 无关。
+- **与 ADR-029 同源**：那条是"准入策略写成三个排除条件，于是有一处默认放行"；
+  这条是"保留策略借用了复核范围的表，于是有两类默认丢弃"。
+  **凡是决定"什么能进交付物"的集合，都必须是一个显式的、单独命名的东西。**
+
+### 二、`max_span_chars` 是给 A/B 类定的，却作用于 P 类
+
+- `verification.max_span_chars: 120` 的判据是「跨度太长说明模型在圈整段」。
+  但 P 类的 `original_text` **按设计就是整段**（`scan_patterns.merge`）——
+  它问的是"这一类段落该有的要件齐不齐"，不是"这句话哪里写错了"。
+- **实测**：155 字的风险段落 → `length_drop: 1`。真实可研/方案里的风险条目、
+  接口描述普遍超过 120 字，就算修好第一条，P 类也留不下几条。
+  且这个丢弃只落在 `metrics.json` 里，报告中不露面（违反 ADR-029「不得静默隐藏」）。
+- **决策**：新增 `pattern_review.max_span_chars`（默认 `0` = 不限），P 类走它。
+  **不动 `verification.max_span_chars`**——放宽它会让 A/B 类失去"在圈整段"这个判据。
+- **这是 ADR-022 没走完的另一半**：那条把侧通道的**输出文件与配额**分开了，
+  **阈值没分开**。配额、输出、阈值三者是一套东西。
+
+### 三、闸门②无条件重算 action，把上游的 report_only 升成了 comment
+
+- `verify_span` 原先写死 `"action": "revision" if sugg else "comment"`，覆盖入参。
+- 后果：`scan_patterns.merge` 的「只缺可选要件 → 降为只进报告，不打扰评审人」
+  失效；规则包里写 `action: report_only` 同样失效——`references/patterns.md`
+  把它列为合法取值，实际是空头支票。
+- **决策**：上游显式声明 `report_only` 时原样保留；C 类无条件置为 `report_only`
+  （`taxonomy.md` 写死"不生成修订也不生成批注"，此前它靠"下游读不到"来实现，
+  第一条修好后就会真的写进文档）。
+
+### 四、主流程从来没有取过租约
+
+- `SKILL.md` 全文没有一处 `workspace.py lease acquire`，但第 6/7/8 步要求带
+  `--session` 调 `detect_conflicts` / `apply_revisions` / `apply_comments` /
+  `state.py heartbeat`——这些都走 `lease_verify`。
+- **实测**：`owner.json` 不存在时 exit 9，文案是
+  「本会话写入权限已失效——该文档已被另一个会话接管」。
+  而 `SKILL.md` 的决策点规定 exit 9 不重试不降级、直接转达用户。
+  **照文档跑一遍标准流程，结果是在 Pass 3 处以一句与实情完全相反的话终止。**
+  `--generation <n>` 的取值来源同样没有出处：`init` 的返回里不含 generation。
+- **决策**：`init` 的 `created` / `resumed` 两个分支补上 `lease` 与 `next`
+  （取租约的完整命令）；`SKILL.md` 第 0 步补一步 acquire，并说明
+  `owner.generation` 就是后续 `--generation` 的取值；exit 9 的决策点补一句
+  「先用 `lease status` 分清是没取还是被接管」。
+  **不在 `init` 里自动取租约**——并发时要先把现状呈现给用户再由他选
+  （加入协作 / 接管 / 独立重跑），自动取会把这个交互吞掉。
+- **教训**：`workspace.py` 的租约实现是完整的，回归第 6 节也测过令牌栅栏，
+  但**没有一项测试是"照着 SKILL.md 的主流程从头跑一遍"**。
+  单元层面全对，串起来第一步就断。
+
+### 回归
+
+新增第 14、15 两节共 11 项（110 → 121）。四条修复各配负向对照，
+已逐条验证：回退修复后对应断言全部失败，且报错精确指出是哪一条
+（「P 类过完两道闸门后在 Pass 2 合并处整组消失」「C 类动作被升成了 comment」
+「只缺可选要件的降级被闸门②覆盖成了 comment」「整段 P 类被跨度上限误杀」）。
+长度那条同时验反向：同样长度的 B 类仍必须被丢弃。
+
+- **影响**：`scripts/verify_pass2.py`、`verify_span.py`、`workspace.py`、
+  `report.py`（P 类的报告分类标签）、`assets/config.default.yaml`、
+  `SKILL.md`、`references/patterns.md`、`taxonomy.md`、
+  `prompts/pass2-verify.md`、`tests/run_regression.sh`。

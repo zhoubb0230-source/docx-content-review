@@ -1005,5 +1005,165 @@ PYEOF
 check "N7 只在建议动了 fallback 术语时压制" "$?" 0
 
 echo
+echo "══ 14. 保留范围 ≠ 复核范围；跨度上限与动作按类别分离 ══"
+
+# 闸门④ 是"要不要复核"，不是"要不要留下"。两者共用一张表时，不复核的类别
+# （C、P）会在 issues-verified.jsonl 这个唯一漏斗处整组消失——报告里也看不见。
+# 这里用第 9 节已经跑完两条支线的 RUN3（含 issues-0001.patterns.jsonl）。
+python3 "$S/verify_pass2.py" build --run-dir "$RUN3" --config "$WORK/tp/cfg.yaml" >/dev/null
+python3 - "$RUN3" <<'PYEOF'
+import json,sys
+run=sys.argv[1]
+pay=json.load(open(f"{run}/work/verify/pass2-primary.json",encoding="utf-8"))
+ids={i["id"] for b in pay["batches"] for i in b["items"]}
+key=json.load(open(f"{run}/work/verify/pass2-primary.key.json",encoding="utf-8"))["key"]
+# P 类必须不在复核集里（它的裁定本就是封闭题，Pass 2 没有规则包）
+assert not any(v["category"]=="P1" for v in key.values()), "P 类被送进了闸门④"
+with open(f"{run}/work/verify/pass2-primary.verdicts.jsonl","w",encoding="utf-8") as f:
+    for i in sorted(ids):
+        f.write(json.dumps({"id":i,"answer":"A"},ensure_ascii=False)+"\n")
+PYEOF
+python3 "$S/verify_pass2.py" merge --run-dir "$RUN3" --config "$WORK/tp/cfg.yaml" >/dev/null
+python3 - "$RUN3" <<'PYEOF'
+import json,sys
+rows=[json.loads(l) for l in open(f"{sys.argv[1]}/work/issues-verified.jsonl",encoding="utf-8")]
+p=[r for r in rows if r["category"]=="P1"]
+assert p, "P 类过完两道闸门后在 Pass 2 合并处整组消失（issues-verified 里一条都没有）"
+assert all(r["verify"]["method"]=="not_reviewed" for r in p), "P 类不该进复核集"
+assert all(r["verify"]["result"]=="pass" for r in p), "不复核被当成了淘汰"
+assert any(r["category"].startswith("A") for r in rows), "主通道/错别字通道条目丢失"
+PYEOF
+check "P 类过闸门后仍留在 issues-verified（不复核 ≠ 丢弃）" "$?" 0
+
+# 负向对照：把 P 类从保留范围里拿掉，上面那条断言必须失败
+python3 - "$S" "$RUN3" <<'PYEOF'
+import json,sys,pathlib
+sys.path.insert(0, sys.argv[1])
+import verify_pass2 as v
+from pathlib import Path
+v.KEEP_SCOPE = {k: (s - v.P_CLASSES) for k, s in v.KEEP_SCOPE.items()}
+rows=v.collect(Path(sys.argv[2]), {"strictness":"balanced"})
+sys.exit(0 if not any(r["category"]=="P1" for r in rows) else 1)
+PYEOF
+check "负向对照：P 类不在保留范围时确实会消失（说明这条断言有效）" "$?" 0
+
+# C 类：thorough 下只进报告，且动作恒为 report_only（永不入文档）
+python3 - "$S" "$RUN3" <<'PYEOF'
+import json,sys,pathlib
+sys.path.insert(0, sys.argv[1])
+import verify_span as vs, workspace as ws
+from pathlib import Path
+run=Path(sys.argv[2]); raw=run/"work"/"issues"/"issues-c.raw.jsonl"
+para=next(json.loads(l) for l in open(run/"work"/"paragraphs.jsonl",encoding="utf-8")
+          if "阀值" in json.loads(l)["text"])
+raw.write_text(json.dumps({"pid":para["pid"],"category":"C1",
+    "original_text":para["text"][:40],"suggested_text":"改写得更简洁",
+    "evidence":"冗长","severity":"Low"},ensure_ascii=False)+"\n",encoding="utf-8")
+out=run/"work"/"issues"/"issues-c.jsonl"
+vs.process(run,"0001",raw,ws.load_config(None),out,20)
+rows=[json.loads(l) for l in open(out,encoding="utf-8")]
+assert rows, "C 类被闸门②丢弃了"
+assert rows[0]["action"]=="report_only", f"C 类动作被升成了 {rows[0]['action']}（会写进文档）"
+assert not rows[0]["suggested_text"], "C 类带了建议文本"
+cfg={"strictness":"thorough"}
+import verify_pass2 as v
+assert "C1" in v._scope(cfg, v.KEEP_SCOPE), "thorough 下 C 类不在保留范围内（等于没有 thorough）"
+assert "C1" not in v._scope(cfg, v.REVIEW_SCOPE), "C 类被送进了闸门④"
+assert "C1" not in v._scope({"strictness":"balanced"}, v.KEEP_SCOPE), "balanced 下不该保留 C 类"
+PYEOF
+check "C 类：动作恒为 report_only，仅 thorough 保留且不复核" "$?" 0
+
+# 上游声明的 report_only 不得被闸门②升回 comment
+python3 - "$S" "$RUN3" <<'PYEOF'
+import json,sys
+sys.path.insert(0, sys.argv[1])
+import verify_span as vs, workspace as ws
+from pathlib import Path
+run=Path(sys.argv[2]); raw=run/"work"/"issues"/"issues-ro.raw.jsonl"
+para=next(json.loads(l) for l in open(run/"work"/"paragraphs.jsonl",encoding="utf-8")
+          if "风险2" in json.loads(l)["text"])
+raw.write_text(json.dumps({"pid":para["pid"],"category":"P1","rule_id":"P-RISK-01",
+    "pattern_name":"风险条目描述范式","original_text":para["text"],"suggested_text":"",
+    "evidence":"缺少：责任人","severity":"Medium","action":"report_only"},
+    ensure_ascii=False)+"\n",encoding="utf-8")
+out=run/"work"/"issues"/"issues-ro.jsonl"
+vs.process(run,"0001",raw,ws.load_config(None),out,20)
+r=json.loads(open(out,encoding="utf-8").readline())
+assert r["action"]=="report_only", \
+    f"只缺可选要件的降级被闸门②覆盖成了 {r['action']}（规则包的 action 形同虚设）"
+PYEOF
+check "上游的 report_only 不被闸门②覆盖（规则包 action 生效）" "$?" 0
+
+# P 类的跨度就是整段：不得被 A/B 类的 max_span_chars 误杀，而 A 类同样长度必须被丢
+python3 - "$S" "$RUN3" <<'PYEOF'
+import json,sys
+sys.path.insert(0, sys.argv[1])
+import verify_span as vs, workspace as ws
+from pathlib import Path
+run=Path(sys.argv[2]); cfg=ws.load_config(None)
+long=("风险3：第三方结算接口在跨境场景下的稳定性存在不确定性，历史上曾出现连续三次超时导致对账中断，"
+      "需在本期实施过程中持续跟踪并评估其对整体进度的影响，同时协调供应商完成链路优化与容量评估，"
+      "并在联调阶段安排专项压测以验证改造效果，相关结论将在月度例会上同步给项目组与业务方。")
+assert len(long) > int(cfg["verification"]["max_span_chars"]), "构造的段落没有超过 A/B 类上限"
+# 造一个含该长段落的片
+pj=run/"work"/"paragraphs.jsonl"
+rows=[json.loads(l) for l in open(pj,encoding="utf-8")]
+extra=dict(rows[0]); extra.update({"pid":"p-099999","text":long,"char_len":len(long),
+                                   "is_heading":False,"is_code":False,"in_table":False})
+with open(pj,"a",encoding="utf-8") as f: f.write(json.dumps(extra,ensure_ascii=False)+"\n")
+cdir=run/"work"/"chunks"; ctext=cdir/"chunk-9999.txt"
+ctext.write_text(f"[p-099999] {long}\n",encoding="utf-8")
+idx=json.load(open(cdir/"index.json",encoding="utf-8"))
+idx["chunks"].append({"chunk_id":"9999","pids":["p-099999"],"review_pids":["p-099999"],
+                      "context_pids":[],"chunk_type":"text"})
+json.dump(idx,open(cdir/"index.json","w",encoding="utf-8"),ensure_ascii=False)
+
+def gate(cat, action=""):
+    raw=run/"work"/"issues"/f"issues-len-{cat}.raw.jsonl"
+    rec={"pid":"p-099999","category":cat,"rule_id":cat,"original_text":long,
+         "suggested_text":"","evidence":"e","severity":"Medium"}
+    if cat=="P1": rec["pattern_name"]="风险条目描述范式"
+    raw.write_text(json.dumps(rec,ensure_ascii=False)+"\n",encoding="utf-8")
+    out=run/"work"/"issues"/f"issues-len-{cat}.jsonl"
+    return vs.process(run,"9999",raw,cfg,out,20)
+p=gate("P1"); b=gate("B1")
+assert p["length_drop"]==0 and p["kept"]==1, f"整段 P 类被跨度上限误杀（{p['length_drop']}）"
+assert b["length_drop"]==1 and b["kept"]==0, "负向对照：同样长度的 B 类本应被丢弃"
+PYEOF
+check "P 类整段跨度不被 max_span_chars 误杀（B 类同长度仍被丢：负向对照）" "$?" 0
+
+echo
+echo "══ 15. 主流程的租约：没取租约与被接管必须可区分 ══"
+
+# SKILL.md 第 0 步要求 init 之后立刻 lease acquire。**这一步早先缺在文档里**：
+# 照主流程跑，Pass 3 会以 exit 9 终止，而那条错误信息说的是"已被另一个会话接管"
+# ——与实情正好相反，会把一次正常运行误报成并发冲突。
+INIT5=$(python3 "$S/workspace.py" init --source "$F/sample-basic.docx" \
+        --output-dir "$DELIVER" --temp-dir "$WORK/t15")
+RUN5=$(echo "$INIT5" | jget "['run_dir']")
+DOC5=$(echo "$INIT5" | jget "['doc_dir']")
+check "init 返回 lease 现状（SKILL.md 第 0 步据此判断要不要问用户）" \
+      "$(echo "$INIT5" | jget "['lease']['held']")" "False"
+check "init 给出取租约的下一步命令" \
+      "$(echo "$INIT5" | python3 -c "import json,sys;print('lease acquire' in json.load(sys.stdin)['next'])")" "True"
+
+# 现状：没取租约 → exit 9，且文案与"被接管"完全一样
+python3 "$S/detect_conflicts.py" --run-dir "$RUN5" --session s-flow --generation 1 >/dev/null 2>&1
+check "未取租约时 Pass 3 以 exit 9 终止" "$?" 9
+check "此时 held=false，可据此与真正的被接管区分开" \
+      "$(python3 "$S/workspace.py" lease status --doc-dir "$DOC5" | jget "['held']")" "False"
+
+# 按 SKILL.md 补取租约后，同一条命令必须通过；generation 取自 acquire 的返回
+OWN5=$(python3 "$S/workspace.py" lease acquire --doc-dir "$DOC5" --session s-flow \
+       --runid "$(basename "$RUN5")" --stage pass3 | jget "['owner']['generation']")
+python3 "$S/detect_conflicts.py" --run-dir "$RUN5" --session s-flow --generation "$OWN5" >/dev/null 2>&1
+check "取租约后同一条命令通过（generation 来自 acquire 返回）" "$?" 0
+# 负向对照：纪元不匹配仍必须是 exit 9（令牌栅栏没有被这次改动放松）
+python3 "$S/detect_conflicts.py" --run-dir "$RUN5" --session s-flow \
+        --generation "$((OWN5 + 1))" >/dev/null 2>&1
+check "负向对照：纪元不匹配仍以 exit 9 拒绝" "$?" 9
+python3 "$S/workspace.py" lease release --doc-dir "$DOC5" --session s-flow --generation "$OWN5" >/dev/null
+
+echo
 printf '通过 \033[32m%d\033[0m，失败 \033[31m%d\033[0m\n' "$PASS" "$FAIL"
 [ "$FAIL" -eq 0 ]
