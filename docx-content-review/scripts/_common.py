@@ -40,15 +40,20 @@ class EX:
 class SkillError(Exception):
     """带退出码的可控失败。main() 捕获后打印中文说明并以该码退出。"""
 
-    def __init__(self, code: int, message: str, hint: str | None = None):
+    def __init__(self, code: int, message: str, hint: str | None = None,
+                 payload: dict | None = None):
         super().__init__(message)
         self.code = code
         self.message = message
         self.hint = hint
+        # 失败时也要能给出可机读的处置依据（例如"该把这个参数设成多少"）。
+        # 只放小字段，stdout 仍是单行 JSON。
+        self.payload = payload or {}
 
 
-def die(code: int, message: str, hint: str | None = None) -> "NoReturn":  # type: ignore[name-defined]
-    raise SkillError(code, message, hint)
+def die(code: int, message: str, hint: str | None = None,
+        payload: dict | None = None) -> "NoReturn":  # type: ignore[name-defined]
+    raise SkillError(code, message, hint, payload)
 
 
 # --------------------------------------------------------------------------
@@ -316,7 +321,7 @@ def run_cli(main_fn) -> None:
         sys.stderr.write(f"[终止] {exc.message}\n")
         if exc.hint:
             sys.stderr.write(exc.hint.rstrip() + "\n")
-        emit({"ok": False, "exit_code": exc.code, "error": exc.message})
+        emit({"ok": False, "exit_code": exc.code, "error": exc.message, **exc.payload})
         sys.exit(exc.code)
     except KeyboardInterrupt:
         sys.stderr.write("[中断] 用户终止；已完成的产物保留。\n")

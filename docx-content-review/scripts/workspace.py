@@ -1191,6 +1191,78 @@ def cmd_config(args) -> int:
     return EX.OK
 
 
+# 改配置之后要重跑哪些步骤。key 是配置里的顶层小节。
+RECONFIG_IMPACT = {
+    "chunking": "重跑第 3 步（chunk.py → 候选扫描 → prompt_pack.py build）；"
+                "切法变了的分片，旧产物会被自动作废并重审",
+    "typo_check": "重跑 typo_scan.py scan + prompt_pack.py build",
+    "pattern_review": "重跑 scan_patterns.py scan + prompt_pack.py build",
+    "strictness": "重跑闸门②③（verify_span.py --all / filter_neverflag.py --all）与闸门④ build",
+    "verification": "重跑闸门②③与闸门④ build",
+    "logic": "重跑第 6 步（ledger.py build + detect_conflicts.py --force）",
+    "glossary": "重跑 import_glossary.py + prompt_pack.py build",
+    "concurrency": "无需重跑，下一次 claim 即生效",
+    "output": "无需重跑，回写与报告阶段生效",
+    "skip": "重跑第 3 步",
+}
+
+
+def cmd_reconfigure(args) -> int:
+    """改本次 run 的生效配置。**这是改配置的唯一入口。**
+
+    为什么不能"给某个脚本传 --config"就算改完了：本次 run 的生效配置是
+    `work/../config.snapshot.yaml`，缺省 `--config` 的脚本读的是它。只给 chunk.py
+    传新文件，就会得到一个静默的半生效状态——chunk.py 按新预算切片，
+    prompt_pack.py 按旧上限渲染，两边都不报错，而错在哪里要跑完才看得出来。
+
+    这里把新值深合并进快照，并**说明改动波及哪些步骤**。它不替你重跑，
+    因为"哪些产物该作废"是流程决定，不是配置决定。
+    """
+    import yaml
+
+    run_dir = Path(args.run_dir).resolve()
+    snap = resolve_path(run_dir, "config_snapshot")
+    if not snap.exists():
+        die(EX.WORKSPACE, f"配置快照不存在：{snap}", "这个 run 不完整，请重新 init。")
+    before = yaml.safe_load(snap.read_text(encoding="utf-8")) or {}
+
+    over: dict = {}
+    if args.config:
+        cp = Path(args.config)
+        if not cp.exists():
+            die(EX.USAGE, f"配置文件不存在：{cp}")
+        over = yaml.safe_load(cp.read_text(encoding="utf-8")) or {}
+    for item in (args.set or []):
+        if "=" not in item:
+            die(EX.USAGE, f"--set 要写成 a.b=值：{item}")
+        path, raw = item.split("=", 1)
+        cur = over
+        keys = path.split(".")
+        for k in keys[:-1]:
+            cur = cur.setdefault(k, {})
+        cur[keys[-1]] = yaml.safe_load(raw)
+    if not over:
+        die(EX.USAGE, "没有要改的内容：给 --config 或 --set a.b=值")
+
+    after = _deep_merge(before, over)
+    after["apply_threshold"] = "conservative"        # D4：写什么都无效
+    changed = []
+    for sect, vals in over.items():
+        if isinstance(vals, dict):
+            changed += [f"{sect}.{k}" for k in vals
+                        if (before.get(sect) or {}).get(k) != vals[k]]
+        elif before.get(sect) != vals:
+            changed.append(sect)
+    guard_write_path(snap, run_dir)
+    atomic_write_text(snap, yaml.safe_dump(after, allow_unicode=True, sort_keys=False))
+    emit({"ok": True, "changed": changed,
+          "config_hash": config_hash(after),
+          "rerun": sorted({RECONFIG_IMPACT[s] for s in over if s in RECONFIG_IMPACT}),
+          "snapshot": str(snap),
+          "note": "此后不带 --config 的脚本都按新值跑；按 rerun 里说的重跑对应步骤"})
+    return EX.OK
+
+
 def cmd_fscheck(args) -> int:
     emit({"ok": True, "path": str(Path(args.path).resolve()), "fs_type": fs_type(args.path),
           "local": is_local_fs(args.path)})
@@ -1263,6 +1335,12 @@ def build_parser() -> argparse.ArgumentParser:
     p = sub.add_parser("config", help="打印生效配置")
     p.add_argument("--config")
     p.set_defaults(func=cmd_config)
+
+    p = sub.add_parser("reconfigure", help="改本次 run 的生效配置（改配置的唯一入口）")
+    p.add_argument("--run-dir", required=True)
+    p.add_argument("--config", help="要合并进来的 yaml")
+    p.add_argument("--set", action="append", help="a.b=值，可多次")
+    p.set_defaults(func=cmd_reconfigure)
 
     p = sub.add_parser("fscheck", help="判断是否本地文件系统")
     p.add_argument("--path", required=True)

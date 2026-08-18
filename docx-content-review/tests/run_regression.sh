@@ -1589,9 +1589,11 @@ chunking:
 YAML
 OLDN=$(python3 "$S/chunk.py" --run-dir "$RUN5" --config "$WORK/big/legacy.yaml" | jget "['chunks']")
 NEWN=$(python3 "$S/chunk.py" --run-dir "$RUN5" | jget "['chunks']")
-# 片数就是 Pass 1 的调用数（每片三次调用）与工具轮次数，是本次提速的主项
-python3 -c "import sys;sys.exit(0 if $OLDN >= $NEWN*15//10 else 1)"
-check "同一份正文：新预算的片数比旧参数少三分之一以上（$OLDN → $NEWN）" "$?" 0
+# 片数就是 Pass 1 的调用数与工具轮次数。系数修正（1.6→1.0）与切点比例（0.5→0.7）
+# 一起把它压下来；默认 max_text_tokens 后来又为了子 Agent 的窗口调小，
+# 所以这里断言的是"明显更少"，不是某个固定倍数。
+python3 -c "import sys;sys.exit(0 if $OLDN >= $NEWN*12//10 else 1)"
+check "同一份正文：新预算的片数比旧参数少两成以上（$OLDN → $NEWN）" "$?" 0
 
 # 没有术语表时不得从预算里扣术语摘要（term_rules 默认关闭，那 4000 是白扣的）
 python3 - "$S" <<'PYEOF'
@@ -2023,6 +2025,125 @@ PYEOF
 SW=$(python3 "$S/verify_span.py" --run-dir "$RUN6" --all --channel main)
 ge "半写的那一片被单独作废并报数" "$(echo "$SW" | jget "['unparsable']")" 1
 ge "其余分片照常过闸（一个坏文件不拖垮整轮）" "$(echo "$SW" | jget "['chunks']")" 1
+
+echo
+
+echo "══ 25. 配置改动与 prompt 体量：在派活之前就拦下来 ══"
+
+# 改配置的唯一入口：合并进快照，且说明要重跑什么
+RC=$(python3 "$S/workspace.py" reconfigure --run-dir "$RUN6" --set chunking.max_text_tokens=7000)
+check "reconfigure 报出改了哪一项" "$(echo "$RC" | jget "['changed'][0]")" chunking.max_text_tokens
+python3 - "$RC" <<'PYEOF'
+import json,sys
+d=json.loads(sys.argv[1])
+sys.exit(0 if d["rerun"] and "第 3 步" in d["rerun"][0] else 1)
+PYEOF
+check "reconfigure 说明这次改动要重跑哪些步骤" "$?" 0
+
+# 关键：此后**不带 --config** 的脚本按新值跑（旧行为是回落默认配置，半生效且不报错）
+python3 "$S/chunk.py" --run-dir "$RUN6" >/dev/null
+python3 - "$RUN6" <<'PYEOF'
+import json,pathlib,sys,yaml
+run=pathlib.Path(sys.argv[1])
+snap=yaml.safe_load((run/"config.snapshot.yaml").read_text(encoding="utf-8"))
+idx=json.load(open(run/"work"/"chunks"/"index.json",encoding="utf-8"))
+assert snap["chunking"]["max_text_tokens"]==7000, "快照没写进去"
+over=[c for c in idx["chunks"] if c["text_tokens"] > 7000]
+assert not over, f"{len(over)} 片超过改后的预算，说明 chunk.py 没读到新配置"
+PYEOF
+check "缺省 --config 时后续脚本按 reconfigure 之后的值跑" "$?" 0
+
+# D4：落笔门槛写什么都无效
+python3 "$S/workspace.py" reconfigure --run-dir "$RUN6" --set apply_threshold=thorough >/dev/null
+python3 - "$RUN6" <<'PYEOF'
+import pathlib,sys,yaml
+snap=yaml.safe_load(pathlib.Path(sys.argv[1],"config.snapshot.yaml").read_text(encoding="utf-8"))
+sys.exit(0 if snap["apply_threshold"]=="conservative" else 1)
+PYEOF
+check "reconfigure 不能放宽落笔门槛（D4）" "$?" 0
+
+# 以下用与真实压测同形的语料（约 21 万字）：小 fixture 的分片再大也就几千字符，
+# 撞不出「子 Agent 装不下」这个现场
+mkdir -p "$WORK/big2"
+cp "$F/sample-basic.docx" "$WORK/big2/big2.docx"
+RUN7=$(python3 "$S/workspace.py" init --source "$WORK/big2/big2.docx" \
+       --output-dir "$DELIVER" --temp-dir "$TEMP" | jget "['run_dir']")
+python3 "$S/unpack.py" run --run-dir "$RUN7" >/dev/null
+python3 "$S/extract.py" --run-dir "$RUN7" >/dev/null
+python3 - "$RUN7" <<'PYEOF'
+import json,pathlib,random,sys
+run=pathlib.Path(sys.argv[1]); random.seed(7)
+body="本系统在设计上采用分层架构，各层之间通过标准接口交互，确保模块可替换与可测试。"
+rows=[]; i=0; chars=0; sec=0
+while chars < 211573:
+    i+=1
+    if i%14==1:
+        sec+=1; t=f"{sec} 第 {sec} 章 模块设计与接口约定"; lvl,h=2,True
+    else:
+        t=(body*7)[:random.randint(120,320)]; lvl,h=None,False
+    rows.append({"pid":f"p-{i:06d}","index":i,"heading_path":[f"{sec} 章"],"level":lvl,
+                 "is_heading":h,"style":"Normal","style_name":"Normal","text":t,"char_len":len(t),
+                 "in_table":False,"table_id":None,"row_idx":None,"cell_idx":None,"is_list":False,
+                 "is_code":False,"is_quote":False,"page_hint":1+chars//265,"page_estimated":True})
+    chars+=len(t)
+(run/"work"/"paragraphs.jsonl").write_text(
+    "".join(json.dumps(r,ensure_ascii=False)+"\n" for r in rows),encoding="utf-8")
+PYEOF
+
+# 默认配置必须自洽：默认预算渲染出的 prompt 不得超过默认上限
+python3 "$S/chunk.py" --run-dir "$RUN7" >/dev/null
+python3 "$S/typo_scan.py" scan --run-dir "$RUN7" >/dev/null
+PD0=$(python3 "$S/prompt_pack.py" build --run-dir "$RUN7"); RC0=$?
+check "默认配置自洽：800 页语料按默认预算渲染不超上限" "$RC0" 0
+python3 - "$PD0" <<'PYEOF'
+import json,sys
+d=json.loads(sys.argv[1])
+print("    默认配置：prompt 最大", d["max_chars"], "/ 上限", d["limit"])
+PYEOF
+
+# 分片太大：必须在派活之前以退出码 8 终止，并给出该设成多少
+python3 "$S/workspace.py" reconfigure --run-dir "$RUN7" --set chunking.max_text_tokens=15000 >/dev/null
+python3 "$S/chunk.py" --run-dir "$RUN7" >/dev/null
+python3 "$S/typo_scan.py" scan --run-dir "$RUN7" >/dev/null
+PB=$(python3 "$S/prompt_pack.py" build --run-dir "$RUN7" 2>/dev/null); RC8=$?
+check "prompt 超限以退出码 8 终止" "$RC8" 8
+ge "报出超限单元数" "$(echo "$PB" | jget "['over_limit']")" 1
+python3 - "$PB" <<'PYEOF'
+import json,sys
+d=json.loads(sys.argv[1])
+print("    建议值：", d.get("suggest_max_text_tokens"), "（上限", d["limit"],
+      "，实测最大", d["max_chars"], "，固定开销", d.get("fixed_overhead_chars"), "）")
+sys.exit(0 if d.get("suggest_max_text_tokens", 10**9) < 15000 else 1)
+PYEOF
+check "给出建议值（严格小于当前值）" "$?" 0
+
+# 照建议改完就该通过——建议值不能只是"更小"，得真的解决问题
+python3 - "$S" "$RUN7" "$PB" <<'PYEOF'
+import json,subprocess,sys
+S,run,pb=sys.argv[1],sys.argv[2],json.loads(sys.argv[3])
+for cmd in ([f"{S}/workspace.py","reconfigure","--run-dir",run,
+             "--set",f"chunking.max_text_tokens={pb['suggest_max_text_tokens']}"],
+            [f"{S}/chunk.py","--run-dir",run],
+            [f"{S}/typo_scan.py","scan","--run-dir",run]):
+    subprocess.run([sys.executable]+cmd,check=True,capture_output=True)
+r=subprocess.run([sys.executable,f"{S}/prompt_pack.py","build","--run-dir",run],capture_output=True)
+out=json.loads(r.stdout.decode().strip().splitlines()[-1])
+print("    照建议改完：exit",r.returncode,"，最大",out.get("max_chars"),"/ 上限",out.get("limit"))
+sys.exit(0 if r.returncode==0 and out["over_limit"]==0 else 1)
+PYEOF
+check "照建议值改完即通过（建议值是可执行的，不是安慰）" "$?" 0
+
+# 上限比固定开销还小时，调分片没用——必须换一条建议，否则 Agent 会陷在
+# 「改了、重跑、还是 8」的死循环里
+python3 "$S/workspace.py" reconfigure --run-dir "$RUN7" --set chunking.max_prompt_chars=1200 >/dev/null
+PZ=$(python3 "$S/prompt_pack.py" build --run-dir "$RUN7" 2>/dev/null)
+python3 - "$PZ" <<'PYEOF'
+import json,sys
+d=json.loads(sys.argv[1])
+print("    上限过低时给的是：", d["error"][:36], "→ 至少", d.get("min_viable_prompt_chars"))
+sys.exit(0 if d.get("min_viable_prompt_chars") and "suggest_max_text_tokens" not in d else 1)
+PYEOF
+check "上限低于固定开销时改口建议调上限（不给无效的分片建议）" "$?" 0
 
 echo
 printf '通过 \033[32m%d\033[0m，失败 \033[31m%d\033[0m\n' "$PASS" "$FAIL"

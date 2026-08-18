@@ -53,6 +53,9 @@ HEADER = """<!-- 本文件由 prompt_pack.py 渲染，**自包含**：读完这�
 
 """
 
+# 分片再小也得装得下一段完整正文，否则切出来的片没有审查价值
+MIN_TEXT_CHARS = 2000
+
 JSONL_HOW = "每行一条 JSON（JSONL），无外层数组、无代码围栏、无前后说明文字"
 JSON_HOW = "一个 JSON 对象，无代码围栏、无前后说明文字"
 
@@ -191,7 +194,12 @@ def build(run_dir: Path, cfg: dict, stages: list[str], chunk_id: str | None) -> 
     guard_write_path(pdir, run_dir)
     pdir.mkdir(parents=True, exist_ok=True)
 
-    written, sizes = {}, []
+    ch = cfg.get("chunking") or {}
+    limit = int(ch.get("max_prompt_chars") or 0)
+    written, sizes, biggest = {}, [], ("", 0)
+    # 固定开销 = prompt 里正文之外的部分（类型体系、不改清单、schema、格式说明）。
+    # 建议值要按它来算：能留给正文的是 limit - fixed，而不是按总量等比例缩。
+    fixed_max = 0
     for stage in stages:
         render, how = RENDERERS[stage]
         n = 0
@@ -204,12 +212,56 @@ def build(run_dir: Path, cfg: dict, stages: list[str], chunk_id: str | None) -> 
             guard_write_path(unit["prompt"], run_dir)
             atomic_write_text(unit["prompt"], text)
             sizes.append(len(text))
+            if stage in ("review", "extract"):
+                src = Path(unit["source"])
+                body = len(src.read_text(encoding="utf-8")) if src.exists() else 0
+                fixed_max = max(fixed_max, len(text) - body)
+            if len(text) > biggest[1]:
+                biggest = (f"{stage}/{unit['unit']}", len(text))
             n += 1
         written[stage] = n
-    return {"dir": str(pdir), "written": written,
-            "max_chars": max(sizes) if sizes else 0,
-            "avg_chars": round(sum(sizes) / len(sizes)) if sizes else 0,
-            "note": "子 Agent 只读 prompt 与写 output 两个文件，不要再读 references/"}
+
+    mx = max(sizes) if sizes else 0
+    over = [x for x in sizes if limit and x > limit]
+    res = {"dir": str(pdir), "written": written, "max_chars": mx,
+           "avg_chars": round(sum(sizes) / len(sizes)) if sizes else 0,
+           "max_unit": biggest[0], "limit": limit, "over_limit": len(over),
+           "note": "子 Agent 只读 prompt 与写 output 两个文件，不要再读 references/"}
+    if over:
+        # **在派活之前就拦下来。** 分片对子 Agent 来说过大时，表现是「跑了一半，
+        # 3/5 的子 Agent 失败」——要跑完一整波才看得出来，而且看到的是失败计数，
+        # 不是原因。这里把它变成第 3 步的一条明确失败，并直接给出该设成多少。
+        # 正文可用额度 = 上限 - 固定开销（类型体系、不改清单、schema、格式说明）。
+        # CJK 下 1 个 est-token ≈ 1 个字符，所以这个额度直接就是 max_text_tokens 该设的值。
+        cur = int(ch.get("max_text_tokens") or 10000)
+        room = (limit - fixed_max) if fixed_max else int(limit * 0.65)
+        res["fixed_overhead_chars"] = fixed_max
+        if room < MIN_TEXT_CHARS:
+            # **上限比固定开销还小时，调 max_text_tokens 是没用的**——正文缩到 0 也超。
+            # 这时候给个"更小的建议值"等于把 Agent 送进死循环：改了、重跑、还是 8。
+            floor = fixed_max + MIN_TEXT_CHARS
+            res["min_viable_prompt_chars"] = floor
+            die(EX.VALIDATE,
+                f"max_prompt_chars={limit} 比固定开销（{fixed_max} 字符）还小，"
+                f"任何分片大小都过不了",
+                f"固定开销是类型体系 + 不改清单 + schema，压不下去。\n"
+                f"把上限调到至少 {floor}：\n"
+                f"  workspace.py reconfigure --run-dir <run> "
+                f"--set chunking.max_prompt_chars={floor}",
+                payload=res)
+        suggest = max(MIN_TEXT_CHARS, min(cur, (room // 1000) * 1000))
+        res["suggest_max_text_tokens"] = suggest
+        die(EX.VALIDATE,
+            f"{len(over)} 个单元的 prompt 超过 max_prompt_chars={limit}"
+            f"（最大 {mx} 字符，在 {biggest[0]}）",
+            f"分片对子 Agent 来说太大了。改配置并重跑第 3 步：\n"
+            f"  workspace.py reconfigure --run-dir <run> "
+            f"--set chunking.max_text_tokens={suggest}\n"
+            f"  chunk.py --run-dir <run> && typo_scan.py scan --run-dir <run> "
+            f"&& prompt_pack.py build --run-dir <run>\n"
+            f"（子 Agent 窗口确实够大时，改 chunking.max_prompt_chars 放宽本项）",
+            payload=res)
+    return res
 
 
 def listing(run_dir: Path, stages: list[str]) -> dict:

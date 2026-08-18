@@ -110,6 +110,24 @@ workspace.py lease acquire --doc-dir <doc_dir> --session <sid> --runid <runid> -
 
 记下返回的 `run_dir`，后续所有脚本都用它。**不要自己拼接任何输出路径**——需要路径时用 `workspace.py resolve --run-dir <run> --kind <kind>`。
 
+**配置怎么生效（跑到一半要改参数时，先看这里）**
+
+本次 run 的生效配置是 `config.snapshot.yaml`，由 `init` 按「默认配置 + `--config` 深合并」
+写定。此后**不带 `--config` 的脚本一律读这份快照**，所以正常情况下后面每一步都不用再传。
+
+要改参数，只用这一个入口：
+
+```
+workspace.py reconfigure --run-dir <run> --set chunking.max_text_tokens=8000
+workspace.py reconfigure --run-dir <run> --config <另一份 yaml>       # 深合并
+```
+
+它把新值合并进快照，并在返回的 `rerun` 里说明**这次改动要重跑哪些步骤**。
+
+**不要只给某一个脚本传 `--config` 来改参数。** 那样只有那一个脚本按新值跑，
+其余仍读旧快照——chunk.py 按新预算切片、prompt_pack.py 按旧上限渲染，
+两边都不报错，错在哪里要跑完才看得出来。`--config` 留给「整轮都用另一份配置」的场合。
+
 ### 第 1 步：Pass -1　归一化
 
 ```
@@ -156,8 +174,12 @@ prompt_pack.py build --run-dir <run>                      # 渲染每次调用�
 判据是 token 不是页数。`chunk.py` 返回 `single_pass: true` 即单片模式。
 `table_only` 类型的分片**不发起审查调用**，只发起事实抽取调用。
 
-**片数就是工作量**：一份 800 页的中文文档在默认配置下约 20 片。明显更多说明
-`max_text_tokens` 被调小了，或 `split_point_fill_ratio` 太低（标题一多就断）。
+**片数就是工作量**：一份 800 页的中文文档在默认配置下约 26 片。
+
+片的大小由**子 Agent 的窗口**决定，不由文档决定。而且撑爆窗口的往往不是输入
+而是**输出**——事实抽取的产出长度与正文成正比，片越大越容易撞上单次输出上限，
+截断的 JSON 解析不了，这一片就会反复失败。所以子 Agent 一旦频繁失败，
+**调小 `max_text_tokens` 是对的方向**，不要靠重试硬扛。
 
 **改了 `chunking` 下的任何参数必须重跑这一步**，并看 `stale_chunks_cleared`：
 切法一变，旧的 `issues-<id>` / `facts-<id>` 就与同号的新分片对不上了，脚本会把它们
@@ -168,9 +190,22 @@ prompt_pack.py build --run-dir <run>                      # 渲染每次调用�
 一个单元一个。子 Agent 因此只需要「读一个文件 → 作答 → 写一个文件」，
 既不必知道技能目录在哪，也没有机会顺手把 `references/` 下的大文件读进上下文。
 
-返回里的 `max_chars` 是**单个子 Agent 的输入规模上界**，值得看一眼：
-默认配置下约 2.3 万字符（固定开销约 8 千 + 分片正文）。子 Agent 的上下文窗口偏小时，
-调低 `chunking.max_text_tokens` 重跑第 3 步即可——这个数会同比例下降。
+**退出码 8 = 分片对你的子 Agent 来说太大。** `prompt_pack.py` 会在派活之前
+量一遍每个单元的 prompt，超过 `chunking.max_prompt_chars`（默认 20000 字符）就终止，
+并在 stdout 的 JSON 里直接给出 `suggest_max_text_tokens`。照着改再重跑第 3 步：
+
+```
+workspace.py reconfigure --run-dir <run> --set chunking.max_text_tokens=<建议值>
+chunk.py --run-dir <run> && typo_scan.py scan --run-dir <run> && prompt_pack.py build --run-dir <run>
+```
+
+**不要跳过这道拦截去硬跑。** 它拦的正是「一波派 5 个、失败 3 个」那个现场——
+那种失败要跑完一整波才看得见，而且看到的是失败计数，不是原因。
+子 Agent 窗口确实够大（≥128k）时，把 `max_prompt_chars` 一并调高即可。
+
+**分片小一点意味着片数多一点，这是有意的取舍。** 单元变小之后总调用数上升，
+但每个单元都能跑完；反过来，片大到子 Agent 装不下时，**失败的单元会一直失败**，
+再多重试也没用。默认 `max_text_tokens: 10000`（约 25 页/片）在 800 页文档上约 26 片。
 
 ### 第 4 步：Pass 1　三波并行
 
@@ -389,6 +424,7 @@ workspace.py clean-temp --run-dir <run>
 |---|---|---|---|
 | `workspace.py init` | 建工作目录、复制源文档、续跑判定 | `--source` | run_dir / action / lease |
 | `workspace.py locate` | 只查已有文档目录 | `--source` | doc_dir / stage |
+| `workspace.py reconfigure` | **改本次 run 的配置（唯一入口）** | `--run-dir --set a.b=值\|--config` | changed / rerun |
 | `workspace.py resolve` | 取临时目录内的标准路径 | `--run-dir --kind` | path |
 | `workspace.py deliver` | 取产物路径与去向 | `--run-dir [--kind]` | paths（交付物）+ artifacts（全部及去向） |
 | `workspace.py clean-temp` | 删除本次 run 的临时目录 | `--run-dir` | 已删路径 + 保留的交付物 |
@@ -402,7 +438,7 @@ workspace.py clean-temp --run-dir <run>
 | `glossary_scan.py` | 候选术语预筛 + 概念族聚类 | `--run-dir` | candidates / batches |
 | `import_glossary.py` | 术语表导入 + 自检 + 三层合并 | `--run-dir --authoritative --fallback` | entries / layers |
 | `chunk.py` | 分片（按 token） | `--run-dir` | chunks / single_pass / stale_chunks_cleared |
-| `prompt_pack.py build\|list` | 渲染每次调用的自包含 prompt（一个单元一个文件） | `--run-dir [--stage --chunk]` | written / max_chars |
+| `prompt_pack.py build\|list` | 渲染每次调用的自包含 prompt；超 `max_prompt_chars` 以 8 终止并给建议值 | `--run-dir [--stage --chunk]` | written / max_chars / suggest_max_text_tokens |
 | `verify_span.py` | 闸门②③ | `--run-dir --chunk [--in --out --cap]` | 各闸门丢弃计数 |
 | `verify_pass2.py build\|merge\|consistency` | 闸门④盲测 A/B 脚手架（build 按批落盘，可并行复核） | `--run-dir [--arrangement]` | items / batches / pass / drop / 一致率 |
 | `filter_neverflag.py` | 不改清单硬过滤 | `--run-dir --chunk\|--all [--channel --file]` | dropped / by_rule |
@@ -443,6 +479,10 @@ workspace.py clean-temp --run-dir <run>
 **批注和报告里怎么称呼问题** —— 脚本已经把规则号译成了中文（「前后数值不一致」「的/地/得误用」），
 规则号只作为末尾的可追溯标记。**转述给用户时也用中文说法，不要念规则号**——
 评审人看到「L06」不知道是什么。
+
+**遇到 exit 8（prompt_pack.py）** —— 不是校验失败，是**分片对子 Agent 太大**。
+按返回里的 `suggest_max_text_tokens` 走一遍 `reconfigure` + 重跑第 3 步即可，
+不需要问用户，也不要绕过去硬跑。（`validate_docx.py` 的 exit 8 是另一回事，见第 8 步。）
 
 **遇到 exit 9（NOT_OWNER）** —— 先确认第 0 步的 `lease acquire` 到底跑过没有：
 **没取租约与被别人接管，报的是同一个退出码和同一句话**。用

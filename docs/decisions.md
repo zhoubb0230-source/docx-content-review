@@ -1028,3 +1028,37 @@ L 规则表、目录结构、配置项）不在此重复。
   `assets/config.default.yaml`、`SKILL.md` 第 3/4/4.5 步与并发一节、
   `prompts/pass1-typo.md`、`prompts/pass1-pattern.md`、`references/schemas.md`、
   回归第 23–24 节（新增 27 项）。
+## ADR-041　分片大小由子 Agent 的窗口决定；配置改动只有一个入口
+
+- **日期**：2026-08-18
+- **背景**：ADR-040 之后又跑了一轮，主 Agent 自己给出的判断是
+  「核心问题是分片过大导致子代理上下文溢出（3/5 失败），按技能指引调小
+  `chunking.max_text_tokens`。先确认配置合并方式」。**判断是对的，两个问题是真的**：
+
+  1. **默认 `max_text_tokens: 15000` 对中等 harness 偏大。** 渲染出的审查 prompt
+     实测最大 21124 字符（固定开销 8207 + 正文）。更要紧的是**撑爆的往往是输出而不是输入**：
+     事实抽取的产出长度与正文成正比，片越大越容易撞上单次输出上限，
+     截断的 JSON 解析不了，这一片就会反复失败——重试多少次都一样。
+  2. **"配置合并方式"确实说不清。** `load_run_config` 让缺省 `--config` 的脚本读 run 的
+     配置快照（ADR-039），但**改配置**没有入口：只给 chunk.py 传一份新 yaml，
+     其余脚本仍读旧快照，又回到半生效状态。Agent 停下来先问，是对的。
+  3. 更根本的是**这个错误发现得太晚**：要派完一整波才看得见，而且看到的是
+     「5 个失败 3 个」，不是原因。
+- **决策**：
+  - 默认 `max_text_tokens` 15000 → 10000（800 页文档约 26 片）。片数因此上升，
+    这是有意的取舍：**片大到子 Agent 装不下时，失败的单元会一直失败**，
+    而片小只是调用多。
+  - 新增 `chunking.max_prompt_chars`（默认 20000）与 `prompt_pack.py` 的**派活前体检**：
+    超限即以退出码 8 终止，并在 stdout 里给出 `suggest_max_text_tokens`。
+    建议值按「上限 − 固定开销」算，不按总量等比例缩——等比例缩出来的值可能仍然超，
+    Agent 会陷在「改了、重跑、还是 8」的循环里。上限本身比固定开销还小时，
+    改口建议调 `max_prompt_chars` 并给出最低可行值。
+  - 新增 `workspace.py reconfigure`：把新值深合并进 run 的配置快照，
+    并在返回的 `rerun` 里说明这次改动要重跑哪些步骤。**这是改配置的唯一入口**；
+    `--config` 留给「整轮都用另一份配置」。D4 照旧强制 `apply_threshold: conservative`。
+  - `_common.die` 支持 `payload`，失败时 stdout 也能带可机读的处置依据。
+- **备选**：让子 Agent 失败后自动降级重试（重试解决不了"输出装不下"，只是多烧几轮）；
+  压缩 `taxonomy.md` / `never-flag.md` 缩小固定开销（削弱的是第一道判据，
+  而 8207 字符里真正能省的不多）。
+- **影响**：`assets/config.default.yaml`、`scripts/prompt_pack.py`、`scripts/workspace.py`、
+  `scripts/_common.py`、`SKILL.md` 第 0/3 步与退出码分诊、回归第 25 节（新增 10 项）。
