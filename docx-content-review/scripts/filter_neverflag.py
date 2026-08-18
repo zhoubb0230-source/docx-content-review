@@ -26,7 +26,7 @@ from _common import (  # noqa: E402
     EX, atomic_write_json, atomic_write_jsonl, die, emit, normalize_key, normalize_width,
     normalize_ws, read_json, read_jsonl, run_cli,
 )
-from workspace import guard_write_path, load_config, resolve_path  # noqa: E402
+from workspace import guard_write_path, load_run_config, resolve_path  # noqa: E402
 
 OPEN_Q = "“「『\""      # “ 「 『 "
 CLOSE_Q = "”」』\""     # ” 」 』 "
@@ -335,7 +335,8 @@ def main(argv: list[str]) -> int:
                                     "见 tests/fixtures/neverflag-traps.json")
     ap.add_argument("--category", default="A5")
     args = ap.parse_args(argv)
-    cfg = load_config(args.config)
+    run_dir = Path(args.run_dir).resolve() if args.run_dir else None
+    cfg = load_run_config(run_dir, args.config)
 
     if args.traps:
         res = traps(Path(args.traps), cfg)
@@ -351,7 +352,8 @@ def main(argv: list[str]) -> int:
         emit({"ok": True, "hit": rule, "kept": rule is None})
         return EX.OK
 
-    run_dir = Path(args.run_dir).resolve()
+    if run_dir is None:
+        die(EX.USAGE, "缺少 --run-dir")
     paras = {p["pid"]: p for p in read_jsonl(resolve_path(run_dir, "paragraphs"))}
     glossary = read_json(resolve_path(run_dir, "glossary_merged"), {}) or {}
     groups, fallback = _alias_groups(glossary), _fallback_terms(glossary)

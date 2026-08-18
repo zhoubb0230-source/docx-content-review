@@ -77,6 +77,8 @@ KINDS = {
     "glossary_extracted": "work/glossary-extracted.json",
     "glossary_merged": "work/glossary.merged.json",
     "conflicts_candidate": "work/conflicts",
+    "conflicts_batches": "work/conflicts/batches",
+    "conflicts_verdicts": "work/conflicts/verdicts",
     "conflicts_verified": "work/conflicts-verified.jsonl",
     "issues_verified": "work/issues-verified.jsonl",
     "typos": "work/typos",
@@ -150,6 +152,28 @@ def load_config(config_path: str | None = None, overrides: dict | None = None) -
     # D4：落笔门槛强制 conservative，不可通过配置放宽
     cfg["apply_threshold"] = "conservative"
     return cfg
+
+
+def config_hash(cfg: dict) -> str:
+    """配置指纹。用于判断「这份产物是不是按当前配置算出来的」。"""
+    import yaml
+
+    return sha256_text(yaml.safe_dump(cfg, allow_unicode=True, sort_keys=True))[:16]
+
+
+def load_run_config(run_dir: Path | str | None, config_path: str | None = None,
+                    overrides: dict | None = None) -> dict:
+    """带 run 目录的脚本一律用这个，不要直接用 load_config。
+
+    `load_config` 只认默认值 + 显式 `--config`，**不读 run 里的配置快照**。
+    于是「init 时带了 --config，后面某一步忘了带」会得到一个静默的半生效状态：
+    chunk.py 按新预算切片、verify_span.py 按旧上限截断，两边都不报错。
+    这里让缺省行为回落到 `work/../config.snapshot.yaml`——那正是本次 run 的配置。
+    """
+    if config_path or run_dir is None:
+        return load_config(config_path, overrides)
+    snap = resolve_path(Path(run_dir), "config_snapshot")
+    return load_config(str(snap) if snap.exists() else None, overrides)
 
 
 def _deep_merge(base: dict, over: dict) -> dict:
@@ -793,7 +817,7 @@ def cmd_init(args) -> int:
         "created_at": now_iso(),
         "config": {"strictness": cfg.get("strictness"),
                    "max_context_tokens": (cfg.get("chunking") or {}).get("max_context_tokens")},
-        "config_hash": sha256_text(yaml.safe_dump(cfg, allow_unicode=True, sort_keys=True))[:16],
+        "config_hash": config_hash(cfg),
         "ab_seed": args.seed if args.seed is not None else random.randint(1, 2 ** 31 - 1),
         # 交付元信息：交付物文件名在 init 时定死，全流程共用同一时间戳
         "deliver_dir": str(deliver_root),

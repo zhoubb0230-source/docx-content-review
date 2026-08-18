@@ -927,3 +927,55 @@ L 规则表、目录结构、配置项）不在此重复。
   `verify_span.py`、`report.py`、`tests/fixtures/make_fixtures.py`、
   新增 `tests/fixtures/existing-comments.docx`、`references/schemas.md`、
   `tests/run_regression.sh`（137 → 144）。
+## ADR-039　长文档的成本在「工具轮次 × 上下文」，不在脚本
+
+- **日期**：2026-08-18
+- **背景**：第一次真实压测——801 页、211,573 字符——跑了 4 小时仍停在第 4 步，
+  31 片里第一轮的 6 片都没做完，部分子 Agent 的上下文已到 175k。
+  脚本侧全程只占几十秒，瓶颈完全在流程形状上。三个独立成因：
+
+  1. **片数被虚高的 token 系数抬了两倍。** `_estimate` 已经把 CJK 逐字记 1 token
+     （真实 tokenizer 约 1 token / 1.4–1.7 字），`token_fallback_ratio` 又乘 1.6，
+     等于一个汉字算 1.6 token。叠加「无条件扣掉 4000 术语摘要预算」
+     （`term_rules` 默认关，根本没有术语摘要）与切点比例 0.5（标题一多就断，
+     每片只装半程），实测同一份 800 页正文切出 37 片，改后 19 片。
+  2. **子 Agent 连做多片，上下文平方级累积。** 技能的 prompt 契约写的是
+     「每次调用无状态、自包含」——那是对 API 调用成立的，但执行载体是一个持续对话的
+     子 Agent，类型体系、不改清单、每片正文与三次调用的产物全都留在同一个上下文里。
+     连做 5 片之后，第 5 片的每一轮工具往返都要重算前 4 片。
+  3. **每片 20+ 轮工具往返里只有 3 轮在做审查。** 其余是每次调用前后各一次
+     claim 续期（6 轮）、六个闸门脚本各一轮、以及「逐行写入」「逐条 append」
+     这类措辞诱导出的逐行落盘。每一轮都要重算当下的全部上下文。
+
+- **决策**：
+  - 系数改 1.0；术语摘要预算按「有没有术语表」计；新增
+    `split_point_fill_ratio`（默认 0.7）；`max_text_tokens` 维持 15000——
+    系数修正后它的含义从「约 9400 汉字」变成「15000 汉字」，片本身已经大了 1.6 倍。
+    同步把 `max_issues_per_chunk` 20→40、`min_b_class_slots` 5→10、
+    错别字配额 100→200，**片变大而上限不动等于拿召回换速度**。
+  - 子 Agent 改为**一片一个、做完即退**；`renew_claim_on_llm_call` 关掉，
+    `chunk_claim_minutes` 20→60 覆盖单片全程；闸门脚本用 `&&` 串成一条命令；
+    支线候选扫描改为整篇跑一次；写盘一律整块写。
+  - 闸门④与 Pass 4 按批分文件：`verify_pass2.py build` 额外落
+    `pass2-<排列>.vNN.json`，`merge` 收所有分批裁定文件；新增
+    `adjudicate_pass4.py`（`build` / `collect` / `status`）承担 Pass 4 的题面拼装与归并。
+    两步都从「主 Agent 串行、把整份候选读进上下文」变成「子 Agent 并行、各读一批」。
+- **备选**：只调 `parallelism`（并行度不是瓶颈，轮次与上下文才是）；
+  把三次调用合并成一次（违反「一次调用只做一件事」，且实测会互相污染）；
+  把 `max_text_tokens` 推到 20000 以上（片越大定位准确率越掉，
+  而定位准确率的优先级高于所有召回指标）。
+- **顺带修掉的两个存量缺陷**：
+  1. **重新分片不清旧产物 = 静默跳片。** `chunk.py` 只删 `chunk-*.txt`，而续跑判定是
+     「文件存在性即状态」，于是换了切法之后新的第 1 片顶着旧的 `issues-0001` 被判为
+     已完成，那部分正文再也不会被看到，输出里没有任何痕迹。现按 chunk 签名比对，
+     内容变了就作废它的全部产物（含两条支线与 claim），并在返回里报数。
+  2. **`load_config` 不读 run 的配置快照。** 「init 时带了 `--config`、后面某一步忘了带」
+     会得到静默的半生效状态：chunk.py 按新预算切、verify_span.py 按旧上限截，
+     两边都不报错。新增 `load_run_config`，缺省回落到 `config.snapshot.yaml`，
+     全部带 run 目录的脚本改用它。
+- **影响**：`assets/config.default.yaml`、`scripts/chunk.py`、`scripts/tokenizer.py`、
+  `scripts/workspace.py`、`scripts/verify_pass2.py`、`scripts/adjudicate_pass4.py`（新增）、
+  其余 14 个脚本的 `load_run_config` 切换、`SKILL.md` 第 3/4/4.5/5/7 步与并发一节、
+  `prompts/pass1-review.md`（`{{MAX_ISSUES}}`）/`pass2-verify.md`/`pass4-adjudicate.md`、
+  `references/schemas.md`、`references/taxonomy.md`、`references/never-flag.md`、
+  `references/logic-rules.md`、回归第 20–22 节（新增 27 项）。

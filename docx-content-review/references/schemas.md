@@ -151,7 +151,7 @@
 不带这个标记时，跨度在段内出现多次即拒绝落笔——"改哪一处"没有依据
 （见 `references/ooxml.md` §2.1）。
 
-## conflicts-verified.jsonl（Pass 4 输出 ← 你写这个，append-only）
+## conflicts/verdicts/adjudicate-bNN.verdicts.jsonl（Pass 4 输出 ← 你写这个）
 
 ```json
 {"conflict_id":"L06-0002","verdict":"CONFLICT","note":"同为核心链路目标值"}
@@ -160,7 +160,21 @@
 `verdict` ∈ `CONFLICT` / `NOT_CONFLICT` / `UNSURE`。`note` ≤30 字，说明范围差异。
 **UNSURE 按 NOT_CONFLICT 处理**，但 Critical 级的 UNSURE 保留并标注"待人工确认"。
 
-append-only 是断点续跑的前提：重启时读已完成的 `conflict_id` 集合，只处理剩余项。
+**一批一个文件**（题面来自 `conflicts/batches/adjudicate-bNN.json`）：各批可以并行，
+而并行时往同一个文件 append 会在中断处互相截断。`adjudicate_pass4.py collect`
+把它们归并成下游唯一认的 `work/conflicts-verified.jsonl`（同样的 schema），
+并报出 `missing`（有候选没裁定）与 `invalid_lines`（格式不对，**不按 UNSURE 收下**）。
+分文件 + 幂等 collect 是断点续跑的前提：只补跑缺的批次即可。
+
+## verify/pass2-<排列>.vNN.verdicts.jsonl（闸门④输出 ← 你写这个）
+
+```json
+{"id":"3b1089d0a7737959","answer":"A"}
+```
+
+题面来自同名的 `pass2-<排列>.vNN.json`，一批一个文件、各批独立可并行，
+裁定写回同名的 `.verdicts.jsonl`。`verify_pass2.py merge` 会把所有分批文件一起读进来。
+**`.key.json` 不要读**——它记的是原文在哪一侧。
 
 ---
 

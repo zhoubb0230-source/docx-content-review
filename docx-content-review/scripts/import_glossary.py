@@ -33,7 +33,7 @@ from _common import (  # noqa: E402
     EX, atomic_write_json, die, emit, normalize_key, read_json, read_jsonl, run_cli,
     sha256_file, sha256_text, version_header,
 )
-from workspace import guard_write_path, load_config, resolve_path  # noqa: E402
+from workspace import guard_write_path, load_run_config, resolve_path  # noqa: E402
 
 PRIORITY = {"authoritative": 1, "extracted": 2, "fallback": 3}
 SPLIT_CHARS = [";", "；", "|", "，", ","]
@@ -252,7 +252,8 @@ def main(argv: list[str]) -> int:
     ap.add_argument("--config")
     ap.add_argument("--inspect", help="只解析该文件并报告，不写盘")
     args = ap.parse_args(argv)
-    cfg = load_config(args.config)
+    run_dir = Path(args.run_dir).resolve() if args.run_dir else None
+    cfg = load_run_config(run_dir, args.config)
     g = cfg.get("glossary") or {}
     defaults = {k: str(v) for k, v in (g.get("enforce_defaults") or {}).items()}
 
@@ -261,9 +262,8 @@ def main(argv: list[str]) -> int:
         emit({"ok": True, "entries": len(entries), "sample": entries[:5]})
         return EX.OK
 
-    if not args.run_dir:
+    if run_dir is None:
         die(EX.USAGE, "缺少 --run-dir")
-    run_dir = Path(args.run_dir).resolve()
 
     srcs = g.get("sources") or {}
     auth_path = args.authoritative or srcs.get("authoritative")

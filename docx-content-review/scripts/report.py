@@ -27,7 +27,7 @@ from _common import (  # noqa: E402
     version_header,
 )
 from workspace import (  # noqa: E402
-    deliver_meta, deliver_path, guard_write_path, load_config, resolve_path,
+    deliver_meta, deliver_path, guard_write_path, load_run_config, resolve_path,
 )
 
 SEV_ORDER = {"Critical": 0, "High": 1, "Medium": 2, "Low": 3}
@@ -442,7 +442,7 @@ def main(argv: list[str]) -> int:
     ap.add_argument("--config")
     args = ap.parse_args(argv)
     run_dir = Path(args.run_dir).resolve()
-    cfg = load_config(args.config)
+    cfg = load_run_config(run_dir, args.config)
 
     out_cfg = cfg.get("output") or {}
     rows = load_rows(run_dir, cfg)

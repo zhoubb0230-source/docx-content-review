@@ -37,7 +37,7 @@ from _common import (  # noqa: E402
     EX, atomic_write_json, atomic_write_jsonl, emit, levenshtein, read_json, read_jsonl,
     run_cli, version_header,
 )
-from workspace import SKILL_ROOT, guard_write_path, load_config, resolve_path  # noqa: E402
+from workspace import SKILL_ROOT, guard_write_path, load_run_config, resolve_path  # noqa: E402
 
 DICT_DIR = SKILL_ROOT / "assets" / "dict"
 
@@ -256,7 +256,7 @@ def main(argv: list[str]) -> int:
         emit({"ok": res["ok"], **res})
         return EX.OK if res["ok"] else EX.PARSE
     run_dir = Path(args.run_dir).resolve()
-    cfg = load_config(args.config)
+    cfg = load_run_config(run_dir, args.config)
     if args.cmd == "scan":
         emit({"ok": True, **scan(run_dir, cfg, args.chunk)})
     else:

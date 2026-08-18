@@ -29,7 +29,7 @@ from _common import (  # noqa: E402
 )
 from workspace import (  # noqa: E402
     chunk_done, claim_path, guard_write_path, lease_heartbeat, lease_status, lease_verify,
-    list_chunk_ids, load_config, resolve_path,
+    list_chunk_ids, load_run_config, resolve_path,
 )
 
 
@@ -195,7 +195,7 @@ def main(argv: list[str]) -> int:
     args = ap.parse_args(argv)
 
     run_dir = Path(args.run_dir).resolve()
-    cfg = load_config(getattr(args, "config", None))
+    cfg = load_run_config(run_dir, getattr(args, "config", None))
     if args.cmd == "rebuild":
         emit({"ok": True, **rebuild(run_dir, cfg)})
     elif args.cmd == "stats":

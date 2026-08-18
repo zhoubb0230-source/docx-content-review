@@ -35,7 +35,7 @@ from _common import (  # noqa: E402
     EX, atomic_write_json, atomic_write_jsonl, die, emit, normalize_ws, read_json,
     read_jsonl, run_cli, sha256_text, version_header,
 )
-from workspace import guard_write_path, load_config, resolve_path  # noqa: E402
+from workspace import guard_write_path, load_run_config, resolve_path  # noqa: E402
 
 ARRANGEMENTS = ("primary", "mirror")
 AB_CLASSES = {"A1", "A2", "A3", "A4", "A5", "A6", "A7", "A8", "L25", "L26"}
@@ -191,9 +191,25 @@ def build(run_dir: Path, cfg: dict, arrangement: str) -> dict:
     atomic_write_json(ppath, payload)
     atomic_write_json(kpath, {**version_header(), "arrangement": arrangement,
                               "ab_seed": seed, "key": key})
+
+    # 每批单独落一个文件。合并文件（上面那个）留着备查，但**发起调用时不要用它**：
+    # 一份 800 页文档能出几百条待复核项，整份读进上下文之后，后面每一轮工具往返
+    # 都要把它重算一遍。分批落盘之后每个子 Agent 只读自己那一批，
+    # 而且各批之间没有任何依赖——闸门④天然可以并行。
+    for old_batch in vdir.glob(f"pass2-{arrangement}.v*.json"):
+        old_batch.unlink()                       # 批数可能变少，先清再写
+    for b in batches:
+        bp = vdir / f"pass2-{arrangement}.{b['batch_id']}.json"
+        guard_write_path(bp, run_dir)
+        atomic_write_json(bp, {**version_header(), "arrangement": arrangement,
+                               "batch_id": b["batch_id"], "items": b["items"]})
     return {"arrangement": arrangement, "candidates": len(rows), "items": len(items),
             "batches": len(batches), "payload": str(ppath),
-            "note": "payload 不含原文在哪一侧的信息；对照表在 .key.json，发起调用时不要带上它"}
+            "batch_dir": str(vdir),
+            "batch_pattern": f"pass2-{arrangement}.v<NN>.json",
+            "verdict_pattern": f"pass2-{arrangement}.v<NN>.verdicts.jsonl",
+            "note": "按批发起调用：每批一个 pass2-<排列>.vNN.json，裁定写同名 .verdicts.jsonl；"
+                    "payload 不含原文在哪一侧的信息，对照表在 .key.json，调用时不要带上它"}
 
 
 # --------------------------------------------------------------------------
@@ -220,20 +236,41 @@ def _single_verdict(answer: str) -> tuple[str, str]:
     return "drop", "UNSURE 一律按 NO 处理（不确定即无问题）"
 
 
+def verdict_files(vdir: Path, arrangement: str) -> list[Path]:
+    """并行复核的产物是每批一个裁定文件；单文件写法照旧支持。
+
+    两种都收：`pass2-<排列>.verdicts.jsonl`（一个子 Agent 全揽）与
+    `pass2-<排列>.vNN.verdicts.jsonl`（每批一个）。并行时**必须各写各的文件**——
+    多个子 Agent 往同一个文件 append，中断处会互相截断，而 JSONL 的坏行是静默丢失。
+    """
+    out = []
+    single = vdir / f"pass2-{arrangement}.verdicts.jsonl"
+    if single.exists():
+        out.append(single)
+    out += sorted(vdir.glob(f"pass2-{arrangement}.v*.verdicts.jsonl"))
+    return out
+
+
+def read_answers(vdir: Path, arrangement: str) -> dict:
+    answers = {}
+    for path in verdict_files(vdir, arrangement):
+        for v in read_jsonl(path):
+            if v.get("id"):
+                answers[v["id"]] = v.get("answer")
+    return answers
+
+
 def merge(run_dir: Path, cfg: dict, arrangement: str) -> dict:
     vdir = resolve_path(run_dir, "verify")
     kpath = vdir / f"pass2-{arrangement}.key.json"
-    vpath = vdir / f"pass2-{arrangement}.verdicts.jsonl"
     if not kpath.exists():
         die(EX.PARSE, f"对照表不存在：{kpath}", "先跑 verify_pass2.py build。")
-    if not vpath.exists():
-        die(EX.PARSE, f"裁定结果不存在：{vpath}",
+    files = verdict_files(vdir, arrangement)
+    if not files:
+        die(EX.PARSE, f"裁定结果不存在：{vdir}/pass2-{arrangement}[.vNN].verdicts.jsonl",
             "按 references/prompts/pass2-verify.md 逐 batch 复核后写入该文件。")
     key = (read_json(kpath, {}) or {}).get("key") or {}
-    answers = {}
-    for v in read_jsonl(vpath):
-        if v.get("id"):
-            answers[v["id"]] = v.get("answer")
+    answers = read_answers(vdir, arrangement)
 
     rows, counters = [], {"pass": 0, "drop": 0, "not_reviewed": 0, "missing_verdict": 0}
     for rec in collect(run_dir, cfg):
@@ -265,7 +302,8 @@ def merge(run_dir: Path, cfg: dict, arrangement: str) -> dict:
     out = resolve_path(run_dir, "issues_verified")
     guard_write_path(out, run_dir)
     atomic_write_jsonl(out, rows)
-    return {"arrangement": arrangement, "total": len(rows), "output": str(out), **counters}
+    return {"arrangement": arrangement, "total": len(rows), "output": str(out),
+            "verdict_files": len(files), **counters}
 
 
 def consistency(run_dir: Path, cfg: dict) -> dict:
@@ -278,17 +316,17 @@ def consistency(run_dir: Path, cfg: dict) -> dict:
     res: dict[str, dict] = {}
     for arr in ARRANGEMENTS:
         key = (read_json(vdir / f"pass2-{arr}.key.json", {}) or {}).get("key") or {}
-        vp = vdir / f"pass2-{arr}.verdicts.jsonl"
-        if not key or not vp.exists():
+        answers = read_answers(vdir, arr)
+        if not key or not answers:
             die(EX.PARSE, f"{arr} 排列的产物不全",
                 "两种排列都要跑一遍 build + 复核，才能算一致率。")
         got = {}
-        for v in read_jsonl(vp):
-            k = key.get(v.get("id") or "")
+        for iid, ans in answers.items():
+            k = key.get(iid)
             if not k:
                 continue
-            got[v["id"]] = (_ab_verdict(v.get("answer"), k["orig_side"])[0]
-                            if k["form"] == "ab" else _single_verdict(v.get("answer"))[0])
+            got[iid] = (_ab_verdict(ans, k["orig_side"])[0]
+                        if k["form"] == "ab" else _single_verdict(ans)[0])
         res[arr] = got
 
     shared = sorted(set(res["primary"]) & set(res["mirror"]))
@@ -318,7 +356,7 @@ def main(argv: list[str]) -> int:
     p.add_argument("--config")
     args = ap.parse_args(argv)
     run_dir = Path(args.run_dir).resolve()
-    cfg = load_config(args.config)
+    cfg = load_run_config(run_dir, args.config)
     if args.cmd == "build":
         emit({"ok": True, **build(run_dir, cfg, args.arrangement)})
     elif args.cmd == "merge":

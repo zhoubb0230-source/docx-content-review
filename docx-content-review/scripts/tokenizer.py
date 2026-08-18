@@ -54,7 +54,13 @@ def available() -> bool:
 
 
 def _estimate(text: str) -> float:
-    """保守基线：CJK 逐字 1 token，其余字符按 0.4 token 折算。"""
+    """保守基线：CJK 逐字 1 token，其余字符按 0.4 token 折算。
+
+    真实 tokenizer 对中文约 1 token / 1.4–1.7 字，所以「逐字 1 token」本身
+    已经保守了 40% 以上。`token_fallback_ratio` 是在这个基线之上再加的安全系数，
+    默认 1.0——它曾经是 1.6，等于一个汉字算 1.6 token，高估约 2.4 倍，
+    直接把分片数抬高 2–3 倍，而分片数就是 Pass 1 的调用数与工具轮次数。
+    """
     cjk = 0
     for ch in text:
         o = ord(ch)

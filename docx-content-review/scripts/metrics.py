@@ -29,7 +29,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from _common import (  # noqa: E402
     EX, atomic_write_json, emit, read_json, read_jsonl, run_cli, version_header,
 )
-from workspace import deliver_path, guard_write_path, load_config, resolve_path  # noqa: E402
+from workspace import deliver_path, guard_write_path, load_run_config, resolve_path  # noqa: E402
 
 COUNTER_PATH = "work/llm-usage.json"
 
@@ -181,7 +181,7 @@ def main(argv: list[str]) -> int:
         u = bump(run_dir, args.pass_name, args.input_tokens, args.output_tokens, args.retry)
         emit({"ok": True, "calls": u["calls"], "tokens": u["tokens"]})
     elif args.cmd == "collect":
-        m = collect(run_dir, load_config(args.config))
+        m = collect(run_dir, load_run_config(run_dir, args.config))
         emit({"ok": True, "gates": m["gates"], "gate_rates": m["gate_rates"],
               "actions": m["actions"], "path": str(deliver_path(run_dir, "metrics"))})
     else:

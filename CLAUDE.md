@@ -46,7 +46,9 @@
 | **新增/修改一个 A/B/C 类别** | `scripts/verify_span.py` 的 `edit_gate` | `references/taxonomy.md` + `prompts/pass1-review.md` + `tests/fixtures` |
 | **新增一条不改清单规则** | `scripts/filter_neverflag.py` 的 `check` | `references/never-flag.md` + 负样本 fixture |
 | 位置类规则（N9/N10/N12）的豁免边界 | `filter_neverflag.py` 的 `exempt_regions` | **必须往 `tests/fixtures/neverflag-traps.json` 补正反两向的句子** |
-| 闸门④盲测 A/B（拼装、判定表、一致率） | `scripts/verify_pass2.py` | `prompts/pass2-verify.md`；**改动必须重跑泄题检查** |
+| 闸门④盲测 A/B（拼装、判定表、一致率） | `scripts/verify_pass2.py` | `prompts/pass2-verify.md`；**改动必须重跑泄题检查（含分批 payload）** |
+| Pass 4 裁定的分批题面与归并、漏答报数 | `scripts/adjudicate_pass4.py` | `prompts/pass4-adjudicate.md` + `references/schemas.md` |
+| 分片预算、token 系数、重切片后作废旧产物 | `scripts/chunk.py` | `assets/config.default.yaml` 的 `chunking`；**改了预算必须重跑 chunk.py** |
 | **某个类别进不进交付物** | `verify_pass2.py` 的 `KEEP_SCOPE`（**不是** `REVIEW_SCOPE`） | `prompts/pass2-verify.md` 触发范围表 |
 | **新增一条 L 规则** | `scripts/detect_conflicts.py`（加 `RULES` 项 + `r_LNN` 函数） | `references/logic-rules.md` + `logic-injection.facts.json` + 回归断言 |
 | 事实台账字段 | `scripts/ledger.py` 的 `MAPPING` | `references/schemas.md` + `prompts/pass1-extract.md` |
@@ -119,7 +121,9 @@ ledger 重建幂等、术语表自检、修订回写、**D9 负向对照**、
 **批注锚定（每处修订带理由批注、范围覆盖完整正文 + 两条负向对照）**、令牌栅栏、报告产物、
 两条支线（错词表自检 + 负向语料对照 + 白名单陷阱零候选；范式规则包三条红线拒绝加载、
 P 类无建议文本、裁定 U 不成条目、三通道产物互不覆盖）、
-闸门④脚手架（payload 不泄题、排列可复现、判定表六条淘汰路径）。
+闸门④脚手架（payload 不泄题、排列可复现、判定表六条淘汰路径）、
+**分片预算与重切片后作废旧产物（含"不清就静默跳片"的负向对照）**、
+**闸门④与 Pass 4 的分批并行（分批不泄题、并行与串行判定逐字相同、漏答必须报数）**。
 
 **扩词表时记住**：左串不能是常见词组的碎片。「按全」会被「按全流程」拆出来——
 这类条目既抬误报又白耗裁定调用，让「扩表不抬高误报率」的前提失效。

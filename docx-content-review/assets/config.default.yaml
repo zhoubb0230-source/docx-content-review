@@ -11,17 +11,31 @@ strictness: balanced            # conservative | balanced | thorough
 apply_threshold: conservative   # 固定，不可放宽
 
 chunking:
-  max_context_tokens: 45000     # 切分判据：正文+指令+术语摘要+衔接+输出预留
+  max_context_tokens: 100000    # 切分判据：正文+指令+术语摘要+衔接+输出预留
+  # 每片正文上限。系数修正之后这个数字的含义变了：以前 15000 里有 2.4 倍的虚高，
+  # 实际只装得下约 9400 个汉字（约 23 页）；现在 15000 ≈ 15000 个汉字（约 37 页）。
+  # 想更快可以往上调（片数即调用数），但片越大模型的定位准确率越掉，
+  # 而定位准确率的优先级高于所有召回指标——不要为了提速把它调过 20000。
   max_text_tokens: 15000
   single_pass_limit: 22000
-  token_fallback_ratio: 1.6     # tokenizer 不可得时的保守系数
+  # tokenizer 不可得时的保守系数。_estimate 已经把 CJK 逐字记 1 token，
+  # 而真实 tokenizer 对中文约 1 token / 1.4–1.7 字，逐字记 1 本身就保守了 40%+。
+  # 再乘 1.6 等于一个汉字算 1.6 token —— 高估约 2.4 倍，直接把片数抬高 2–3 倍，
+  # 而片数就是 Pass 1 的调用数与工具轮次数。实测 21 万字的文档被切成 31 片，
+  # 真实 token 只有约 14 万，每片正文只装了 45k 上下文预算的 10%。
+  token_fallback_ratio: 1.0
   overlap_paragraphs: 2
-  max_issues_per_chunk: 20
-  min_b_class_slots: 5          # 截断时为 B 类保留的下限席位。A 类恒 High、B 类恒 Medium，
+  # 遇到 H2/H3 且本片已装到这个比例时就断开，让分片对齐章节。
+  # 0.5 意味着平均每片只装了七成预算——章节多的文档会因此多切出三分之一的片。
+  split_point_fill_ratio: 0.7
+  # 片变大时这个上限必须同步变大：它是截断源，不是"每片就这么多问题"。
+  # 片大 2.5 倍而上限不动 = 拿召回换速度，与优先级排序相悖。
+  max_issues_per_chunk: 40
+  min_b_class_slots: 10         # 截断时为 B 类保留的下限席位。A 类恒 High、B 类恒 Medium，
                                 # 纯按 severity 截断会让 B 类被 A 类整组挤掉（同 §9.7 的配额挤占）
   instruction_tokens: 9000      # 技能指令 + 类型体系 + 不改清单
-  glossary_tokens: 4000         # 术语表摘要预算
-  output_reserve_tokens: 12000  # 输出预留
+  glossary_tokens: 4000         # 术语表摘要预算；**没有术语表时 chunk.py 按 0 计**
+  output_reserve_tokens: 8000   # 输出预留
   table_only_text_ratio: 0.10   # 正文段落占比低于此值即判为纯表格片
 
 logic:
@@ -32,14 +46,15 @@ logic:
   # 报告的「本次未覆盖范围」会写明这一维度没查。改成 true 即恢复，不需要改代码。
   term_rules: false
   gap_ratio: 3                  # L27 目标值与实测值差异倍数阈值
+  adjudicate_batch_size: 10     # Pass 4 每批裁定的候选组数（adjudicate_pass4.py build）
   coverage_rules_to_comment: false   # L29–L32 默认只进报告
   percent_tolerance: 0.5        # L09 百分比合计容差
   entity_similar_distance: 2    # L04 写法相近判定的编辑距离上限
 
 typo_check:
   enabled: true                 # 独立通道：脚本出候选 → LLM 二选一裁定 → 过闸门②③
-  max_typos_per_chunk: 100      # 独立配额，不占用 max_issues_per_chunk
-  batch_size: 50
+  max_typos_per_chunk: 200      # 独立配额，不占用 max_issues_per_chunk
+  batch_size: 100
   require_llm_adjudication: true # 脚本候选不得直接生成修订
   # 未登录词检测（切词后查不到的词即可疑）需 5 万词级词表才有信噪比，
   # 内置词表远未达到该规模，故不启用。召回率上限 = common-typos.txt 的覆盖范围。
@@ -49,7 +64,7 @@ pattern_review:                 # P 类：特定场景的描述范式审查
   enabled: false                # 默认关闭；无规则包时即使打开也自动跳过
   use_builtin: true             # 加载 assets/patterns/*.yaml（内置的是示例，可删）
   packs: []                     # 额外规则包路径；--patterns 可追加，同 id 后者覆盖前者
-  max_pattern_issues_per_chunk: 20  # 独立配额，不占用 max_issues_per_chunk
+  max_pattern_issues_per_chunk: 40  # 独立配额，不占用 max_issues_per_chunk
   batch_size: 20
   # P 类的跨度上限，独立于 verification.max_span_chars（0 = 不限）。
   # 后者的判据是「跨度太长说明模型在圈整段」，而 P 类的 original_text 按设计就是整段——
@@ -102,11 +117,15 @@ workspace:
 
 concurrency:
   parallelism: 5                # subAgent 工作池大小，建议上限 8，由压测确定
-  renew_claim_on_llm_call: true # 退避可能超出 claim TTL，调用前后必须续期
+  # 「每次调用前后都续期」在一个子 Agent 连做多片时是必要的，但那个模型本身已废弃：
+  # 现在一个子 Agent 只做一片、做完即退，claim 的生命周期就是这一片，
+  # 6 次续期换来的只是 6 轮工具往返（每轮都要重算整个上下文）。
+  # TTL 同步从 20 分钟抬到 60 分钟覆盖单片全程。
+  renew_claim_on_llm_call: false
   pipeline_pass2: false         # v1 不做 Pass1/Pass2 流水线并行
   allow_collaboration: true     # 允许多会话分工处理同一文档（§11.3）
   lease_minutes: 30             # 独占租约 TTL（心跳续租，不基于 pid）
-  chunk_claim_minutes: 20       # 分片 claim TTL
+  chunk_claim_minutes: 60       # 分片 claim TTL（覆盖单片全程：三次调用 + 闸门）
   require_local_fs: true        # 非本地文件系统时关闭协作，fail-closed
   on_conflict: ask              # ask | join | refuse
 

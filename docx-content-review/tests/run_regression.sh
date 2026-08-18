@@ -737,9 +737,18 @@ sys.exit(0 if json.load(open(sys.argv[1],encoding="utf-8"))["dropped"]==0 else 1
 PYEOF
 check "闸门③ 未用词级规则误杀 P 类条目" "$?" 0
 
-# 关掉开关后必须彻底静默（默认配置即为关闭）
-PD=$(python3 "$S/scan_patterns.py" scan --run-dir "$RUN3")
+# 关掉开关后必须彻底静默
+printf 'pattern_review:\n  enabled: false\n' > "$WORK/tp/off.yaml"
+PD=$(python3 "$S/scan_patterns.py" scan --run-dir "$RUN3" --config "$WORK/tp/off.yaml")
 check "pattern_review 关闭时不产生任何候选" "$(echo "$PD" | jget "['candidates']")" 0
+
+# 不带 --config 时读的是**本次 run 的配置快照**，不是默认配置。
+# 这个 run 是带 pattern_review: true 初始化的，所以照样出 4 条候选。
+# 旧行为是回落到默认配置 → 同一个 run 里 chunk.py 按新预算切、verify_span.py 按旧上限截，
+# 两边都不报错，只是结果对不上。
+PD2=$(python3 "$S/scan_patterns.py" scan --run-dir "$RUN3")
+check "缺省 --config 时按 run 的配置快照生效（不是默认配置）" \
+      "$(echo "$PD2" | jget "['candidates']")" 4
 
 echo
 echo "══ 10. 截断的类别偏差与答案清单的闸门期望 ══"
@@ -1223,7 +1232,7 @@ from pathlib import Path
 sys.path.insert(0, sys.argv[1])
 import filter_neverflag as nf
 nf._span_range = lambda ptext, span: None      # 定位不到即退回旧的整段语义
-res = nf.traps(Path(sys.argv[2]), nf.load_config(None))
+res = nf.traps(Path(sys.argv[2]), nf.load_run_config(None))
 for p in res["problems"][:3]:
     print("   ", p)
 sys.exit(0 if (not res["ok"] and len(res["problems"]) >= 5) else 1)
@@ -1235,7 +1244,7 @@ python3 - "$S" <<'PYEOF'
 import sys
 sys.path.insert(0, sys.argv[1])
 import filter_neverflag as nf
-cfg = nf.load_config(None)
+cfg = nf.load_run_config(None)
 def hit(para, span, cat="A2"):
     return nf.check({"original_text": span, "category": cat, "suggested_text": ""},
                     {"text": para}, cfg, {}, [], set())
@@ -1530,6 +1539,275 @@ if bak is not None: cv.write_text(bak, encoding="utf-8")
 assert not bad, f"{len(bad)} 条未写进文档的候选被记成了「{bad[0]['action']}」"
 PYEOF
 check "未准入的冲突候选记为 report_only（不虚报批注数）" "$?" 0
+
+echo
+echo "══ 20. 分片预算：虚高的 token 系数与重切片后的陈旧产物 ══"
+
+# 造一份与真实压测同形的正文（约 6 万字、H2 密集），直接写 paragraphs.jsonl——
+# chunk.py 只吃它，不需要真做一份 800 页的 docx。
+mkdir -p "$WORK/big"
+cp "$F/sample-basic.docx" "$WORK/big/big.docx"
+RUN5=$(python3 "$S/workspace.py" init --source "$WORK/big/big.docx" \
+       --output-dir "$DELIVER" --temp-dir "$TEMP" | jget "['run_dir']")
+python3 "$S/unpack.py" run --run-dir "$RUN5" >/dev/null
+python3 "$S/extract.py" --run-dir "$RUN5" >/dev/null
+python3 - "$RUN5" <<'PYEOF'
+import json,pathlib,random,sys
+run=pathlib.Path(sys.argv[1]); random.seed(7)
+body="本系统在设计上采用分层架构，各层之间通过标准接口交互，确保模块可替换与可测试。"
+rows=[]; i=0; chars=0; sec=0
+while chars < 60000:
+    i+=1
+    if i%14==1:
+        sec+=1; t=f"{sec} 第 {sec} 章 模块设计与接口约定"
+        rows.append({"pid":f"p-{i:06d}","index":i,"heading_path":[t],"level":2,
+                     "is_heading":True,"style":"Heading2","style_name":"heading 2","text":t,
+                     "char_len":len(t),"in_table":False,"table_id":None,"row_idx":None,
+                     "cell_idx":None,"is_list":False,"is_code":False,"is_quote":False,
+                     "page_hint":1+chars//265,"page_estimated":True})
+        chars+=len(t); continue
+    t=(body*7)[:random.randint(120,320)]
+    rows.append({"pid":f"p-{i:06d}","index":i,"heading_path":[f"{sec} 第 {sec} 章 模块设计与接口约定"],
+                 "level":None,"is_heading":False,"style":"Normal","style_name":"Normal","text":t,
+                 "char_len":len(t),"in_table":False,"table_id":None,"row_idx":None,"cell_idx":None,
+                 "is_list":False,"is_code":False,"is_quote":False,"page_hint":1+chars//265,
+                 "page_estimated":True})
+    chars+=len(t)
+(run/"work"/"paragraphs.jsonl").write_text(
+    "".join(json.dumps(r,ensure_ascii=False)+"\n" for r in rows),encoding="utf-8")
+PYEOF
+
+# 旧参数：系数 1.6（一个汉字算 1.6 token）+ 无条件扣掉术语摘要预算 + 切点比例 0.5
+cat > "$WORK/big/legacy.yaml" <<'YAML'
+chunking:
+  max_context_tokens: 45000
+  max_text_tokens: 15000
+  token_fallback_ratio: 1.6
+  glossary_tokens: 4000
+  output_reserve_tokens: 12000
+  split_point_fill_ratio: 0.5
+YAML
+OLDN=$(python3 "$S/chunk.py" --run-dir "$RUN5" --config "$WORK/big/legacy.yaml" | jget "['chunks']")
+NEWN=$(python3 "$S/chunk.py" --run-dir "$RUN5" | jget "['chunks']")
+# 片数就是 Pass 1 的调用数（每片三次调用）与工具轮次数，是本次提速的主项
+python3 -c "import sys;sys.exit(0 if $OLDN >= $NEWN*15//10 else 1)"
+check "同一份正文：新预算的片数比旧参数少三分之一以上（$OLDN → $NEWN）" "$?" 0
+
+# 没有术语表时不得从预算里扣术语摘要（term_rules 默认关闭，那 4000 是白扣的）
+python3 - "$S" <<'PYEOF'
+import sys
+sys.path.insert(0, sys.argv[1])
+import chunk as ck, workspace as ws
+cfg=ws.load_config(None)
+no_g, with_g = ck.overhead_tokens(cfg, False), ck.overhead_tokens(cfg, True)
+gl=int(cfg["chunking"]["glossary_tokens"])
+assert with_g - no_g == gl, f"术语摘要预算未随术语表存在与否变化：{no_g} / {with_g}"
+assert no_g == cfg["chunking"]["instruction_tokens"] + cfg["chunking"]["output_reserve_tokens"]
+PYEOF
+check "无术语表时不扣术语摘要预算" "$?" 0
+
+# 重新分片 = 旧产物作废。不清的话「文件存在性即状态」会让新的第 1 片被判为已完成，
+# 而那部分正文再也不会被看到，输出里没有任何痕迹。
+seed_products() { python3 - "$RUN5" <<'PYEOF'
+import json,pathlib,sys
+run=pathlib.Path(sys.argv[1])
+(run/"work"/"issues").mkdir(parents=True,exist_ok=True)
+(run/"work"/"facts").mkdir(parents=True,exist_ok=True)
+(run/"work"/"typos").mkdir(parents=True,exist_ok=True)
+(run/"work"/"issues"/"issues-0001.jsonl").write_text("",encoding="utf-8")
+(run/"work"/"issues"/"issues-0001.raw.jsonl").write_text("",encoding="utf-8")
+(run/"work"/"issues"/"issues-0001.typos.jsonl").write_text("",encoding="utf-8")
+(run/"work"/"facts"/"facts-0001.json").write_text("{}",encoding="utf-8")
+(run/"work"/"typos"/"typos-0001.json").write_text("{}",encoding="utf-8")
+PYEOF
+}
+seed_products
+# 同配置重跑必须是幂等的：一个产物都不许动（断点续跑的前提）
+IDEM=$(python3 "$S/chunk.py" --run-dir "$RUN5" | jget "['stale_chunks_cleared']")
+check "同配置重跑不清任何产物（幂等）" "$IDEM" 0
+check "幂等重跑后产物仍在" \
+  "$([ -f "$RUN5/work/facts/facts-0001.json" ] && echo yes || echo no)" yes
+
+cat > "$WORK/big/small.yaml" <<'YAML'
+chunking:
+  max_text_tokens: 3000
+YAML
+CLR=$(python3 "$S/chunk.py" --run-dir "$RUN5" --config "$WORK/big/small.yaml" | jget "['stale_chunks_cleared']")
+ge "换切法后作废的分片数" "$CLR" 1
+check "陈旧的 facts 已作废" \
+  "$([ -f "$RUN5/work/facts/facts-0001.json" ] && echo no || echo yes)" yes
+check "陈旧的 issues（含两条支线）已作废" \
+  "$(ls "$RUN5/work/issues" 2>/dev/null | grep -c 'issues-0001') " "0 "
+DONE=$(python3 "$S/workspace.py" claim status --run-dir "$RUN5" --session s-clr | jget "['done']")
+check "重切片后没有分片被误判为已完成" "$DONE" 0
+
+# 负向对照：把清理关掉，同一个现场必须立刻退化成「静默跳片」
+python3 - "$S" "$RUN5" "$WORK/big/small.yaml" <<'PYEOF'
+import json,pathlib,sys
+sys.path.insert(0, sys.argv[1])
+import chunk as ck, workspace as ws
+run=pathlib.Path(sys.argv[2])
+for p,c in ((run/"work"/"issues"/"issues-0001.jsonl",""),
+            (run/"work"/"facts"/"facts-0001.json","{}")):
+    p.parent.mkdir(parents=True,exist_ok=True); p.write_text(c,encoding="utf-8")
+ck.clear_stale_products = lambda run_dir, stale: 0          # 关掉清理
+ck.build(run, ws.load_config(sys.argv[3]))                  # 换成另一种切法
+done = ws.chunk_done(run, "0001")
+print("    关掉清理后 chunk-0001 被判为已完成" if done else "    未复现")
+sys.exit(0 if done else 1)
+PYEOF
+check "负向对照：不清陈旧产物即静默跳片（说明这项断言咬得住）" "$?" 0
+
+echo
+echo "══ 21. 闸门④按批落盘：可并行，且并行不改变判定 ══"
+
+# RUN4 在第 11 节已经 build 过并写了一份「单文件」裁定，先记下它的判定结果作为基准
+python3 "$S/verify_pass2.py" build --run-dir "$RUN4" >/dev/null
+BN=$(python3 "$S/verify_pass2.py" build --run-dir "$RUN4" | jget "['batches']")
+V4="$RUN4/work/verify"
+check "分批 payload 文件数与批数一致" "$(ls "$V4" | grep -c '^pass2-primary\.v[0-9]*\.json$')" "$BN"
+
+# 分批文件同样不许泄题：批内不含侧别信息，且答案不在同批任何一条上下文里
+python3 - "$RUN4" <<'PYEOF'
+import glob,json,sys
+bad=[]
+for f in sorted(glob.glob(f"{sys.argv[1]}/work/verify/pass2-primary.v*.json")):
+    raw=open(f,encoding="utf-8").read()
+    for k in ("orig_side","suggested_text","category","severity","evidence","key"):
+        if k in raw: bad.append(f"{f.split('/')[-1]} 含字段 {k}")
+    d=json.load(open(f,encoding="utf-8"))
+    whole=" ".join(x.get("context") or "" for x in d["items"])
+    for x in d["items"]:
+        if x["form"]=="ab" and (x["A"] in whole or x["B"] in whole):
+            bad.append(f"{d['batch_id']} 的选项出现在同批上下文里")
+for b in bad[:5]: print("   ", b)
+sys.exit(1 if bad else 0)
+PYEOF
+check "分批 payload 不泄题" "$?" 0
+
+python3 "$S/verify_pass2.py" merge --run-dir "$RUN4" >/dev/null
+HS=$(sha256sum "$RUN4/work/issues-verified.jsonl" | cut -d' ' -f1)
+
+# 把那份单文件裁定按批拆开（模拟 N 个子 Agent 各写各的），判定结果必须逐字相同
+python3 - "$RUN4" <<'PYEOF'
+import glob,json,pathlib,sys
+V=pathlib.Path(sys.argv[1],"work","verify")
+ans={json.loads(l)["id"]:json.loads(l)["answer"]
+     for l in open(V/"pass2-primary.verdicts.jsonl",encoding="utf-8")}
+for f in sorted(glob.glob(str(V/"pass2-primary.v*.json"))):
+    d=json.load(open(f,encoding="utf-8"))
+    rows=[{"id":x["id"],"answer":ans[x["id"]]} for x in d["items"] if x["id"] in ans]
+    (V/f"pass2-primary.{d['batch_id']}.verdicts.jsonl").write_text(
+        "".join(json.dumps(r,ensure_ascii=False)+"\n" for r in rows),encoding="utf-8")
+(V/"pass2-primary.verdicts.jsonl").unlink()      # 只留分批文件
+PYEOF
+MP=$(python3 "$S/verify_pass2.py" merge --run-dir "$RUN4")
+ge "分批裁定文件被全部读到" "$(echo "$MP" | jget "['verdict_files']")" "$BN"
+check "并行分批与单文件写法的判定逐字相同" \
+  "$([ "$(sha256sum "$RUN4/work/issues-verified.jsonl" | cut -d' ' -f1)" = "$HS" ] && echo yes || echo no)" yes
+
+# 少跑一批 = 那批全部缺裁定 → 必须整批淘汰（fail-closed），不能当成"没问题"放行
+LAST=$(ls "$V4" | grep '^pass2-primary\.v[0-9]*\.verdicts\.jsonl$' | tail -1)
+LOST=$(python3 -c "
+import json,sys;print(sum(1 for _ in open(sys.argv[1],encoding='utf-8')))" "$V4/$LAST")
+mv "$V4/$LAST" "$V4/$LAST.bak"
+MM=$(python3 "$S/verify_pass2.py" merge --run-dir "$RUN4")
+ge "漏跑一批时缺裁定条数" "$(echo "$MM" | jget "['missing_verdict']")" "$LOST"
+mv "$V4/$LAST.bak" "$V4/$LAST"
+python3 "$S/verify_pass2.py" merge --run-dir "$RUN4" >/dev/null
+
+echo
+echo "══ 22. Pass 4 分批裁定：候选不进主 Agent 上下文，漏答必须看得见 ══"
+
+# RUN2 是 logic-injection，已有全部冲突候选
+CVF2="$RUN2/work/conflicts-verified.jsonl"
+cp "$CVF2" "$WORK/cv2.bak" 2>/dev/null || true
+BB=$(python3 "$S/adjudicate_pass4.py" build --run-dir "$RUN2")
+NC=$(echo "$BB" | jget "['candidates']")
+NB=$(echo "$BB" | jget "['batches']")
+ge "候选被拼成批次" "$NB" 2
+check "分批文件数与批数一致" \
+  "$(ls "$RUN2/work/conflicts/batches" | grep -c '^adjudicate-b[0-9]*\.json$')" "$NB"
+
+# 题面只给两侧原文与位置。severity/action 属于"这条有多要紧"，会把模型往 CONFLICT 上带
+python3 - "$RUN2" "$NC" <<'PYEOF'
+import glob,json,sys
+run,total=sys.argv[1],int(sys.argv[2])
+groups=[]; bad=[]
+for f in sorted(glob.glob(f"{run}/work/conflicts/batches/adjudicate-b*.json")):
+    raw=open(f,encoding="utf-8").read()
+    for k in ("severity","action","chapter_span"):
+        if f'"{k}"' in raw: bad.append(f"题面含 {k}")
+    d=json.load(open(f,encoding="utf-8"))
+    groups+=d["groups"]
+    for g in d["groups"]:
+        if not g["sides"]: bad.append(f"{g['conflict_id']} 没有任何一侧原文")
+if len(groups)!=total: bad.append(f"分批后条数对不上：{len(groups)} vs {total}")
+if len({g["conflict_id"] for g in groups})!=total: bad.append("conflict_id 有重复")
+for b in bad[:5]: print("   ", b)
+sys.exit(1 if bad else 0)
+PYEOF
+check "题面完整、不重不漏、不含倾向性字段" "$?" 0
+
+# 全部裁定 CONFLICT → collect 归并 → 与直接写 conflicts-verified.jsonl 等效
+answer_all() { python3 - "$RUN2" "$1" "$2" <<'PYEOF'
+import glob,json,pathlib,sys
+run,verdict,skip=sys.argv[1],sys.argv[2],sys.argv[3]
+vdir=pathlib.Path(run,"work","conflicts","verdicts"); vdir.mkdir(parents=True,exist_ok=True)
+for f in vdir.glob("*.jsonl"): f.unlink()
+pathlib.Path(run,"work","conflicts-verified.jsonl").write_text("",encoding="utf-8")
+for f in sorted(glob.glob(f"{run}/work/conflicts/batches/adjudicate-b*.json")):
+    d=json.load(open(f,encoding="utf-8"))
+    if d["batch_id"]==skip: continue          # 模拟漏跑一批
+    (vdir/f"adjudicate-{d['batch_id']}.verdicts.jsonl").write_text(
+        "".join(json.dumps({"conflict_id":g["conflict_id"],"verdict":verdict,"note":"回归"},
+                           ensure_ascii=False)+"\n" for g in d["groups"]),encoding="utf-8")
+PYEOF
+}
+answer_all CONFLICT ""
+C1=$(python3 "$S/adjudicate_pass4.py" collect --run-dir "$RUN2")
+check "全部裁定后无漏答" "$(echo "$C1" | jget "['missing']")" 0
+check "归并条数 = 候选条数" "$(echo "$C1" | jget "['verdicts']")" "$NC"
+ge "裁定后有批注进文档" "$(python3 "$S/apply_comments.py" plan --run-dir "$RUN2" | jget "['comments']")" 5
+
+# collect 幂等：再跑一次不丢、不重
+H4=$(sha256sum "$CVF2" | cut -d' ' -f1)
+python3 "$S/adjudicate_pass4.py" collect --run-dir "$RUN2" >/dev/null
+check "collect 幂等" \
+  "$([ "$(sha256sum "$CVF2" | cut -d' ' -f1)" = "$H4" ] && echo yes || echo no)" yes
+
+# 漏跑一批：必须报出来。conflict_admitted 对未裁定是 fail-closed（对的），
+# 于是漏答表现为「这条冲突凭空消失」——不报数就没人会发现。
+answer_all CONFLICT b01
+C2=$(python3 "$S/adjudicate_pass4.py" collect --run-dir "$RUN2")
+ge "漏跑一批时报出缺裁定条数" "$(echo "$C2" | jget "['missing']")" 1
+python3 -c "import sys;sys.exit(0 if $(python3 "$S/apply_comments.py" plan --run-dir "$RUN2" | jget "['comments']") < $(echo "$C1" | jget "['verdicts']") else 1)"
+check "漏答的候选不进交付物" "$?" 0
+
+# 格式不对的裁定行不得被当成 UNSURE 收下——那是"模型拿不准"的待遇，
+# Critical 级的 UNSURE 还会被保留并标注，等于把一行乱码升格成一条冲突
+answer_all CONFLICT ""
+python3 - "$RUN2" <<'PYEOF'
+import glob,json,pathlib,sys
+run=sys.argv[1]
+f=sorted(glob.glob(f"{run}/work/conflicts/verdicts/*.jsonl"))[0]
+rows=[json.loads(l) for l in open(f,encoding="utf-8")]
+rows[0]["verdict"]="大概是矛盾吧"
+pathlib.Path(f).write_text("".join(json.dumps(r,ensure_ascii=False)+"\n" for r in rows),
+                           encoding="utf-8")
+PYEOF
+C3=$(python3 "$S/adjudicate_pass4.py" collect --run-dir "$RUN2")
+ge "无法解析的裁定行被计数" "$(echo "$C3" | jget "['invalid_lines']")" 1
+ge "无法解析 = 未裁定（计入缺裁定）" "$(echo "$C3" | jget "['missing']")" 1
+python3 - "$RUN2" <<'PYEOF'
+import json,sys
+bad=[json.loads(l) for l in open(f"{sys.argv[1]}/work/conflicts-verified.jsonl",encoding="utf-8")
+     if json.loads(l)["verdict"] not in ("CONFLICT","NOT_CONFLICT","UNSURE")]
+sys.exit(1 if bad else 0)
+PYEOF
+check "无法解析的裁定不写入交付入口" "$?" 0
+
+cp "$WORK/cv2.bak" "$CVF2" 2>/dev/null || true
 
 echo
 printf '通过 \033[32m%d\033[0m，失败 \033[31m%d\033[0m\n' "$PASS" "$FAIL"

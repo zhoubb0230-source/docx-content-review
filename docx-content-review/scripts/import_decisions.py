@@ -34,7 +34,7 @@ from _common import (  # noqa: E402
     EX, atomic_write_json, atomic_write_jsonl, die, emit, normalize_width, normalize_ws,
     now_iso, read_json, read_jsonl, run_cli, sha256_text,
 )
-from workspace import deliver_path, guard_write_path, load_config, resolve_path  # noqa: E402
+from workspace import deliver_path, guard_write_path, load_run_config, resolve_path  # noqa: E402
 
 SCHEMA_VERSION = "1"
 
@@ -163,7 +163,7 @@ def main(argv: list[str]) -> int:
     args = ap.parse_args(argv)
 
     run_dir = Path(args.run_dir).resolve()
-    cfg = load_config(args.config)
+    cfg = load_run_config(run_dir, args.config)
     if args.cmd == "import":
         emit({"ok": True, **cmd_import(run_dir, cfg, Path(args.xlsx) if args.xlsx else None)})
     elif args.cmd == "apply":

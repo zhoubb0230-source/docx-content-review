@@ -28,7 +28,7 @@ import tokenizer as tk  # noqa: E402
 from _common import (  # noqa: E402
     EX, atomic_write_json, emit, levenshtein, normalize_key, read_jsonl, run_cli, version_header,
 )
-from workspace import guard_write_path, load_config, resolve_path  # noqa: E402
+from workspace import guard_write_path, load_run_config, resolve_path  # noqa: E402
 
 CJK = r"㐀-鿿"
 SEG_RE = re.compile(f"[{CJK}]+")
@@ -252,7 +252,8 @@ def main(argv: list[str]) -> int:
     ap.add_argument("--run-dir", required=True)
     ap.add_argument("--config")
     args = ap.parse_args(argv)
-    emit({"ok": True, **scan(Path(args.run_dir).resolve(), load_config(args.config))})
+    run_dir = Path(args.run_dir).resolve()
+    emit({"ok": True, **scan(run_dir, load_run_config(run_dir, args.config))})
     return EX.OK
 
 

@@ -33,7 +33,7 @@ from _common import (  # noqa: E402
 )
 from ledger import connect  # noqa: E402
 from workspace import (  # noqa: E402
-    Heartbeat, guard_write_path, lease_verify, load_config, resolve_path,
+    Heartbeat, guard_write_path, lease_verify, load_run_config, resolve_path,
 )
 
 # 规则元数据：严重度 + 默认动作。动作是候选值，Pass 4 裁定后才最终确定。
@@ -1030,7 +1030,7 @@ def main(argv: list[str]) -> int:
     args = ap.parse_args(argv)
 
     run_dir = Path(args.run_dir).resolve()
-    cfg = load_config(args.config)
+    cfg = load_run_config(run_dir, args.config)
     doc_dir = run_dir.parent
     if args.session:
         lease_verify(doc_dir, args.session, args.generation)

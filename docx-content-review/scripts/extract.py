@@ -20,7 +20,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from _common import EX, atomic_write_json, atomic_write_jsonl, die, emit, run_cli, version_header  # noqa: E402
-from workspace import guard_write_path, load_config, resolve_path  # noqa: E402
+from workspace import guard_write_path, load_run_config, resolve_path  # noqa: E402
 
 W = "http://schemas.openxmlformats.org/wordprocessingml/2006/main"
 XML_SPACE = "{http://www.w3.org/XML/1998/namespace}space"
@@ -323,8 +323,9 @@ def main(argv: list[str]) -> int:
     ap.add_argument("--run-dir", required=True)
     ap.add_argument("--config")
     args = ap.parse_args(argv)
-    cfg = load_config(args.config)
-    emit({"ok": True, **extract(Path(args.run_dir).resolve(), cfg)})
+    run_dir = Path(args.run_dir).resolve()
+    cfg = load_run_config(run_dir, args.config)
+    emit({"ok": True, **extract(run_dir, cfg)})
     return EX.OK
 
 

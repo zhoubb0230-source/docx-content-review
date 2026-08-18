@@ -30,7 +30,7 @@ from _common import (  # noqa: E402
     EX, atomic_write_json, atomic_write_jsonl, die, emit, is_subsequence, levenshtein,
     normalize_ws, read_json, read_jsonl, run_cli,
 )
-from workspace import guard_write_path, load_config, resolve_path  # noqa: E402
+from workspace import guard_write_path, load_run_config, resolve_path  # noqa: E402
 
 SEVERITIES = ["Critical", "High", "Medium", "Low"]
 A_CLASSES = {"A1", "A2", "A3", "A4", "A5", "A6", "A7", "A8"}
@@ -372,7 +372,7 @@ def main(argv: list[str]) -> int:
     if not raw.exists():
         die(EX.PARSE, f"原始输出不存在：{raw}",
             "子 Agent 的 Pass 1 输出应先写入该路径（一行一条 JSON，无代码围栏）。")
-    emit({"ok": True, **process(run_dir, args.chunk, raw, load_config(args.config),
+    emit({"ok": True, **process(run_dir, args.chunk, raw, load_run_config(run_dir, args.config),
                                 Path(args.out) if args.out else None, args.cap)})
     return EX.OK
 

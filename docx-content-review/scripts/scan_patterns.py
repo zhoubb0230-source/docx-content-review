@@ -37,7 +37,7 @@ from _common import (  # noqa: E402
     EX, atomic_write_json, atomic_write_jsonl, die, emit, read_json, read_jsonl, run_cli,
     version_header,
 )
-from workspace import SKILL_ROOT, guard_write_path, load_config, resolve_path  # noqa: E402
+from workspace import SKILL_ROOT, guard_write_path, load_run_config, resolve_path  # noqa: E402
 
 PATTERN_DIR = SKILL_ROOT / "assets" / "patterns"
 SEVERITIES = ["Critical", "High", "Medium", "Low"]
@@ -339,7 +339,8 @@ def main(argv: list[str]) -> int:
     p.add_argument("--patterns", action="append")
     p.add_argument("--config")
     args = ap.parse_args(argv)
-    cfg = load_config(getattr(args, "config", None))
+    run_dir = Path(args.run_dir).resolve() if getattr(args, "run_dir", None) else None
+    cfg = load_run_config(run_dir, getattr(args, "config", None))
 
     if args.cmd == "lint":
         rules = load_packs(cfg, args.patterns)
@@ -350,7 +351,6 @@ def main(argv: list[str]) -> int:
                                     for r in rules)})
         return EX.OK
 
-    run_dir = Path(args.run_dir).resolve()
     if args.cmd == "scan":
         emit({"ok": True, **scan(run_dir, cfg, args.chunk, args.patterns)})
     else:

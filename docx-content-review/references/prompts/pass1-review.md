@@ -3,7 +3,8 @@
 调用参数：温度 0（或平台最低值），单次调用，无多轮对话。
 占位符：`{{TAXONOMY}}` 填 `references/taxonomy.md` 全文，`{{NEVER_FLAG}}` 填
 `references/never-flag.md` 全文，`{{GLOSSARY}}` 填术语表摘要（≤4k tokens），
-`{{CHUNK}}` 填 `work/chunks/chunk-<id>.txt`。
+`{{CHUNK}}` 填 `work/chunks/chunk-<id>.txt`，`{{MAX_ISSUES}}` 填
+`work/chunks/index.json` 的 `max_issues_per_chunk`（配置项同名，默认 40）。
 
 ---
 
@@ -31,7 +32,7 @@
 
 ## 硬性限制
 
-1. **本片最多上报 20 条。** 宁可只报 5 条确定的，也不要凑满 20 条。
+1. **本片最多上报 {{MAX_ISSUES}} 条。** 宁可只报 5 条确定的，也不要凑满上限。
 2. 标有 `【以下为上文参考】` 的区域**不在审查范围**，那里的 pid 不要出现在输出中。
 3. 标有 `«代码/命令/配置，不做语言审查»` 的行、以及 `[表格 T#]` 之下的内容，**一律不审查**。
 4. 不要做任何算术：数值是否对得上、条目数是否一致、百分比合计、编号是否连续，

@@ -35,7 +35,7 @@ from _common import (  # noqa: E402
     run_cli, version_header, warn,
 )
 from workspace import (  # noqa: E402
-    Heartbeat, guard_write_path, lease_verify, load_config, resolve_path,
+    Heartbeat, guard_write_path, lease_verify, load_run_config, resolve_path,
 )
 
 W = ox.W
@@ -522,7 +522,7 @@ def main(argv: list[str]) -> int:
     args = ap.parse_args(argv)
 
     run_dir = Path(args.run_dir).resolve()
-    cfg = load_config(args.config)
+    cfg = load_run_config(run_dir, args.config)
     if args.session:
         lease_verify(run_dir.parent, args.session, args.generation)
     if args.cmd == "plan":

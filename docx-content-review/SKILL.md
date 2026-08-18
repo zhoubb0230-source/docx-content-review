@@ -152,32 +152,68 @@ chunk.py --run-dir <run>
 
 判据是 token 不是页数。返回 `single_pass: true` 即单片模式。`table_only` 类型的分片**不发起审查调用**，只发起事实抽取调用。
 
-### 第 4 步：Pass 1　逐片审查与抽取（可并行）
+**片数就是工作量**：每片三次调用，全流程的耗时基本与片数成正比。返回里的
+`chunks` / `review_calls` 值得看一眼——一份 800 页的中文文档在默认配置下约 20 片。
+明显更多（比如 30 片以上）说明配置里的 `max_text_tokens` 被调小了，或者
+`split_point_fill_ratio` 太低（标题一多就断，每片只装了半程）。
 
-每个子 Agent 循环：
+**改了 `chunking` 下的任何参数，必须重跑这一步**，而且要看返回的
+`stale_chunks_cleared`：切法一变，旧的 `issues-<id>` / `facts-<id>` 就与新的
+同号分片对不上了，脚本会把它们作废。这个数不为 0 是正常的——那些片会重新审查。
+
+### 第 4 步：Pass 1　逐片审查与抽取（并行）
+
+**一个子 Agent 只做一片，做完就退出。** 不要让一个子 Agent 循环 claim 多片：
+子 Agent 的每一次工具往返都要重算它当下的全部上下文，而上下文会随做过的片数累积
+（实测连做 5 片后到 175k）。连做的开销是平方级的，一片一个只是重复读一遍
+类型体系与不改清单，便宜得多。
+
+主 Agent 每轮派 `parallelism` 个子 Agent，各领一片；本轮全部返回后再派下一轮，
+直到 `claim next` 返回 `exhausted: true`。**主 Agent 不做任何分配决策**，
+也不接收问题正文——子 Agent 只回 `{路径, 计数, 状态}`。
+
+子 Agent 拿到一片之后，**全程只需三轮工具调用**。轮次本身就是成本：
+每片有 20 多轮的旧写法里，只有 3 轮在做审查，其余全是记账，而每一轮都要重算上下文。
+
+**第一轮 · 领片**
 
 ```
 workspace.py claim next --run-dir <run> --session <sid> --generation <n>
-  → exhausted:true 就退出；否则拿到 chunk_id
+  → exhausted:true 就退出；否则拿到 chunk_id、chunk_type、以及本片的候选情况
 ```
 
-对该片发起**两次独立调用**（绝不合并成一次）：
+**第二轮 · 三次独立调用**（绝不合并成一次，理由见「中等能力模型适配」第 1 条）
 
 1. **审查**：`references/prompts/pass1-review.md` + `work/chunks/chunk-<id>.txt`
-   → 逐行写入 `work/issues/issues-<id>.raw.jsonl`
+   → `work/issues/issues-<id>.raw.jsonl`
 2. **事实抽取**：`references/prompts/pass1-extract.md` + 同一分片
-   → 写入 `work/facts/facts-<id>.json`
+   → `work/facts/facts-<id>.json`
+3. **错别字裁定**（该片有候选时才做，见第 4.5 步）→ `work/typos/typos-<id>.verdicts.jsonl`
 
-**每次调用前后都要续期 claim**（限流退避可能超过 TTL）：
-`workspace.py claim renew --run-dir <run> --chunk <id> --session <sid>`
+每次调用的输出**一次性整块写盘**（一个 heredoc 写完本次的全部行）。
+**不要逐行追加**——一行一次工具往返，一片 20 条就是 20 轮。
 
-然后过脚本闸门：
+`claim` 的 TTL（`chunk_claim_minutes`，默认 60 分钟）覆盖单片全程，
+正常情况下不需要续期。只有当某一片因限流退避明显卡住时，才补一次
+`workspace.py claim renew --run-dir <run> --chunk <id> --session <sid>`。
+
+**第三轮 · 过闸门**，用 `&&` 串成一条命令（顺序不能变；三条通道各过各的闸）：
 
 ```
-verify_span.py --run-dir <run> --chunk <id>       # 闸门②③，产出 issues-<id>.jsonl
-filter_neverflag.py --run-dir <run> --chunk <id>  # 幂等复查
-metrics.py bump --run-dir <run> --pass pass1_review --input-tokens N --output-tokens M
+verify_span.py --run-dir <run> --chunk <id> && \
+filter_neverflag.py --run-dir <run> --chunk <id> && \
+typo_scan.py merge --run-dir <run> --chunk <id> && \
+verify_span.py --run-dir <run> --chunk <id> \
+  --in work/issues/issues-<id>.typos.jsonl --out work/issues/issues-<id>.typos.jsonl --cap 200 && \
+filter_neverflag.py --run-dir <run> --chunk <id> --file work/issues/issues-<id>.typos.jsonl && \
+metrics.py bump --run-dir <run> --pass pass1_review
 ```
+
+（该片没有错别字候选时，去掉中间那三条。范式支线开启时按第 4.5 步再串三条。）
+
+`metrics.py bump` 的 `--input-tokens` / `--output-tokens` 是可选的：平台能报出用量就带上，
+报不出就不带——**不要为了填这两个数额外发起一次工具调用**，闸门丢弃率才是调 prompt 的依据，
+token 数只是成本旁证。
 
 输出无法解析成 JSONL 时**重试一次**，提示"上次输出无法解析"；二次失败：
 `state.py mark --run-dir <run> --chunk <id> --status failed --error "json parse error"`
@@ -187,32 +223,33 @@ metrics.py bump --run-dir <run> --pass pass1_review --input-tokens N --output-to
 ### 第 4.5 步：两条支线（错别字 / 范式）
 
 这两类问题都**不能靠主审查顺带发现**，各走独立通道：脚本出候选 → 模型答封闭题 →
-过同样的两道闸门。两条支线各有独立配额，不占用主审查每片 20 条。
+过同样的两道闸门。两条支线各有独立配额，不占用主审查每片的问题上限。
 
-与主审查是三次独立调用，**绝不合并**。支线可以和主审查在同一个 claim 周期里做完。
+与主审查是三次独立调用，**绝不合并**。支线在同一个 claim 周期里做完。
+
+**候选扫描在第 3 步之后由主 Agent 整篇跑一次，不要每片跑一次**——
+它是纯脚本，一次跑完全部分片；分到每片去跑只是多 N 轮工具往返：
+
+```
+typo_scan.py scan --run-dir <run>                        # 不带 --chunk = 整篇
+scan_patterns.py scan --run-dir <run> [--patterns <规则包>]   # 范式支线开启时
+```
+
+返回里带每片的 `candidates`。**候选为 0 的片直接跳过对应支线**，不要为它发起调用。
 
 **错别字**（`typo_check.enabled` 默认开）——模型对错别字有鲁棒性，让它自己找先天不利：
-
-```
-typo_scan.py scan --run-dir <run> --chunk <id>
-  → candidates:0 就跳过这一片
-  → 否则对 work/typos/typos-<id>.json 的每个 batch，按 prompts/pass1-typo.md 发起调用
-    （二选一：A 原字正确 / B 应改 / C 都不对），逐行写入 typos-<id>.verdicts.jsonl
-typo_scan.py merge --run-dir <run> --chunk <id>
-verify_span.py --run-dir <run> --chunk <id> \
-  --in work/issues/issues-<id>.typos.jsonl --out work/issues/issues-<id>.typos.jsonl --cap 100
-filter_neverflag.py --run-dir <run> --chunk <id> --file work/issues/issues-<id>.typos.jsonl
-```
+对 `work/typos/typos-<id>.json` 的每个 batch，按 `prompts/pass1-typo.md` 发起调用
+（二选一：A 原字正确 / B 应改 / C 都不对），整块写入 `typos-<id>.verdicts.jsonl`，
+随后由第 4 步第三轮那条命令里的 `typo_scan.py merge` + 两道闸门收口。
 
 **范式**（`pattern_review.enabled` 默认关，无规则包时自动跳过）——用户提供规则包后才有内容：
+按 `prompts/pass1-pattern.md` 逐 batch 裁定（每个要件只答 Y/N/U），写入
+`work/patterns/patterns-<id>.verdicts.jsonl`，然后：
 
 ```
-scan_patterns.py scan --run-dir <run> --chunk <id> [--patterns <规则包>]
-  → candidates:0 就跳过；否则按 prompts/pass1-pattern.md 逐 batch 裁定
-    （每个要件只答 Y/N/U），写入 work/patterns/patterns-<id>.verdicts.jsonl
-scan_patterns.py merge --run-dir <run> --chunk <id> [--patterns <规则包>]
+scan_patterns.py merge --run-dir <run> --chunk <id> [--patterns <规则包>] && \
 verify_span.py --run-dir <run> --chunk <id> \
-  --in work/issues/issues-<id>.patterns.jsonl --out work/issues/issues-<id>.patterns.jsonl --cap 20
+  --in work/issues/issues-<id>.patterns.jsonl --out work/issues/issues-<id>.patterns.jsonl --cap 40 && \
 filter_neverflag.py --run-dir <run> --chunk <id> --file work/issues/issues-<id>.patterns.jsonl
 ```
 
@@ -236,9 +273,17 @@ verify_pass2.py build --run-dir <run>            # 拼装待复核集（含位�
 ```
 
 脚本已把三个通道的过闸产物合并、按 manifest 的 `ab_seed` 逐条定好 A/B 位置，
-产出 `work/verify/pass2-primary.json`。**你只发这个 payload**——
-按 `references/prompts/pass2-verify.md` 逐 batch 复核（一次 ≤10 组），
-每行一条 `{"id":"…","answer":"A"}` 追加写入 `work/verify/pass2-primary.verdicts.jsonl`。
+并**按批落盘**：`work/verify/pass2-primary.vNN.json`，每批 ≤10 组
+（返回里给 `batches` 与文件名格式）。
+
+**各批之间没有依赖，这一步同样并行**：派 `parallelism` 个子 Agent，
+每人领一个批次文件，按 `references/prompts/pass2-verify.md` 复核，
+把 `{"id":"…","answer":"A"}` 整块写入**同名的** `pass2-primary.vNN.verdicts.jsonl`。
+各写各的文件——多个子 Agent 往同一个文件 append，中断处会互相截断。
+
+**不要用合并文件 `pass2-primary.json` 发起调用**，也不要把它读进主 Agent：
+一份长文档能出几百条待复核项，整份进了上下文，此后每一轮工具往返都要重算它一遍。
+它只留作备查。
 
 **同目录下的 `.key.json` 不要读、更不要带进调用。** 它记的是原文在哪一侧，
 是 `merge` 应用判定表用的。看了它，盲测就只剩名义。
@@ -247,8 +292,12 @@ verify_pass2.py build --run-dir <run>            # 拼装待复核集（含位�
 verify_pass2.py merge --run-dir <run>            # 判定表 → work/issues-verified.jsonl
 ```
 
+`merge` 会把所有分批裁定文件一起读进来（`verdict_files` 报出读到几份）。
 判定表由脚本执行：选中原文所在项 = 通过；选中建议侧 / 两者都没有 / 两者都有 /
 答案无法解析 / 缺裁定 = 一律淘汰。B 类的封闭单问里 UNSURE 按 NO 处理。
+
+**漏跑一批 = 那批整批淘汰**（`missing_verdict` 会报数）。看到这个数不为 0，
+补跑缺的那几批再 merge，不要放着不管——它是"少了一批复核"，不是"这批没问题"。
 
 > 需要测模型的位置偏好时（M2 验收项）：`build --arrangement mirror` 再复核一轮，
 > 然后 `verify_pass2.py consistency --run-dir <run>` 给出两种排列的判定一致率。
@@ -266,13 +315,31 @@ ledger.py build --run-dir <run>
 detect_conflicts.py --run-dir <run> --session <sid> --generation <n>
 ```
 
-### 第 7 步：Pass 4　冲突裁定（独占）
+### 第 7 步：Pass 4　冲突裁定（独占，可并行）
 
-对 `work/conflicts/conflicts-candidate.*.json` 中的每条候选，按
-`references/prompts/pass4-adjudicate.md` 裁定，**逐条 append** 到
-`work/conflicts-verified.jsonl`（append-only，中断后只需重跑剩余项）。
+```
+adjudicate_pass4.py build --run-dir <run>        # 候选 → 分批题面
+```
 
-**每次调用前后执行** `state.py heartbeat --run-dir <run> --session <sid>` ——
+脚本把全部候选拼成题面并按 `logic.adjudicate_batch_size`（默认 10 组）分批落到
+`work/conflicts/batches/adjudicate-bNN.json`。**不要自己去读
+`conflicts-candidate.*.json`**——那是几百条带原文的记录，读进主 Agent 之后，
+此后每一轮工具往返都要把它重算一遍。
+
+各批无依赖，派子 Agent 并行：每人一个批次文件，按
+`references/prompts/pass4-adjudicate.md` 裁定，把
+`{"conflict_id":"L06-0002","verdict":"CONFLICT","note":"…"}` 整块写入
+`work/conflicts/verdicts/adjudicate-bNN.verdicts.jsonl`。
+
+```
+adjudicate_pass4.py collect --run-dir <run>      # 归并 → work/conflicts-verified.jsonl
+```
+
+**看 `collect` 返回的 `missing` 与 `invalid_lines`。** 未裁定的候选一律不进交付物
+（未裁定 = 不确定 = 无问题），所以漏答的表现是「这条冲突凭空消失」，
+报告里也看不出来。不为 0 就补跑对应批次再 collect（collect 幂等，已归并的不会丢）。
+
+**每批调用前后执行一次** `state.py heartbeat --run-dir <run> --session <sid>` ——
 此阶段脚本不在运行，没有自然心跳点，不续租会被误判为死亡。
 
 ### 第 8 步：回写与报告（严格单写）
@@ -334,10 +401,11 @@ workspace.py clean-temp --run-dir <run>
 | `import_glossary.py` | 术语表导入 + 自检 + 三层合并 | `--run-dir --authoritative --fallback` | entries / layers |
 | `chunk.py` | 分片（按 token） | `--run-dir` | chunks / single_pass |
 | `verify_span.py` | 闸门②③ | `--run-dir --chunk [--in --out --cap]` | 各闸门丢弃计数 |
-| `verify_pass2.py build\|merge\|consistency` | 闸门④盲测 A/B 脚手架 | `--run-dir [--arrangement]` | items / pass / drop / 一致率 |
+| `verify_pass2.py build\|merge\|consistency` | 闸门④盲测 A/B 脚手架（build 按批落盘，可并行复核） | `--run-dir [--arrangement]` | items / batches / pass / drop / 一致率 |
 | `filter_neverflag.py` | 不改清单硬过滤 | `--run-dir --chunk\|--all [--file]` | dropped / by_rule |
 | `ledger.py build\|rebuild\|stats` | 台账 SQLite 索引 | `--run-dir` | stats |
 | `detect_conflicts.py` | L01–L32 冲突检测 | `--run-dir [--rules]` | total / by_rule |
+| `adjudicate_pass4.py build\|collect\|status` | Pass 4 裁定脚手架（分批题面 + 归并 + 漏答报数） | `--run-dir` | batches / verdicts / missing |
 | `apply_revisions.py plan\|apply` | 修订回写（两段式） | `--run-dir` | patches / applied |
 | `apply_comments.py plan\|apply` | 批注回写（六文件联动） | `--run-dir` | comments / anchored |
 | `validate_docx.py` | 回写后四项校验 | `--run-dir` | pass / failed |
@@ -395,7 +463,12 @@ workspace.py clean-temp --run-dir <run>
 
 加入协作还需同时满足：配置快照哈希一致、技能版本一致、工作目录在本地文件系统（`workspace.py fscheck`）、Pass 0 已完成。任一不满足只能独立重跑。
 
-主 Agent 主动并行时用同一套 claim 机制：启动 `parallelism`（默认 5，上限建议 8）个子 Agent 跑同一个 claim 循环即可，**主 Agent 不做任何分配决策**。
+主 Agent 主动并行时用同一套 claim 机制：每轮启动 `parallelism`（默认 5，上限建议 8）个子 Agent，
+**每个只领一片、做完即退**，本轮全部返回后再派下一轮，**主 Agent 不做任何分配决策**。
+
+不要让子 Agent 循环领片：它的上下文会随做过的片数累积，而每一次工具往返都要
+重算当下的全部上下文——连做的开销是平方级的。同样的道理适用于第 5 步与第 7 步，
+那两步也是按批分文件、各批独立，照样派子 Agent 并行。
 
 ---
 
@@ -409,7 +482,8 @@ workspace.py clean-temp --run-dir <run>
 6. 反例优先：`never-flag.md` 的反例数量应 ≥ 正例。
 7. 温度设 0 或平台最低值。
 8. 类别、严重度、动作、复核结论全部是封闭枚举，只能选不能造。
-9. 每片上限 20 条。无上限时模型会持续"发现"问题以显得尽职。
+9. 每片有条数上限（`max_issues_per_chunk`，默认 40）。无上限时模型会持续"发现"问题以显得尽职。
+   片变大时这个上限要同步变大——它是截断源，不是「每片就这么多问题」。
 10. 每次调用无状态、自包含，不做多轮对话。
 
 **禁止让模型输出 `confidence` 分数并据此卡阈值。** 言语化置信度存在系统性过度自信与分数饱和，不存在有效阈值点；且已作出判断的 Agent 倾向为自身判断辩护。质量由四道工程闸门保证，不由模型自评保证。
