@@ -217,7 +217,7 @@ chunk.py --run-dir <run> && typo_scan.py scan --run-dir <run> && prompt_pack.py 
 |---|---|---|---|---|
 | 一 | `review` | 每个非纯表格分片 | `work/prompts/review-<片>.md` | `issues-<片>.raw.jsonl` |
 | 二 | `extract` | 每个分片 | `work/prompts/extract-<片>.md` | `facts-<片>.json` |
-| 三 | `typo` / `pattern` | 每片每批候选 | `work/prompts/typo-<片>-<批>.md` | `typos-<片>.<批>.verdicts.jsonl` |
+| 三 | `typo` / `pattern` | 每批候选（**错别字跨片攒批**） | `work/prompts/typo-<批>.md` | `typos-<批>.verdicts.jsonl` |
 
 三波之间没有依赖，先后顺序随意，也可以混在一起派——分开只是为了让每一波的
 子 Agent 指令完全一致、便于统计。**波内当然并行。**
@@ -225,17 +225,32 @@ chunk.py --run-dir <run> && typo_scan.py scan --run-dir <run> && prompt_pack.py 
 **主 Agent 每一波的循环**：
 
 ```
-workspace.py claim next --run-dir <run> --stage <阶段> --session <sid> --generation <n>
-  → exhausted:true 就换下一波；否则拿到 {unit, prompt, output}
+workspace.py claim next --run-dir <run> --stage <阶段> --count 4 \
+  --session <sid> --generation <n>
+  → exhausted:true 就换下一波；否则拿到一组 units（每个带 prompt 与 output 两个路径）
 ```
 
-把 `prompt` 与 `output` 两个路径原样交给子 Agent，指令就一句：
+**`--count` 是"一个子 Agent 领几个单元"，不是并发数。** 脚本按
+`concurrency.subagent_budget_chars`（默认 40000 字符）封顶，所以给 4 也可能只返回 2：
+审查单元近两万字符，一次两个；错别字单元只有几千字符，一次能给五六个。
 
-> 读 `<prompt>` 这个文件，照它写的做，把结果写到它指定的 `<output>`，
-> 然后返回 `{"unit":…, "lines":N}`。**不要读别的文件，不要把正文内容带回来。**
+**为什么要打包**：派活的固定开销与单元大小无关——拉起子 Agent、领单元、读文件、
+回话，每一步都要模型先把这次工具调用吐出来。在 60 token/s 这种出字速度下，
+**一次工具调用光"说出口"就要一两秒**，几十个单元摊下来，固定开销能占总耗时三四成。
 
-每轮派 `parallelism` 个，全部返回后再派下一轮，直到 `exhausted`。
+把这组 units 原样交给子 Agent，指令就一句：
+
+> 依次处理下面这几个单元。每个单元：读它的 `prompt` 文件，照文件里写的做，
+> 把结果写到它指定的 `output`。全部做完再返回 `[{"unit":…, "lines":N}, …]`。
+> **不要读别的文件，不要把正文内容带回来。**
+
+每轮派 `parallelism` 个子 Agent，全部返回后再派下一轮，直到 `exhausted`。
 **主 Agent 上下文里只留统计数字。**
+
+> **先确认子 Agent 是不是真并行。** 如果一轮的墙上时间约等于各子 Agent 耗时之和，
+> 那就是串行执行的——此时 `parallelism` 调多少都没用，唯一的杠杆是把
+> `subagent_budget_chars` 提到子 Agent 窗口允许的最大值（单元打得更包一些，
+> 少几次派活），以及少生成 token。
 
 **收口（纯脚本，主 Agent 一次跑完，不要按片各跑一次）**：
 
@@ -252,6 +267,20 @@ filter_neverflag.py --run-dir <run> --all --channel typos
 `metrics.py bump --run-dir <run> --pass pass1_review`（以及 `--pass typo` / `--pass pattern`）
 每波记一次即可。`--input-tokens` / `--output-tokens` 可选：平台报得出就带上，
 **不要为了填这两个数额外发一次工具调用**。
+
+#### 耗时都花在哪（跑得慢的时候按这个顺序查）
+
+一份 800 页文档在默认配置下约 26 片 ≈ 55–70 个单元。耗时由三项构成，
+**脚本不在其中**（实测每次调用 76–183 毫秒，全流程加起来不到一分钟）：
+
+| 项 | 怎么估 | 怎么降 |
+|---|---|---|
+| 生成 token | 总输出量 ÷ 出字速度。事实抽取是大头，其次是审查 | 分片小一点、`max_issues_per_chunk` 别开太大 |
+| **工具调用** | 次数 × (吐出这次调用的时间 + 往返开销)。**每次调用模型都要先"说出口"**，60 token/s 下约 1–2 秒 | `--count` 打包（少派活）、闸门用 `--all` 一次扫完、不要按片各跑一次 |
+| 派活固定开销 | 子 Agent 数 × 拉起成本 | 同上 |
+
+**「工具调用耗时」不是脚本慢，是调用次数太多。** 看到工具时间与模型时间同量级，
+先数一下这一波发了多少次工具调用，而不是去优化脚本。
 
 #### 子 Agent 失败了怎么办（会失败，要按会失败来设计）
 
@@ -292,6 +321,10 @@ filter_neverflag.py --run-dir <run> --all --channel typos
 **错别字**（`typo_check.enabled` 默认开）：模型对错别字有鲁棒性，让它自己找先天不利，
 所以退化成二选一——A 原字正确 / B 应改 / C 都不对。裁定按 `tid` 回填，
 `typo_scan.py merge` 只采纳 B。
+
+候选**跨分片攒批**（每批 `typo_check.batch_size`，默认 50）：它们彼此无关，
+判断也只需要候选自带的上下文。按片分批会让只有三五个候选的分片也独占一次调用——
+26 片就是 26 次；跨片攒批之后同样的候选量通常只要三五次。
 
 **范式**（`pattern_review.enabled` 默认关，无规则包时自动跳过）：每个要件只答 Y/N/U，
 U 按「要件齐备」处理。

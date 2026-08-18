@@ -50,7 +50,7 @@
 | Pass 4 裁定的分批题面与归并、漏答报数 | `scripts/adjudicate_pass4.py` | `prompts/pass4-adjudicate.md` + `references/schemas.md` |
 | 分片预算、token 系数、重切片后作废旧产物 | `scripts/chunk.py` | `assets/config.default.yaml` 的 `chunking`；**改了预算必须重跑 chunk.py** |
 | 子 Agent 看到的 prompt（自包含渲染、派活前体检） | `scripts/prompt_pack.py` | 对应的 `prompts/*.md`；**改了模板要重跑 prompt_pack build** |
-| 阶段化单元（claim 的粒度、崩溃回收） | `scripts/workspace.py` 的 `stage_units` / `reclaim_stage` | `SKILL.md` 第 4 步 + 回归第 23 节 |
+| 阶段化单元（claim 的粒度、崩溃回收、成组派活） | `scripts/workspace.py` 的 `stage_units` / `reclaim_stage` / `next_pending_units` | `SKILL.md` 第 4 步 + 回归第 23、26 节 |
 | **某个类别进不进交付物** | `verify_pass2.py` 的 `KEEP_SCOPE`（**不是** `REVIEW_SCOPE`） | `prompts/pass2-verify.md` 触发范围表 |
 | **新增一条 L 规则** | `scripts/detect_conflicts.py`（加 `RULES` 项 + `r_LNN` 函数） | `references/logic-rules.md` + `logic-injection.facts.json` + 回归断言 |
 | 事实台账字段 | `scripts/ledger.py` 的 `MAPPING` | `references/schemas.md` + `prompts/pass1-extract.md` |

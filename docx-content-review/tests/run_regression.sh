@@ -1909,10 +1909,12 @@ pid=next(p for t,p in paras.items() if "阀值" in t)
   "evidence":"单位不统一","severity":"High"},ensure_ascii=False)+"\n",encoding="utf-8")
 (run/"work"/"facts").mkdir(parents=True,exist_ok=True)
 (run/"work"/"facts"/"facts-0001.json").write_text("{}",encoding="utf-8")
-t=json.load(open(run/"work"/"typos"/"typos-0001.t01.json",encoding="utf-8"))
-(run/"work"/"typos"/"typos-0001.t01.verdicts.jsonl").write_text(
-  "".join(json.dumps({"tid":x["tid"],"verdict":"B"},ensure_ascii=False)+"\n"
-          for x in t["items"]),encoding="utf-8")
+# 错别字候选跨片攒批：批次文件是 typos-gNN.json，裁定写同名 .verdicts.jsonl
+for b in json.load(open(run/"work"/"typos"/"typos-index.json",encoding="utf-8"))["batches"]:
+    t=json.load(open(run/"work"/"typos"/f"typos-{b['batch_id']}.json",encoding="utf-8"))
+    (run/"work"/"typos"/f"typos-{b['batch_id']}.verdicts.jsonl").write_text(
+      "".join(json.dumps({"tid":x["tid"],"verdict":"B"},ensure_ascii=False)+"\n"
+              for x in t["items"]),encoding="utf-8")
 p=json.load(open(run/"work"/"patterns"/"patterns-0001.p01.json",encoding="utf-8"))
 v={0:{"impact":"Y","mitigation":"Y","owner":"Y"},1:{"impact":"N","mitigation":"N","owner":"U"},
    2:{"request":"Y","response":"Y","error":"Y"},3:{"request":"Y","response":"N","error":"N"}}
@@ -2144,6 +2146,124 @@ print("    上限过低时给的是：", d["error"][:36], "→ 至少", d.get("m
 sys.exit(0 if d.get("min_viable_prompt_chars") and "suggest_max_text_tokens" not in d else 1)
 PYEOF
 check "上限低于固定开销时改口建议调上限（不给无效的分片建议）" "$?" 0
+
+echo "══ 26. 派活打包：按上下文预算成组领取 ══"
+
+# RUN7 是 800 页语料（第 25 节建的），先恢复默认配置并渲染 prompt
+python3 "$S/workspace.py" reconfigure --run-dir "$RUN7" \
+        --set chunking.max_text_tokens=10000 --set chunking.max_prompt_chars=20000 >/dev/null
+python3 "$S/chunk.py" --run-dir "$RUN7" >/dev/null
+python3 "$S/typo_scan.py" scan --run-dir "$RUN7" >/dev/null
+python3 "$S/prompt_pack.py" build --run-dir "$RUN7" >/dev/null
+rm -f "$RUN7"/work/chunks/*.claim
+
+P1=$(python3 "$S/workspace.py" claim next --run-dir "$RUN7" --stage review --count 8 --session pk1)
+ge "一次能领到多个单元" "$(echo "$P1" | jget "['count']")" 2
+
+# 预算是按**字符**算的。用 stat() 的字节数会把包打成三分之一大（中文一字三字节）
+python3 - "$RUN7" "$P1" <<'PYEOF'
+import json,pathlib,sys,yaml
+run,got=pathlib.Path(sys.argv[1]),json.loads(sys.argv[2])
+cfg=yaml.safe_load((run/"config.snapshot.yaml").read_text(encoding="utf-8"))
+budget=cfg["concurrency"]["subagent_budget_chars"]
+idx=json.load(open(run/"work"/"prompts"/"index.json",encoding="utf-8"))
+chars=sum(idx[f"review/{u['unit']}"] for u in got["units"])
+byts=sum(len(pathlib.Path(u["prompt"]).read_bytes()) for u in got["units"])
+print(f"    本组 {got['count']} 个单元：{chars} 字符 / {byts} 字节（预算 {budget}）")
+assert chars <= budget, "超预算"
+assert byts > budget, "构造无效：这组的字节数没有超过预算，测不出字符/字节的差别"
+PYEOF
+check "打包按字符数算预算，不是字节数（负向对照：同一组按字节算会超）" "$?" 0
+
+# 领过的不会再被领走
+P2=$(python3 "$S/workspace.py" claim next --run-dir "$RUN7" --stage review --count 8 --session pk2)
+python3 - "$P1" "$P2" <<'PYEOF'
+import json,sys
+a={u["unit"] for u in json.loads(sys.argv[1])["units"]}
+b={u["unit"] for u in json.loads(sys.argv[2])["units"]}
+sys.exit(1 if a & b else 0)
+PYEOF
+check "两次领取不重叠" "$?" 0
+
+# 预算小于单个 prompt 时也必须派得出去，否则整波死锁
+python3 "$S/workspace.py" reconfigure --run-dir "$RUN7" --set concurrency.subagent_budget_chars=100 >/dev/null
+P3=$(python3 "$S/workspace.py" claim next --run-dir "$RUN7" --stage review --count 8 --session pk3)
+check "预算再小也至少派一个（不死锁）" "$(echo "$P3" | jget "['count']")" 1
+
+# **一个问题都没查出来的分片，产物就是一个空 JSONL——那是"做完了"，不是"没做完"。**
+# 判成没做完，这类分片会被无限重派，而"没查出问题"恰恰是常态。
+python3 - "$RUN7" <<'PYEOF'
+import json,pathlib,sys
+run=pathlib.Path(sys.argv[1])
+d=run/"work"/"issues"; d.mkdir(parents=True,exist_ok=True)
+for c in json.load(open(run/"work"/"chunks"/"index.json",encoding="utf-8"))["chunks"]:
+    (d/f"issues-{c['chunk_id']}.jsonl").write_text("",encoding="utf-8")
+PYEOF
+P4=$(python3 "$S/workspace.py" claim next --run-dir "$RUN7" --stage review --count 8 --session pk4)
+check "零问题的分片算已完成（空 JSONL 是合法产物，不得无限重派）" "$(echo "$P4" | jget "['exhausted']")" True
+python3 - "$S" <<'PYEOF'
+import pathlib,sys,tempfile
+sys.path.insert(0, sys.argv[1])
+from _common import product_ok
+d=pathlib.Path(tempfile.mkdtemp())
+(d/"a.jsonl").write_text("",encoding="utf-8")
+(d/"b.json").write_text("",encoding="utf-8")
+(d/"c.json").write_text('{"terms":[',encoding="utf-8")
+assert product_ok(d/"a.jsonl") is True,  "空 JSONL 应算完成"
+assert product_ok(d/"b.json") is False,  "空 JSON 不该算完成"
+assert product_ok(d/"c.json") is False,  "半写 JSON 不该算完成"
+PYEOF
+check "空 JSONL 合法、空 JSON 与半写 JSON 不合法" "$?" 0
+python3 "$S/workspace.py" reconfigure --run-dir "$RUN7" --set concurrency.subagent_budget_chars=40000 >/dev/null
+
+# 错别字候选跨片攒批：按片分批会让只有几个候选的分片也独占一次调用。
+# 用 typo-pattern 那份 fixture 切成多片来验——候选总数不变，批次数不该跟着片数走。
+mkdir -p "$WORK/gb"
+cp "$F/typo-pattern.docx" "$WORK/gb/gb.docx"
+RUN8=$(python3 "$S/workspace.py" init --source "$WORK/gb/gb.docx" \
+       --output-dir "$DELIVER" --temp-dir "$TEMP" | jget "['run_dir']")
+python3 "$S/unpack.py" run --run-dir "$RUN8" >/dev/null
+python3 "$S/extract.py" --run-dir "$RUN8" >/dev/null
+python3 "$S/import_glossary.py" --run-dir "$RUN8" >/dev/null
+python3 "$S/workspace.py" reconfigure --run-dir "$RUN8" \
+        --set chunking.max_text_tokens=120 --set chunking.single_pass_limit=100 >/dev/null
+NCH=$(python3 "$S/chunk.py" --run-dir "$RUN8" | jget "['chunks']")
+TS8=$(python3 "$S/typo_scan.py" scan --run-dir "$RUN8")
+ge "构造：切成多片" "$NCH" 5
+python3 - "$TS8" <<'PYEOF'
+import json,sys
+n=[r["candidates"] for r in json.loads(sys.argv[1])["results"] if r["candidates"]]
+print("    候选分布在", len(n), "个分片上：", n)
+sys.exit(0 if len(n) >= 2 else 1)
+PYEOF
+check "构造：候选分散在多个分片上" "$?" 0
+check "跨片攒批：批次数不跟着片数走" "$(echo "$TS8" | jget "['batches']")" 1
+TU8=$(python3 "$S/workspace.py" claim status --run-dir "$RUN8" --stage typo)
+check "错别字单元数 = 批次数（不是分片数）" "$(echo "$TU8" | jget "['total']")" 1
+
+# 跨片批次里混着多个分片的候选，靠 tid 归属；merge 必须各归各片
+python3 - "$RUN8" <<'PYEOF'
+import json,pathlib,sys
+run=pathlib.Path(sys.argv[1]); t=run/"work"/"typos"
+b=json.load(open(t/"typos-g01.json",encoding="utf-8"))
+cids={x["tid"].split("-")[0] for x in b["items"]}
+assert len(cids) >= 2, f"这一批只覆盖了 {cids}，构造无效"
+(t/"typos-g01.verdicts.jsonl").write_text(
+    "".join(json.dumps({"tid":x["tid"],"verdict":"B"},ensure_ascii=False)+"\n"
+            for x in b["items"]),encoding="utf-8")
+PYEOF
+check "构造：一批里混着多个分片的候选" "$?" 0
+MG8=$(python3 "$S/typo_scan.py" merge --run-dir "$RUN8")
+ge "merge 按 tid 把裁定归回各自的分片" "$(echo "$MG8" | jget "['merged']")" 8
+python3 - "$RUN8" <<'PYEOF'
+import json,pathlib,sys
+d=pathlib.Path(sys.argv[1],"work","issues")
+files=sorted(d.glob("issues-*.typos.jsonl"))
+per={f.name: sum(1 for _ in open(f,encoding="utf-8")) for f in files if f.stat().st_size}
+print("    各片各归各的：", per)
+sys.exit(0 if len(per) >= 2 else 1)
+PYEOF
+check "裁定落回了多个分片的产物（没有全堆到第一片）" "$?" 0
 
 echo
 printf '通过 \033[32m%d\033[0m，失败 \033[31m%d\033[0m\n' "$PASS" "$FAIL"

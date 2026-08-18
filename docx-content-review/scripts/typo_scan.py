@@ -121,6 +121,12 @@ def _unique_window(text: str, s: int, e: int, pad: int = 6, limit: int = 40) -> 
     return max(0, s - limit), min(len(text), e + limit)
 
 
+def _question(c: dict) -> dict:
+    """题面只要这四项：定位靠 tid，判断靠 context + 两种写法。"""
+    return {"tid": c["tid"], "context": c["context"],
+            "wrong": c["wrong"], "right": c["right"]}
+
+
 def scan(run_dir: Path, cfg: dict, chunk_id: str | None) -> dict:
     tc = cfg.get("typo_check") or {}
     if not tc.get("enabled"):
@@ -147,7 +153,8 @@ def scan(run_dir: Path, cfg: dict, chunk_id: str | None) -> dict:
     tdir.mkdir(parents=True, exist_ok=True)
 
     total = 0
-    results = []
+    results: list[dict] = []
+    all_cands: list[dict] = []
     for c in chunks:
         cands = []
         for pid in c.get("review_pids") or c.get("pids") or []:
@@ -191,16 +198,17 @@ def scan(run_dir: Path, cfg: dict, chunk_id: str | None) -> dict:
         for old_batch in tdir.glob(f"typos-{c['chunk_id']}.t*.json"):
             old_batch.unlink()
         batches = []
-        for n, g in enumerate(groups, 1):
-            bid = f"t{n:02d}"
-            bpath = tdir / f"typos-{c['chunk_id']}.{bid}.json"
-            guard_write_path(bpath, run_dir)
-            atomic_write_json(bpath, {
-                **version_header(), "chunk_id": c["chunk_id"], "batch_id": bid,
-                # 题面只要这四项：定位靠 tid，判断靠 context + 两种写法
-                "items": [{"tid": x["tid"], "context": x["context"],
-                           "wrong": x["wrong"], "right": x["right"]} for x in g]})
-            batches.append({"batch_id": bid, "count": len(g)})
+        if chunk_id:                    # 只扫一片时保留按片分批（补跑用）
+            for n, g in enumerate(groups, 1):
+                bid = f"t{n:02d}"
+                bpath = tdir / f"typos-{c['chunk_id']}.{bid}.json"
+                guard_write_path(bpath, run_dir)
+                atomic_write_json(bpath, {
+                    **version_header(), "chunk_id": c["chunk_id"], "batch_id": bid,
+                    "items": [_question(x) for x in g]})
+                batches.append({"batch_id": bid, "count": len(g)})
+        else:
+            all_cands.extend(cands)     # 整篇扫描：跨片攒够一批再切（见下）
 
         payload = {**version_header(), "chunk_id": c["chunk_id"], "candidates": cands,
                    "truncated": truncated, "batches": batches,
@@ -211,15 +219,39 @@ def scan(run_dir: Path, cfg: dict, chunk_id: str | None) -> dict:
         total += len(cands)
         results.append({"chunk_id": c["chunk_id"], "candidates": len(cands),
                         "batches": len(batches), "truncated": truncated})
-    return {"enabled": True, "candidates": total, "chunks": len(results), "results": results}
+
+    # **整篇扫描时跨片攒批。** 按片分批会让只有 3 个候选的分片也独占一次调用——
+    # 26 片就是 26 次，而这些候选彼此无关、也不需要分片上下文（context 已在候选里）。
+    # 跨片攒到 batch_size 再切，同样的候选量能少掉大半次调用。
+    gbatches = []
+    if not chunk_id:
+        for old_batch in tdir.glob("typos-g*.json"):
+            old_batch.unlink()
+        batch = int(tc.get("batch_size") or 50)
+        for n in range(0, len(all_cands), batch):
+            bid = f"g{n // batch + 1:02d}"
+            bpath = tdir / f"typos-{bid}.json"
+            guard_write_path(bpath, run_dir)
+            atomic_write_json(bpath, {**version_header(), "batch_id": bid,
+                                      "items": [_question(x) for x in all_cands[n:n + batch]]})
+            gbatches.append({"batch_id": bid, "count": len(all_cands[n:n + batch])})
+        ipath = tdir / "typos-index.json"
+        guard_write_path(ipath, run_dir)
+        atomic_write_json(ipath, {**version_header(), "candidates": total,
+                                  "batches": gbatches})
+    return {"enabled": True, "candidates": total, "chunks": len(results),
+            "batches": len(gbatches) or sum(r["batches"] for r in results),
+            "results": results}
 
 
 def merge(run_dir: Path, cfg: dict, chunk_id: str) -> dict:
     """把 LLM 裁定结果并入该片的 issues。裁定为 A（原字正确）或「都不对」的一律丢弃。"""
     tc = cfg.get("typo_check") or {}
     tdir = resolve_path(run_dir, "typos")
-    # 分批裁定（每批一个文件，可并行）+ 旧的整片单文件写法，两种都收
-    verdict_files = sorted(tdir.glob(f"typos-{chunk_id}.t*.verdicts.jsonl"))
+    # 三种都收：跨片批次（typos-gNN）、按片批次（typos-<片>.tNN）、旧的整片单文件。
+    # 跨片批次里混着别的分片的裁定，靠 tid 归属——tid 的前缀就是 chunk_id。
+    verdict_files = sorted(tdir.glob("typos-g*.verdicts.jsonl"))
+    verdict_files += sorted(tdir.glob(f"typos-{chunk_id}.t*.verdicts.jsonl"))
     single = tdir / f"typos-{chunk_id}.verdicts.jsonl"
     if single.exists():
         verdict_files.insert(0, single)

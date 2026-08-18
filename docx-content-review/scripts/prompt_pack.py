@@ -28,7 +28,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from _common import (  # noqa: E402
-    EX, atomic_write_text, die, emit, read_json, run_cli,
+    EX, atomic_write_json, atomic_write_text, die, emit, read_json, run_cli,
 )
 from workspace import (  # noqa: E402
     SKILL_ROOT, STAGES, guard_write_path, load_run_config, resolve_path, stage_units,
@@ -185,7 +185,8 @@ RENDERERS = {"review": (render_review, JSONL_HOW),
 
 TITLES = {"review": "语病与语义审查 · 分片 {cid}",
           "extract": "事实抽取 · 分片 {cid}",
-          "typo": "错别字裁定 · 分片 {cid} 第 {bid} 批",
+          # 错别字批次跨分片（候选彼此无关），所以标题里只报批号
+          "typo": "错别字裁定 · 第 {bid} 批",
           "pattern": "范式要件裁定 · 分片 {cid} 第 {bid} 批"}
 
 
@@ -197,6 +198,9 @@ def build(run_dir: Path, cfg: dict, stages: list[str], chunk_id: str | None) -> 
     ch = cfg.get("chunking") or {}
     limit = int(ch.get("max_prompt_chars") or 0)
     written, sizes, biggest = {}, [], ("", 0)
+    # 每个 prompt 的**字符数**（不是字节数——中文一个字三字节，按字节量会差三倍）。
+    # claim 打包时要按它算预算，不该为此把每个 prompt 都读一遍。
+    index: dict[str, int] = {}
     # 固定开销 = prompt 里正文之外的部分（类型体系、不改清单、schema、格式说明）。
     # 建议值要按它来算：能留给正文的是 limit - fixed，而不是按总量等比例缩。
     fixed_max = 0
@@ -212,6 +216,7 @@ def build(run_dir: Path, cfg: dict, stages: list[str], chunk_id: str | None) -> 
             guard_write_path(unit["prompt"], run_dir)
             atomic_write_text(unit["prompt"], text)
             sizes.append(len(text))
+            index[f"{stage}/{unit['unit']}"] = len(text)
             if stage in ("review", "extract"):
                 src = Path(unit["source"])
                 body = len(src.read_text(encoding="utf-8")) if src.exists() else 0
@@ -220,6 +225,12 @@ def build(run_dir: Path, cfg: dict, stages: list[str], chunk_id: str | None) -> 
                 biggest = (f"{stage}/{unit['unit']}", len(text))
             n += 1
         written[stage] = n
+
+    idx_path = pdir / "index.json"
+    guard_write_path(idx_path, run_dir)
+    prev = read_json(idx_path, {}) or {}
+    prev.update(index)                        # 只渲染了一部分时保留其余单元的记录
+    atomic_write_json(idx_path, prev)
 
     mx = max(sizes) if sizes else 0
     over = [x for x in sizes if limit and x > limit]

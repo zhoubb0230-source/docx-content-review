@@ -736,6 +736,23 @@ def stage_units(run_dir: Path, stage: str) -> list[dict]:
     chunks = idx.get("chunks", [])
     pdir = resolve_path(run_dir, "prompts")
     out = []
+
+    # 错别字候选跨片攒批（typo_scan 整篇扫描时产出）：候选彼此无关、也不需要分片
+    # 上下文，按片分批会让只有 3 个候选的分片也独占一次调用。有跨片批次就用它。
+    if stage == "typo":
+        tdir = resolve_path(run_dir, "typos")
+        gidx = read_json(tdir / "typos-index.json", {}) or {}
+        if gidx.get("batches"):
+            for b in gidx["batches"]:
+                bid = b["batch_id"]
+                out.append({"unit": bid, "chunk_id": "-", "batch_id": bid,
+                            "prompt": pdir / f"typo-{bid}.md",
+                            "output": tdir / f"typos-{bid}.verdicts.jsonl",
+                            "done_marker": tdir / f"typos-{bid}.verdicts.jsonl",
+                            "source": tdir / f"typos-{bid}.json"})
+            out.sort(key=lambda u: u["unit"])
+            return out
+
     for c in chunks:
         cid = c["chunk_id"]
         if stage == "review":
@@ -783,9 +800,28 @@ def _unit_view(u: dict, stage: str) -> dict:
             "prompt": str(u["prompt"]), "output": str(u["output"])}
 
 
-def next_pending_unit(run_dir: Path, stage: str, session: str, generation: int | None,
-                      minutes: int) -> dict | None:
+def next_pending_units(run_dir: Path, stage: str, session: str, generation: int | None,
+                       minutes: int, count: int, budget_chars: int) -> list[dict]:
+    """一次领一组单元。
+
+    **一个子 Agent 只领一个单元，在串行 harness 上是很贵的。** 每次派活的固定开销
+    （拉起子 Agent、领单元、读文件、回话）与单元大小无关，而在 60 token/s 这种
+    出字速度下，光是"吐出一次工具调用"就要一两秒。67 个单元摊下来，
+    固定开销能占到总耗时的三四成。
+
+    所以按**上下文预算**打包：小单元（错别字一批几千字符）一次给五六个，
+    大单元（审查一片近两万字符）一次给两个。预算由 `subagent_budget_chars` 定，
+    它是"一个子 Agent 的上下文里最多装多少 prompt"，不是单个 prompt 的上限
+    （那是 `chunking.max_prompt_chars`，由 prompt_pack 在派活前把关）。
+    """
+    picked: list[dict] = []
+    used = 0
+    # prompt 的字符数由 prompt_pack 落在索引里。用 stat() 会拿到字节数——
+    # 中文一个字三字节，按字节算预算会把包打成三分之一大。
+    sizes = read_json(resolve_path(run_dir, "prompts") / "index.json", {}) or {}
     for u in stage_units(run_dir, stage):
+        if len(picked) >= max(1, count):
+            break
         if product_ok(u["done_marker"]):
             claim_release(run_dir, u["unit"], stage=stage)
             continue
@@ -794,9 +830,20 @@ def next_pending_unit(run_dir: Path, stage: str, session: str, generation: int |
             continue
         if cp.exists():
             claim_release(run_dir, u["unit"], stage=stage)
+        size = int(sizes.get(f"{stage}/{u['unit']}") or 0)
+        # 第一个单元无论多大都要给，否则会一个都派不出去
+        if picked and budget_chars and used + size > budget_chars:
+            break
         if claim_acquire(run_dir, u["unit"], session, generation, minutes, stage=stage):
-            return _unit_view(u, stage)
-    return None
+            picked.append(_unit_view(u, stage))
+            used += size
+    return picked
+
+
+def next_pending_unit(run_dir: Path, stage: str, session: str, generation: int | None,
+                      minutes: int) -> dict | None:
+    got = next_pending_units(run_dir, stage, session, generation, minutes, 1, 0)
+    return got[0] if got else None
 
 
 def stage_status(run_dir: Path, stage: str) -> dict:
@@ -1116,6 +1163,13 @@ def cmd_claim(args) -> int:
     stage = getattr(args, "stage", None)
     unit = getattr(args, "unit", None) or args.chunk
     if args.op == "next":
+        if stage and (args.count or 0) > 1:
+            budget = int((cfg.get("concurrency") or {}).get("subagent_budget_chars") or 40000)
+            got = next_pending_units(run_dir, stage, args.session, args.generation,
+                                     minutes, args.count, budget)
+            emit({"ok": True, "stage": stage, "units": got, "count": len(got),
+                  "exhausted": not got})
+            return EX.OK
         if stage:
             got = next_pending_unit(run_dir, stage, args.session, args.generation, minutes)
         else:
@@ -1319,6 +1373,9 @@ def build_parser() -> argparse.ArgumentParser:
                                   "typo/pattern 是 <chunk>.<batch>）")
     p.add_argument("--stage", choices=list(STAGES),
                    help="不给 = 旧的整片 claim（一个子 Agent 做完一片的全部调用）")
+    p.add_argument("--count", type=int, default=1,
+                   help="一次领几个单元（按 subagent_budget_chars 的上下文预算封顶）。"
+                        "派活的固定开销与单元大小无关，小单元该多领几个")
     p.add_argument("--config")
     p.set_defaults(func=cmd_claim)
 

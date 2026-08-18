@@ -123,8 +123,13 @@ def product_ok(path: str | os.PathLike) -> bool:
     所以凡是子 Agent 写的产物，判完成时都要过这一关。
     """
     p = Path(path)
-    if not p.exists() or p.stat().st_size == 0:
+    if not p.exists():
         return False
+    # **空的 JSONL 是合法的**：这一片一个问题都没查出来，就该是零行。
+    # 把空文件判成"没做完"，这类分片会被无限重派——而"没查出问题"恰恰是常态。
+    # 空的 .json 则不合法：JSON 至少要有一个对象。
+    if p.stat().st_size == 0:
+        return p.suffix == ".jsonl"
     try:
         text = p.read_text(encoding="utf-8")
     except (OSError, UnicodeDecodeError):
