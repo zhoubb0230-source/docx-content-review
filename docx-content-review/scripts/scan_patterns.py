@@ -234,8 +234,27 @@ def scan(run_dir: Path, cfg: dict, chunk_id: str | None, extra: list[str] | None
         truncated = len(cands) > cap
         cands = cands[:cap]                     # 独立配额，不占用 max_issues_per_chunk
         used = {c2["pattern_id"] for c2 in cands}
-        batches = [{"batch_id": f"p{i // batch + 1:02d}", "items": cands[i:i + batch]}
-                   for i in range(0, len(cands), batch)]
+        groups = [cands[i:i + batch] for i in range(0, len(cands), batch)]
+
+        # 分批题面单独落盘，子 Agent 只读自己那一批（与错别字通道同一形状）。
+        # 主文件里再放一份 items 的拷贝，只会让读整份的子 Agent 上下文翻倍。
+        for old_batch in pdir.glob(f"patterns-{c['chunk_id']}.p*.json"):
+            old_batch.unlink()
+        batches = []
+        for n, g in enumerate(groups, 1):
+            bid = f"p{n:02d}"
+            bpath = pdir / f"patterns-{c['chunk_id']}.{bid}.json"
+            guard_write_path(bpath, run_dir)
+            used_here = {x["pattern_id"] for x in g}
+            atomic_write_json(bpath, {
+                **version_header(), "chunk_id": c["chunk_id"], "batch_id": bid,
+                "items": g,
+                # 正反例随本批用到的规则一并注入：写 prompt 时直接取用，不必回读规则包
+                "rules": [{"id": r["id"], "name": r["name"], "requires": r["requires"],
+                           "examples": r["examples"]}
+                          for r in rules if r["id"] in used_here]})
+            batches.append({"batch_id": bid, "count": len(g)})
+
         payload = {
             **version_header(), "chunk_id": c["chunk_id"], "candidates": cands,
             "truncated": truncated, "batches": batches,
@@ -261,10 +280,15 @@ def merge(run_dir: Path, cfg: dict, chunk_id: str, extra: list[str] | None) -> d
     """裁定 → issues。只有明确「N」（要件不存在）才成条目；「U」按齐备处理。"""
     pr = cfg.get("pattern_review") or {}
     pdir = resolve_path(run_dir, "patterns")
-    verdict_path = pdir / f"patterns-{chunk_id}.verdicts.jsonl"
+    # 分批裁定（每批一个文件，可并行）+ 旧的整片单文件写法，两种都收
+    verdict_files = sorted(pdir.glob(f"patterns-{chunk_id}.p*.verdicts.jsonl"))
+    single = pdir / f"patterns-{chunk_id}.verdicts.jsonl"
+    if single.exists():
+        verdict_files.insert(0, single)
     payload = read_json(pdir / f"patterns-{chunk_id}.json", {}) or {}
-    if not verdict_path.exists():
-        return {"merged": 0, "note": f"无裁定结果：{verdict_path}"}
+    if not verdict_files:
+        return {"merged": 0,
+                "note": f"无裁定结果：{pdir}/patterns-{chunk_id}[.pNN].verdicts.jsonl"}
 
     rules = {r["id"]: r for r in load_packs(cfg, extra)}
     cands = {c["cid"]: c for c in payload.get("candidates", [])}
@@ -274,7 +298,7 @@ def merge(run_dir: Path, cfg: dict, chunk_id: str, extra: list[str] | None) -> d
 
     missing: dict[str, list[str]] = {}
     counters = {"verdicts": 0, "answer_N": 0, "answer_U": 0, "unknown_cid": 0}
-    for v in read_jsonl(verdict_path):
+    for v in [x for f in verdict_files for x in read_jsonl(f)]:
         counters["verdicts"] += 1
         cid, key = v.get("cid"), v.get("key")
         ans = str(v.get("answer") or "").strip().upper()[:1]
@@ -332,7 +356,7 @@ def main(argv: list[str]) -> int:
     for name in ("scan", "merge"):
         p = sub.add_parser(name)
         p.add_argument("--run-dir", required=True)
-        p.add_argument("--chunk", required=(name == "merge"))
+        p.add_argument("--chunk", help="merge 不给 = 合并全部分片（阶段化流程用这个）")
         p.add_argument("--patterns", action="append", help="额外规则包，可多次")
         p.add_argument("--config")
     p = sub.add_parser("lint", help="只校验规则包，不需要 run 目录")
@@ -353,8 +377,12 @@ def main(argv: list[str]) -> int:
 
     if args.cmd == "scan":
         emit({"ok": True, **scan(run_dir, cfg, args.chunk, args.patterns)})
-    else:
+    elif args.chunk:
         emit({"ok": True, **merge(run_dir, cfg, args.chunk, args.patterns)})
+    else:
+        res = [merge(run_dir, cfg, c["chunk_id"], args.patterns) for c in
+               (read_json(resolve_path(run_dir, "chunk_index"), {}) or {}).get("chunks", [])]
+        emit({"ok": True, "chunks": len(res), "merged": sum(r["merged"] for r in res)})
     return EX.OK
 
 

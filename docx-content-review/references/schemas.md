@@ -42,6 +42,25 @@
 
 ---
 
+## work/prompts/\<阶段\>-\<单元\>.md（`prompt_pack.py` 产出）
+
+Pass 1 的每一次调用对应一个**自包含**的 prompt 文件：类型体系、不改清单、
+facts schema、术语表摘要、分片正文、候选题面，全部已经拼进去了。
+
+| 阶段 | 文件 | 单元 | 输出 |
+|---|---|---|---|
+| review | `review-<片>.md` | 分片 | `issues-<片>.raw.jsonl` |
+| extract | `extract-<片>.md` | 分片 | `facts-<片>.json` |
+| typo | `typo-<片>-<批>.md` | 分片的一批候选 | `typos-<片>.<批>.verdicts.jsonl` |
+| pattern | `pattern-<片>-<批>.md` | 分片的一批候选 | `patterns-<片>.<批>.verdicts.jsonl` |
+
+**子 Agent 只读这一个文件、只写它指定的那一个文件。** 不要读 `references/` 下的
+任何文件，也不要读分片原文或候选主文件——需要的内容都在 prompt 里，
+读进去只会白占上下文。文件开头的注释块写明了输出路径与格式。
+
+单元与 claim 的对应关系由 `workspace.py claim next --stage <阶段>` 给出，
+它只返回 `{unit, chunk_id, stage, prompt, output}`——**没有 pid 列表**。
+
 ## issues-\<chunk\>.raw.jsonl（Pass 1 审查调用的输出 ← 你写这个）
 
 ```json

@@ -979,3 +979,52 @@ L 规则表、目录结构、配置项）不在此重复。
   `prompts/pass1-review.md`（`{{MAX_ISSUES}}`）/`pass2-verify.md`/`pass4-adjudicate.md`、
   `references/schemas.md`、`references/taxonomy.md`、`references/never-flag.md`、
   `references/logic-rules.md`、回归第 20–22 节（新增 27 项）。
+## ADR-040　子 Agent 的上下文是硬约束：一个单元 = 一次调用 = 一份产物
+
+- **日期**：2026-08-18
+- **背景**：ADR-039 的改动之后，在 OpenCode 与 Deepseek 两个 harness 上各跑了一次
+  同一份 800 页文档。分片降到 18 片（预期内），但**两次都没跑完**，
+  现象是子 Agent 频繁失败，已定位两条原因：上下文溢出，以及运行环境抖动。
+  拆开看是四件事：
+
+  1. **一个子 Agent 领一片、做三次调用**，它的上下文要同时装下 `taxonomy.md`
+     + `never-flag.md` + facts schema + 整片正文（还常常读两遍）+ 错别字候选
+     + 三份产物。窗口偏小的子 Agent 直接溢出。
+  2. **错别字候选主文件里同一批数据存了两份**（`candidates` 与 `batches[].items`），
+     200 个候选就是 8 万字符；子 Agent 读整份，上下文当场见底。
+  3. **`claim next` 把整条 chunk 元信息原样吐出**，其中 `pids` / `review_pids` /
+     `context_pids` 在长文档上是几百个条目。技能自己定的「不打印大对象」，
+     claim 是第一个破的。
+  4. **失败的代价是一整片**：环境抖一下，这一片的三次调用全白跑；而崩掉的子 Agent
+     还占着 claim 直到 TTL（当时是 60 分钟）到期，整轮都在等一个不会回来的活。
+
+- **决策**：把 Pass 1 的最小单位从「分片」降到「一次调用」。
+  - `workspace.py` 新增阶段化单元（`stage_units` / `next_pending_unit` /
+    `reclaim_stage`），claim 粒度变成 `<阶段>-<单元>`；`claim next --stage` 只返回
+    `{unit, chunk_id, stage, prompt, output}`，不再吐任何列表。
+  - 新增 `prompt_pack.py`：把每一次调用要用的东西预先拼成**一个自包含的 prompt 文件**。
+    子 Agent 的动作退化成「读一个文件 → 作答 → 写一个文件」，
+    它既不需要知道技能目录在哪，也没有机会顺手读进 `references/` 下的大文件。
+    实测单个子 Agent 的输入上界从「全套 references + 正文 + 候选」降到约 2.3 万字符。
+  - 错别字与范式的候选**按批分文件**（`typos-<片>.<批>.json`），题面只留四个字段；
+    裁定按 `tid` 回填（原先要回填 pid/wrong/context 三个字段，抄错一个字这条就静默消失）。
+  - 闸门改为整轮收口：`verify_span.py --all --channel main|typos|patterns`
+    与 `filter_neverflag.py --all --channel …`，一条命令扫完全部分片——
+    闸门是纯脚本，按片各发一次工具调用等于白白多 N 轮往返。
+  - `chunk_claim_minutes` 60 → 30：单元变小了，锁死的窗口也该同比例变小。
+- **备选**：继续压缩 `taxonomy.md` / `never-flag.md`（削弱的是第一道人工判据，
+  而闸门③本来就是脚本在兜底，收益不值得）；把分片切得更小（片数即调用数，
+  且定位准确率会掉）；提高并发（失败的单元要重派，重派比串行更贵）。
+- **顺带修掉的一个存量缺陷**：**「文件存在」不等于「做完了」**。脚本写盘走
+  `atomic_write_*`，半写不会表现为完成；但子 Agent 是用 shell 写的，被杀在中途就会
+  留下一个存在但截断的文件，而续跑判定只看文件在不在。更糟的是 `read_json` 对坏 JSON
+  静默返回默认值——整片事实凭空消失，报告里也看不出来。新增 `_common.product_ok`，
+  阶段完成判定改为「存在且可解析」，`claim status` 单独报 `corrupt`，
+  `state.py doctor --fix` 作废半写产物，`--all` 收口对坏文件只作废那一片并报数
+  （一个坏文件曾经会让整轮过闸以退出码 10 结束）。
+- **影响**：`scripts/workspace.py`、`scripts/prompt_pack.py`（新增）、`scripts/_common.py`、
+  `scripts/typo_scan.py`、`scripts/scan_patterns.py`、`scripts/verify_span.py`、
+  `scripts/filter_neverflag.py`、`scripts/state.py`、`scripts/chunk.py`、
+  `assets/config.default.yaml`、`SKILL.md` 第 3/4/4.5 步与并发一节、
+  `prompts/pass1-typo.md`、`prompts/pass1-pattern.md`、`references/schemas.md`、
+  回归第 23–24 节（新增 27 项）。

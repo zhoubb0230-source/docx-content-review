@@ -1810,5 +1810,220 @@ check "无法解析的裁定不写入交付入口" "$?" 0
 cp "$WORK/cv2.bak" "$CVF2" 2>/dev/null || true
 
 echo
+echo "══ 23. 阶段化单元：子 Agent 只读一个文件、只写一个文件 ══"
+
+mkdir -p "$WORK/st"
+cp "$F/typo-pattern.docx" "$WORK/st/st.docx"
+printf 'pattern_review:\n  enabled: true\n' > "$WORK/st/cfg.yaml"
+RUN6=$(cd "$WORK/st" && python3 "$S/workspace.py" init --source "$WORK/st/st.docx" \
+       --config "$WORK/st/cfg.yaml" --temp-dir "$TEMP" | jget "['run_dir']")
+python3 "$S/unpack.py" run --run-dir "$RUN6" >/dev/null
+python3 "$S/extract.py" --run-dir "$RUN6" >/dev/null
+python3 "$S/import_glossary.py" --run-dir "$RUN6" >/dev/null
+python3 "$S/chunk.py" --run-dir "$RUN6" >/dev/null
+python3 "$S/typo_scan.py" scan --run-dir "$RUN6" >/dev/null
+python3 "$S/scan_patterns.py" scan --run-dir "$RUN6" >/dev/null
+PP=$(python3 "$S/prompt_pack.py" build --run-dir "$RUN6")
+ge "四个阶段都渲染了 prompt" \
+   "$(echo "$PP" | jget "[\"written\"]['review']+d['written']['extract']+d['written']['typo']+d['written']['pattern']")" 4
+
+# 自包含：占位符全部填掉，且子 Agent 需要的东西都在文件里
+python3 - "$RUN6" <<'PYEOF'
+import glob,json,pathlib,sys
+run=pathlib.Path(sys.argv[1]); bad=[]
+chunk=(run/"work"/"chunks"/"chunk-0001.txt").read_text(encoding="utf-8")
+tax=(pathlib.Path(__file__).parent if False else None)
+rv=(run/"work"/"prompts"/"review-0001.md").read_text(encoding="utf-8")
+ex=(run/"work"/"prompts"/"extract-0001.md").read_text(encoding="utf-8")
+for name,txt in (("review",rv),("extract",ex)):
+    if "{{" in txt: bad.append(f"{name} 仍有未替换的占位符")
+    if chunk.strip()[:60] not in txt: bad.append(f"{name} 里没有分片正文")
+    if str(run) not in txt: bad.append(f"{name} 没写明输出路径")
+# 审查 prompt 必须自带类型体系与不改清单——否则子 Agent 还得去读 references/
+if "A2" not in rv or "绝对不要上报" not in rv: bad.append("review 缺类型体系/不改清单")
+# 抽取 prompt 不该夹带审查用的大文件
+if "绝对不要上报" in ex: bad.append("extract 夹带了不改清单（白占上下文）")
+for b in bad[:5]: print("   ", b)
+sys.exit(1 if bad else 0)
+PYEOF
+check "prompt 自包含：占位符已填、正文与输出路径都在、不夹带无关大文件" "$?" 0
+
+# 每个阶段的 prompt 都比"读全套 references"小得多；review 是上界
+python3 - "$RUN6" "$SKILL" <<'PYEOF'
+import pathlib,sys
+run,skill=pathlib.Path(sys.argv[1]),pathlib.Path(sys.argv[2])
+refs=sum(len((skill/"references"/f).read_text(encoding="utf-8"))
+         for f in ("taxonomy.md","never-flag.md","schemas.md"))
+sizes={p.name:len(p.read_text(encoding="utf-8"))
+       for p in (run/"work"/"prompts").glob("*.md")}
+big=[n for n,v in sizes.items() if not n.startswith("review") and v > refs]
+print("    ", {n:v for n,v in sorted(sizes.items())}, f"references 合计 {refs}")
+sys.exit(1 if big else 0)
+PYEOF
+check "非审查阶段的 prompt 小于三份 references 之和" "$?" 0
+
+# claim next 是给子 Agent 看的：只给它用得上的路径，不吐 pid 列表
+CN=$(python3 "$S/workspace.py" claim next --run-dir "$RUN6" --stage review --session s-st)
+check "claim next 返回单元与两个路径" "$(echo "$CN" | jget "['chunk']['unit']")" 0001
+python3 - <<PYEOF
+import json,sys
+d=json.loads('''$CN''')["chunk"]
+bad=[k for k in ("pids","review_pids","context_pids") if k in d]
+if bad: print("    claim 输出里有大列表：", bad)
+if len(json.dumps(d,ensure_ascii=False)) > 600: print("    claim 输出过大：", len(json.dumps(d)))
+sys.exit(1 if bad or len(json.dumps(d,ensure_ascii=False)) > 600 else 0)
+PYEOF
+check "claim next 不吐大对象（无 pid 列表、体量受控）" "$?" 0
+
+# 阶段之间互不干扰：review 被占住，extract 照领不误
+CE=$(python3 "$S/workspace.py" claim next --run-dir "$RUN6" --stage extract --session s-st2)
+check "另一阶段的同一分片可并行领取" "$(echo "$CE" | jget "['chunk']['stage']")" extract
+CR=$(python3 "$S/workspace.py" claim next --run-dir "$RUN6" --stage review --session s-other)
+check "同阶段同单元不会被两个会话同时领走" "$(echo "$CR" | jget "['exhausted']")" True
+
+# 子 Agent 崩了：claim 还在、产物没有。不 reclaim 就一直锁到 TTL
+ST=$(python3 "$S/workspace.py" claim status --run-dir "$RUN6" --stage review)
+check "崩掉的单元仍被计为 claimed" "$(echo "$ST" | jget "['claimed']")" 1
+RC=$(python3 "$S/workspace.py" claim reclaim --run-dir "$RUN6" --stage review --session s-st)
+check "reclaim 回收本会话没有产物的 claim" "$(echo "$RC" | jget "['released']")" 1
+CR2=$(python3 "$S/workspace.py" claim next --run-dir "$RUN6" --stage review --session s-other)
+check "回收后可被重新领走（重派是安全的）" "$(echo "$CR2" | jget "['chunk']['unit']")" 0001
+
+# 别人正在跑的 claim 不许动
+python3 "$S/workspace.py" claim reclaim --run-dir "$RUN6" --stage review --session s-st >/dev/null
+CR3=$(python3 "$S/workspace.py" claim status --run-dir "$RUN6" --stage review)
+check "带 --session 的 reclaim 不动别的会话" "$(echo "$CR3" | jget "['claimed']")" 1
+
+# 三波产出 → 一次性收口。三条通道的产物互不覆盖
+python3 - "$RUN6" <<'PYEOF'
+import json,pathlib,sys
+run=pathlib.Path(sys.argv[1])
+paras={json.loads(l)["text"]:json.loads(l)["pid"]
+       for l in open(run/"work"/"paragraphs.jsonl",encoding="utf-8")}
+pid=next(p for t,p in paras.items() if "阀值" in t)
+(run/"work"/"issues").mkdir(parents=True,exist_ok=True)
+(run/"work"/"issues"/"issues-0001.raw.jsonl").write_text(json.dumps(
+ {"pid":pid,"category":"A8","original_text":"设定为 200 毫秒","suggested_text":"设定为 200ms",
+  "evidence":"单位不统一","severity":"High"},ensure_ascii=False)+"\n",encoding="utf-8")
+(run/"work"/"facts").mkdir(parents=True,exist_ok=True)
+(run/"work"/"facts"/"facts-0001.json").write_text("{}",encoding="utf-8")
+t=json.load(open(run/"work"/"typos"/"typos-0001.t01.json",encoding="utf-8"))
+(run/"work"/"typos"/"typos-0001.t01.verdicts.jsonl").write_text(
+  "".join(json.dumps({"tid":x["tid"],"verdict":"B"},ensure_ascii=False)+"\n"
+          for x in t["items"]),encoding="utf-8")
+p=json.load(open(run/"work"/"patterns"/"patterns-0001.p01.json",encoding="utf-8"))
+v={0:{"impact":"Y","mitigation":"Y","owner":"Y"},1:{"impact":"N","mitigation":"N","owner":"U"},
+   2:{"request":"Y","response":"Y","error":"Y"},3:{"request":"Y","response":"N","error":"N"}}
+with open(run/"work"/"patterns"/"patterns-0001.p01.verdicts.jsonl","w",encoding="utf-8") as f:
+    for i,c in enumerate(p["items"]):
+        for k,a in v[i].items():
+            f.write(json.dumps({"cid":c["cid"],"key":k,"answer":a},ensure_ascii=False)+"\n")
+PYEOF
+python3 "$S/verify_span.py" --run-dir "$RUN6" --all --channel main >/dev/null
+python3 "$S/filter_neverflag.py" --run-dir "$RUN6" --all --channel main >/dev/null
+python3 "$S/typo_scan.py" merge --run-dir "$RUN6" >/dev/null
+TSW=$(python3 "$S/verify_span.py" --run-dir "$RUN6" --all --channel typos)
+python3 "$S/filter_neverflag.py" --run-dir "$RUN6" --all --channel typos >/dev/null
+python3 "$S/scan_patterns.py" merge --run-dir "$RUN6" >/dev/null
+PSW=$(python3 "$S/verify_span.py" --run-dir "$RUN6" --all --channel patterns)
+ge "错别字通道整轮过闸（tid 回填对得上）" "$(echo "$TSW" | jget "['count']")" 8
+ge "范式通道整轮过闸" "$(echo "$PSW" | jget "['count']")" 2
+python3 - "$RUN6" <<'PYEOF'
+import json,pathlib,sys
+d=pathlib.Path(sys.argv[1],"work","issues")
+main=[json.loads(l) for l in open(d/"issues-0001.jsonl",encoding="utf-8")]
+typo=[json.loads(l) for l in open(d/"issues-0001.typos.jsonl",encoding="utf-8")]
+pat=[json.loads(l) for l in open(d/"issues-0001.patterns.jsonl",encoding="utf-8")]
+bad=[]
+if {r["category"] for r in main} != {"A8"}: bad.append("主通道被支线覆盖了")
+if {r["category"] for r in typo} != {"A1"}: bad.append("错别字通道内容不对")
+if {r["category"] for r in pat} != {"P1"}: bad.append("范式通道内容不对")
+for b in bad: print("   ", b)
+sys.exit(1 if bad else 0)
+PYEOF
+check "三条通道的产物互不覆盖（--all 扫描按通道分文件）" "$?" 0
+
+# 全部单元完成后，各阶段都应报 exhausted
+for st in review extract typo pattern; do
+  E=$(python3 "$S/workspace.py" claim next --run-dir "$RUN6" --stage "$st" --session s-fin | jget "['exhausted']")
+  [ "$E" = "True" ] || bad "阶段 $st 仍有未完成单元"
+done
+ok "四个阶段全部完成后不再派活（产物存在即状态）"
+
+# 重切片必须把已渲染的 prompt 一并作废，否则子 Agent 会照着旧正文作答
+printf 'chunking:\n  max_text_tokens: 300\n  single_pass_limit: 100\n' > "$WORK/st/small.yaml"
+python3 "$S/chunk.py" --run-dir "$RUN6" --config "$WORK/st/small.yaml" >/dev/null
+check "重切片后旧的 prompt 已作废" \
+  "$([ -f "$RUN6/work/prompts/review-0001.md" ] && echo no || echo yes)" yes
+PPL=$(python3 "$S/prompt_pack.py" list --run-dir "$RUN6" --stage review)
+ge "重切片后单元数变多" "$(echo "$PPL" | jget "['stages']['review']['units']")" 2
+check "重切片后 prompt 缺失可被发现" "$(echo "$PPL" | jget "['stages']['review']['prompts']")" 0
+
+echo
+echo "══ 24. 环境抖动：半写产物不得被当成「已完成」 ══"
+
+# 重新把 RUN6 切回默认切法并补齐题面
+python3 "$S/chunk.py" --run-dir "$RUN6" >/dev/null
+python3 "$S/typo_scan.py" scan --run-dir "$RUN6" >/dev/null
+python3 "$S/scan_patterns.py" scan --run-dir "$RUN6" >/dev/null
+python3 "$S/prompt_pack.py" build --run-dir "$RUN6" >/dev/null
+rm -f "$RUN6"/work/chunks/*.claim
+
+# 子 Agent 写到一半被杀：facts 是截断的 JSON
+python3 - "$RUN6" <<'PYEOF'
+import pathlib,sys
+f=pathlib.Path(sys.argv[1],"work","facts","facts-0001.json")
+f.parent.mkdir(parents=True,exist_ok=True)
+f.write_text('{"terms":[{"term":"边缘节点","definit', encoding="utf-8")   # 断在半路
+PYEOF
+check "半写产物文件确实存在（构造成立）" \
+  "$([ -s "$RUN6/work/facts/facts-0001.json" ] && echo yes || echo no)" yes
+SE=$(python3 "$S/workspace.py" claim status --run-dir "$RUN6" --stage extract)
+check "半写不算完成" "$(echo "$SE" | jget "['done']")" 0
+ge "半写被单独报出来" "$(echo "$SE" | jget "['corrupt']")" 1
+CX=$(python3 "$S/workspace.py" claim next --run-dir "$RUN6" --stage extract --session s-fix)
+check "半写的单元会被重新派出去" "$(echo "$CX" | jget "['chunk']['unit']")" 0001
+
+# 负向对照：按「文件存在」判定的话，这个单元就是"已完成"——
+# 而 read_json 对坏 JSON 静默返回默认值，整片事实凭空消失，报告里也看不出来
+python3 - "$S" "$RUN6" <<'PYEOF'
+import pathlib,sys
+sys.path.insert(0, sys.argv[1])
+import workspace as ws
+u=[x for x in ws.stage_units(pathlib.Path(sys.argv[2]), "extract") if x["unit"]=="0001"][0]
+exists_only = u["done_marker"].exists()
+really_ok   = ws.product_ok(u["done_marker"])
+print(f"    按存在性判定：{exists_only}；按可解析判定：{really_ok}")
+sys.exit(0 if (exists_only and not really_ok) else 1)
+PYEOF
+check "负向对照：只看存在性会把半写判成已完成" "$?" 0
+
+DOC=$(python3 "$S/state.py" doctor --run-dir "$RUN6" --fix)
+ge "doctor 报出半写产物" "$(echo "$DOC" | jget "['findings']" | grep -c 半写)" 1
+check "doctor --fix 之后半写产物已作废" \
+  "$([ -f "$RUN6/work/facts/facts-0001.json" ] && echo no || echo yes)" yes
+
+# 收口时一个坏文件不得拖垮整轮：其余分片照常过闸
+python3 "$S/chunk.py" --run-dir "$RUN6" --config "$WORK/st/small.yaml" >/dev/null
+python3 - "$RUN6" <<'PYEOF'
+import json,pathlib,sys
+run=pathlib.Path(sys.argv[1]); d=run/"work"/"issues"; d.mkdir(parents=True,exist_ok=True)
+ids=[c["chunk_id"] for c in json.load(open(run/"work"/"chunks"/"index.json",encoding="utf-8"))["chunks"]]
+paras=[json.loads(l) for l in open(run/"work"/"paragraphs.jsonl",encoding="utf-8")]
+pids={c: [p["pid"] for p in paras if p["pid"] in set(
+        json.load(open(run/"work"/"chunks"/"index.json",encoding="utf-8"))["chunks"][i]["pids"])]
+      for i, c in enumerate(ids)}
+good=json.dumps({"pid":pids[ids[-1]][0],"category":"A2","original_text":"认真的完成",
+                 "suggested_text":"认真地完成","evidence":"状语应用地","severity":"High"},
+                ensure_ascii=False)
+(d/f"issues-{ids[0]}.raw.jsonl").write_text('{"pid":"p-000001","categ', encoding="utf-8")  # 半写
+(d/f"issues-{ids[-1]}.raw.jsonl").write_text(good+"\n", encoding="utf-8")
+print(f"    构造：{ids[0]} 半写，{ids[-1]} 完整（共 {len(ids)} 片）")
+PYEOF
+SW=$(python3 "$S/verify_span.py" --run-dir "$RUN6" --all --channel main)
+ge "半写的那一片被单独作废并报数" "$(echo "$SW" | jget "['unparsable']")" 1
+ge "其余分片照常过闸（一个坏文件不拖垮整轮）" "$(echo "$SW" | jget "['chunks']")" 1
+
+echo
 printf '通过 \033[32m%d\033[0m，失败 \033[31m%d\033[0m\n' "$PASS" "$FAIL"
 [ "$FAIL" -eq 0 ]

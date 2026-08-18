@@ -327,6 +327,8 @@ def main(argv: list[str]) -> int:
     ap.add_argument("--run-dir")
     ap.add_argument("--chunk")
     ap.add_argument("--all", action="store_true")
+    ap.add_argument("--channel", choices=["main", "typos", "patterns"], default="main",
+                    help="--all 时决定扫哪一条通道的产物")
     ap.add_argument("--file", help="直接指定要过滤的 issues 文件；"
                                    "侧通道（错别字/范式）用它指向自己的产物")
     ap.add_argument("--config")
@@ -358,17 +360,23 @@ def main(argv: list[str]) -> int:
     glossary = read_json(resolve_path(run_dir, "glossary_merged"), {}) or {}
     groups, fallback = _alias_groups(glossary), _fallback_terms(glossary)
 
+    idir = resolve_path(run_dir, "issues")
+    suffix = {"main": "", "typos": ".typos", "patterns": ".patterns"}[args.channel]
     ids = []
     if args.all:
+        # 通道决定看哪一批文件：主通道 issues-<c>.jsonl，侧通道 issues-<c>.<通道>.jsonl
         ids = sorted(p.name.split("-")[1].split(".")[0]
-                     for p in resolve_path(run_dir, "issues").glob("issues-*.jsonl")
-                     if p.name.count(".") == 1)
+                     for p in idir.glob(f"issues-*{suffix}.jsonl")
+                     if p.name.count(".") == (1 if args.channel == "main" else 2)
+                     and not p.name.endswith(".raw.jsonl"))
     elif args.chunk:
         ids = [args.chunk]
     target = Path(args.file) if args.file else None
     if target and not args.chunk:
         die(EX.USAGE, "--file 必须与 --chunk 一起使用")
-    results = [process_chunk(run_dir, c, cfg, paras, glossary, groups, fallback, target)
+    results = [process_chunk(run_dir, c, cfg, paras, glossary, groups, fallback,
+                             target or (idir / f"issues-{c}{suffix}.jsonl"
+                                        if suffix else None))
                for c in ids]
     emit({"ok": True, "chunks": len(results),
           "dropped": sum(r.get("dropped", 0) for r in results),

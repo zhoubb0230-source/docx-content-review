@@ -165,7 +165,8 @@ def scan(run_dir: Path, cfg: dict, chunk_id: str | None) -> dict:
                     continue
                 for m in re.finditer(re.escape(wrong), text):
                     lo, hi = _unique_window(text, m.start(), m.end())
-                    cands.append({"pid": pid, "wrong": wrong, "right": right,
+                    cands.append({"tid": f"{c['chunk_id']}-{len(cands) + 1:03d}",
+                                  "pid": pid, "wrong": wrong, "right": right,
                                   "rule": "common-typos" if (wrong, right, why) in typos
                                           else "glossary-forbidden",
                                   "reason": why, "context": text[lo:hi],
@@ -178,12 +179,29 @@ def scan(run_dir: Path, cfg: dict, chunk_id: str | None) -> dict:
             # 它要有信噪比，前提是先做分词 + 未登录词检测——而未登录词检测需要
             # 5 万词级词表，内置词表远未达到该规模（config: typo_check.oov_detection）。
             # 这两份词表目前只作为写 common-typos.txt 时的人工参照，不参与运行期判定。
-        cap = int(tc.get("max_typos_per_chunk") or 100)
+        cap = int(tc.get("max_typos_per_chunk") or 200)
         truncated = len(cands) > cap
         cands = cands[:cap]                    # 独立配额，不占用 max_issues_per_chunk
         batch = int(tc.get("batch_size") or 50)
-        batches = [{"batch_id": f"t{i//batch + 1:02d}", "items": cands[i:i + batch]}
-                   for i in range(0, len(cands), batch)]
+        groups = [cands[i:i + batch] for i in range(0, len(cands), batch)]
+
+        # 主文件只给 merge 用；**分批题面单独落盘，子 Agent 只读自己那一批**。
+        # 以前主文件里 candidates 与 batches[].items 是同一批数据的两份拷贝，
+        # 200 个候选就是 8 万字符——子 Agent 一读整份，上下文当场见底。
+        for old_batch in tdir.glob(f"typos-{c['chunk_id']}.t*.json"):
+            old_batch.unlink()
+        batches = []
+        for n, g in enumerate(groups, 1):
+            bid = f"t{n:02d}"
+            bpath = tdir / f"typos-{c['chunk_id']}.{bid}.json"
+            guard_write_path(bpath, run_dir)
+            atomic_write_json(bpath, {
+                **version_header(), "chunk_id": c["chunk_id"], "batch_id": bid,
+                # 题面只要这四项：定位靠 tid，判断靠 context + 两种写法
+                "items": [{"tid": x["tid"], "context": x["context"],
+                           "wrong": x["wrong"], "right": x["right"]} for x in g]})
+            batches.append({"batch_id": bid, "count": len(g)})
+
         payload = {**version_header(), "chunk_id": c["chunk_id"], "candidates": cands,
                    "truncated": truncated, "batches": batches,
                    "require_llm_adjudication": bool(tc.get("require_llm_adjudication", True))}
@@ -200,19 +218,29 @@ def merge(run_dir: Path, cfg: dict, chunk_id: str) -> dict:
     """把 LLM 裁定结果并入该片的 issues。裁定为 A（原字正确）或「都不对」的一律丢弃。"""
     tc = cfg.get("typo_check") or {}
     tdir = resolve_path(run_dir, "typos")
-    verdict_path = tdir / f"typos-{chunk_id}.verdicts.jsonl"
-    if not verdict_path.exists():
-        return {"merged": 0, "note": f"无裁定结果：{verdict_path}"}
+    # 分批裁定（每批一个文件，可并行）+ 旧的整片单文件写法，两种都收
+    verdict_files = sorted(tdir.glob(f"typos-{chunk_id}.t*.verdicts.jsonl"))
+    single = tdir / f"typos-{chunk_id}.verdicts.jsonl"
+    if single.exists():
+        verdict_files.insert(0, single)
+    if not verdict_files:
+        return {"merged": 0, "note": f"无裁定结果：{tdir}/typos-{chunk_id}[.tNN].verdicts.jsonl"}
     payload = read_json(tdir / f"typos-{chunk_id}.json", {}) or {}
     cands = {(c["pid"], c["wrong"], c["context"]): c for c in payload.get("candidates", [])}
+    by_tid = {c["tid"]: c for c in payload.get("candidates", []) if c.get("tid")}
 
-    rows = []
-    for v in read_jsonl(verdict_path):
+    rows, seen = [], set()
+    for v in [x for f in verdict_files for x in read_jsonl(f)]:
         if str(v.get("verdict", "")).strip().upper() != "B":
             continue                      # 只有裁定「应为建议写法」才采纳
-        c = cands.get((v.get("pid"), v.get("wrong"), v.get("context"))) or {}
-        if not c:
+        # tid 是首选定位方式：回填 pid/wrong/context 三个字段容易抄错，
+        # 抄错的结果是这一条静默消失（对不上候选就丢），没有任何痕迹。
+        c = by_tid.get(v.get("tid")) or cands.get(
+            (v.get("pid"), v.get("wrong"), v.get("context"))) or {}
+        if not c or c.get("tid") in seen:
             continue
+        if c.get("tid"):
+            seen.add(c["tid"])
         # 只替换裁定针对的那一处：窗口里可能出现两次同一个错词
         # （「1200ms」里就含着「200ms」），全局 replace 会顺手改掉不该改的那个。
         orig, at = c["original_text"], c.get("wrong_at")
@@ -244,7 +272,7 @@ def main(argv: list[str]) -> int:
     p.add_argument("--config")
     p = sub.add_parser("merge")
     p.add_argument("--run-dir", required=True)
-    p.add_argument("--chunk", required=True)
+    p.add_argument("--chunk", help="不给 = 合并全部分片（阶段化流程用这个）")
     p.add_argument("--config")
     p = sub.add_parser("lint", help="自检词表，不需要 run 目录")
     # 允许指向别处的词表：技能目录在运行期只读，负向对照不该去改它
@@ -259,8 +287,12 @@ def main(argv: list[str]) -> int:
     cfg = load_run_config(run_dir, args.config)
     if args.cmd == "scan":
         emit({"ok": True, **scan(run_dir, cfg, args.chunk)})
-    else:
+    elif args.chunk:
         emit({"ok": True, **merge(run_dir, cfg, args.chunk)})
+    else:
+        res = [merge(run_dir, cfg, c["chunk_id"]) for c in
+               (read_json(resolve_path(run_dir, "chunk_index"), {}) or {}).get("chunks", [])]
+        emit({"ok": True, "chunks": len(res), "merged": sum(r["merged"] for r in res)})
     return EX.OK
 
 

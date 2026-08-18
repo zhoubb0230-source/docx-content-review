@@ -25,11 +25,12 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from _common import (  # noqa: E402
+    product_ok,
     EX, atomic_write_json, emit, now_iso, read_json, run_cli, version_header,
 )
 from workspace import (  # noqa: E402
     chunk_done, claim_path, guard_write_path, lease_heartbeat, lease_status, lease_verify,
-    list_chunk_ids, load_run_config, resolve_path,
+    STAGES, list_chunk_ids, load_run_config, resolve_path, stage_units,
 )
 
 
@@ -122,6 +123,25 @@ def doctor(run_dir: Path, cfg: dict, fix: bool) -> dict:
             if fix:
                 cp.unlink(missing_ok=True)
                 fixed.append(f"回收 claim {cid}（标记完成，不重跑）")
+
+    # 阶段化单元：两类残留。claim 还在但产物已完成（子 Agent 崩在写盘与释放之间），
+    # 以及产物存在但解析不了（写到一半断了）。后者更危险——「文件存在即完成」
+    # 会把半截产物当成做完了，而 read_json 对坏 JSON 是静默返回默认值。
+    for stage in STAGES:
+        for u in stage_units(run_dir, stage):
+            cp = claim_path(run_dir, u["unit"], stage)
+            ok = product_ok(u["done_marker"])
+            if u["done_marker"].exists() and not ok:
+                findings.append(f"产物半写（存在但解析不了）：{stage}/{u['unit']}")
+                if fix:
+                    u["done_marker"].unlink(missing_ok=True)
+                    cp.unlink(missing_ok=True)
+                    fixed.append(f"作废半写产物 {stage}/{u['unit']}（下一轮重跑）")
+            elif cp.exists() and ok:
+                findings.append(f"claim 残留但产物已存在：{stage}/{u['unit']}")
+                if fix:
+                    cp.unlink(missing_ok=True)
+                    fixed.append(f"回收 claim {stage}/{u['unit']}")
 
     man_path = resolve_path(run_dir, "manifest")
     if not man_path.exists() or read_json(man_path) is None:

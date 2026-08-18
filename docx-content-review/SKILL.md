@@ -144,120 +144,122 @@ import_glossary.py --run-dir <run> [--authoritative <表>] [--fallback <表>]
 
 > 有权威术语表且 `term_rules` 打开时，命名不一致类问题可从「批注」升级为「修订」（L25/L26）。
 
-### 第 3 步：分片
+### 第 3 步：分片与题面准备
 
 ```
-chunk.py --run-dir <run>
+chunk.py --run-dir <run>                                  # 切片
+typo_scan.py scan --run-dir <run>                         # 错别字候选，整篇一次
+scan_patterns.py scan --run-dir <run> [--patterns <包>]   # 范式候选（默认关，跳过）
+prompt_pack.py build --run-dir <run>                      # 渲染每次调用的自包含 prompt
 ```
 
-判据是 token 不是页数。返回 `single_pass: true` 即单片模式。`table_only` 类型的分片**不发起审查调用**，只发起事实抽取调用。
+判据是 token 不是页数。`chunk.py` 返回 `single_pass: true` 即单片模式。
+`table_only` 类型的分片**不发起审查调用**，只发起事实抽取调用。
 
-**片数就是工作量**：每片三次调用，全流程的耗时基本与片数成正比。返回里的
-`chunks` / `review_calls` 值得看一眼——一份 800 页的中文文档在默认配置下约 20 片。
-明显更多（比如 30 片以上）说明配置里的 `max_text_tokens` 被调小了，或者
-`split_point_fill_ratio` 太低（标题一多就断，每片只装了半程）。
+**片数就是工作量**：一份 800 页的中文文档在默认配置下约 20 片。明显更多说明
+`max_text_tokens` 被调小了，或 `split_point_fill_ratio` 太低（标题一多就断）。
 
-**改了 `chunking` 下的任何参数，必须重跑这一步**，而且要看返回的
-`stale_chunks_cleared`：切法一变，旧的 `issues-<id>` / `facts-<id>` 就与新的
-同号分片对不上了，脚本会把它们作废。这个数不为 0 是正常的——那些片会重新审查。
+**改了 `chunking` 下的任何参数必须重跑这一步**，并看 `stale_chunks_cleared`：
+切法一变，旧的 `issues-<id>` / `facts-<id>` 就与同号的新分片对不上了，脚本会把它们
+连同已渲染的 prompt 一起作废。这个数不为 0 是正常的——那些片会重新审查。
 
-### 第 4 步：Pass 1　逐片审查与抽取（并行）
+**`prompt_pack.py` 是这一步的关键。** 它把每一次调用要用的东西——类型体系、
+不改清单、facts schema、术语表摘要、分片正文、候选题面——**预先拼成一个文件**，
+一个单元一个。子 Agent 因此只需要「读一个文件 → 作答 → 写一个文件」，
+既不必知道技能目录在哪，也没有机会顺手把 `references/` 下的大文件读进上下文。
 
-**一个子 Agent 只做一片，做完就退出。** 不要让一个子 Agent 循环 claim 多片：
-子 Agent 的每一次工具往返都要重算它当下的全部上下文，而上下文会随做过的片数累积
-（实测连做 5 片后到 175k）。连做的开销是平方级的，一片一个只是重复读一遍
-类型体系与不改清单，便宜得多。
+返回里的 `max_chars` 是**单个子 Agent 的输入规模上界**，值得看一眼：
+默认配置下约 2.3 万字符（固定开销约 8 千 + 分片正文）。子 Agent 的上下文窗口偏小时，
+调低 `chunking.max_text_tokens` 重跑第 3 步即可——这个数会同比例下降。
 
-主 Agent 每轮派 `parallelism` 个子 Agent，各领一片；本轮全部返回后再派下一轮，
-直到 `claim next` 返回 `exhausted: true`。**主 Agent 不做任何分配决策**，
-也不接收问题正文——子 Agent 只回 `{路径, 计数, 状态}`。
+### 第 4 步：Pass 1　三波并行
 
-子 Agent 拿到一片之后，**全程只需三轮工具调用**。轮次本身就是成本：
-每片有 20 多轮的旧写法里，只有 3 轮在做审查，其余全是记账，而每一轮都要重算上下文。
+**一个子 Agent 只做一件事：一次调用，一份产物。** 不要让它领一整片去做三件事——
+那样它的上下文要同时装下类型体系、facts schema、整片正文、错别字候选和三份产物，
+在窗口偏小的子 Agent 上会直接溢出；而且**环境抖一下，这一片的三次调用全白跑**。
 
-**第一轮 · 领片**
+| 波次 | `--stage` | 单元 | 读 | 写 |
+|---|---|---|---|---|
+| 一 | `review` | 每个非纯表格分片 | `work/prompts/review-<片>.md` | `issues-<片>.raw.jsonl` |
+| 二 | `extract` | 每个分片 | `work/prompts/extract-<片>.md` | `facts-<片>.json` |
+| 三 | `typo` / `pattern` | 每片每批候选 | `work/prompts/typo-<片>-<批>.md` | `typos-<片>.<批>.verdicts.jsonl` |
 
-```
-workspace.py claim next --run-dir <run> --session <sid> --generation <n>
-  → exhausted:true 就退出；否则拿到 chunk_id、chunk_type、以及本片的候选情况
-```
+三波之间没有依赖，先后顺序随意，也可以混在一起派——分开只是为了让每一波的
+子 Agent 指令完全一致、便于统计。**波内当然并行。**
 
-**第二轮 · 三次独立调用**（绝不合并成一次，理由见「中等能力模型适配」第 1 条）
-
-1. **审查**：`references/prompts/pass1-review.md` + `work/chunks/chunk-<id>.txt`
-   → `work/issues/issues-<id>.raw.jsonl`
-2. **事实抽取**：`references/prompts/pass1-extract.md` + 同一分片
-   → `work/facts/facts-<id>.json`
-3. **错别字裁定**（该片有候选时才做，见第 4.5 步）→ `work/typos/typos-<id>.verdicts.jsonl`
-
-每次调用的输出**一次性整块写盘**（一个 heredoc 写完本次的全部行）。
-**不要逐行追加**——一行一次工具往返，一片 20 条就是 20 轮。
-
-`claim` 的 TTL（`chunk_claim_minutes`，默认 60 分钟）覆盖单片全程，
-正常情况下不需要续期。只有当某一片因限流退避明显卡住时，才补一次
-`workspace.py claim renew --run-dir <run> --chunk <id> --session <sid>`。
-
-**第三轮 · 过闸门**，用 `&&` 串成一条命令（顺序不能变；三条通道各过各的闸）：
+**主 Agent 每一波的循环**：
 
 ```
-verify_span.py --run-dir <run> --chunk <id> && \
-filter_neverflag.py --run-dir <run> --chunk <id> && \
-typo_scan.py merge --run-dir <run> --chunk <id> && \
-verify_span.py --run-dir <run> --chunk <id> \
-  --in work/issues/issues-<id>.typos.jsonl --out work/issues/issues-<id>.typos.jsonl --cap 200 && \
-filter_neverflag.py --run-dir <run> --chunk <id> --file work/issues/issues-<id>.typos.jsonl && \
-metrics.py bump --run-dir <run> --pass pass1_review
+workspace.py claim next --run-dir <run> --stage <阶段> --session <sid> --generation <n>
+  → exhausted:true 就换下一波；否则拿到 {unit, prompt, output}
 ```
 
-（该片没有错别字候选时，去掉中间那三条。范式支线开启时按第 4.5 步再串三条。）
+把 `prompt` 与 `output` 两个路径原样交给子 Agent，指令就一句：
 
-`metrics.py bump` 的 `--input-tokens` / `--output-tokens` 是可选的：平台能报出用量就带上，
-报不出就不带——**不要为了填这两个数额外发起一次工具调用**，闸门丢弃率才是调 prompt 的依据，
-token 数只是成本旁证。
+> 读 `<prompt>` 这个文件，照它写的做，把结果写到它指定的 `<output>`，
+> 然后返回 `{"unit":…, "lines":N}`。**不要读别的文件，不要把正文内容带回来。**
 
-输出无法解析成 JSONL 时**重试一次**，提示"上次输出无法解析"；二次失败：
-`state.py mark --run-dir <run> --chunk <id> --status failed --error "json parse error"`
+每轮派 `parallelism` 个，全部返回后再派下一轮，直到 `exhausted`。
+**主 Agent 上下文里只留统计数字。**
 
-**子 Agent 只返回 `{路径, 计数, 状态}`，绝不返回问题正文。** 主 Agent 上下文只保留统计数字。
+**收口（纯脚本，主 Agent 一次跑完，不要按片各跑一次）**：
 
-### 第 4.5 步：两条支线（错别字 / 范式）
+```
+verify_span.py --run-dir <run> --all --channel main && \
+filter_neverflag.py --run-dir <run> --all --channel main && \
+typo_scan.py merge --run-dir <run> && \
+verify_span.py --run-dir <run> --all --channel typos && \
+filter_neverflag.py --run-dir <run> --all --channel typos
+```
+
+（范式支线开启时，把最后三条换成 `scan_patterns.py merge` + `--channel patterns` 的两条。）
+
+`metrics.py bump --run-dir <run> --pass pass1_review`（以及 `--pass typo` / `--pass pattern`）
+每波记一次即可。`--input-tokens` / `--output-tokens` 可选：平台报得出就带上，
+**不要为了填这两个数额外发一次工具调用**。
+
+#### 子 Agent 失败了怎么办（会失败，要按会失败来设计）
+
+产物存在性即状态，所以**重派是安全的**：已完成的单元不会被重做，失败的单元
+下一轮会被重新领走。三件事必须做：
+
+1. **回收崩掉的 claim。** 子 Agent 中途死掉时，它占着的单元会一直锁到 TTL
+   （`chunk_claim_minutes`，默认 60 分钟）到期——整轮都在等一个不会回来的活。
+   每波结束后跑一次：
+   `workspace.py claim reclaim --run-dir <run> --stage <阶段> --session <sid>`
+   （带 `--session` 只回收本会话自己的；别人的正在跑，不能动。）
+2. **看 `claim status`。** `workspace.py claim status --run-dir <run> --stage <阶段>`
+   给出 total / done / claimed / pending，以及前 20 个 pending 单元。
+   `pending` 不再下降就是卡住了，不要空转。
+3. **同一单元连续失败 3 次就放过它**（`retry.max_attempts_per_chunk`）：
+   `state.py mark --run-dir <run> --chunk <片> --status failed --error "<原因>"`，
+   继续下一波。报告会写明哪些片没审到——**不要因为一片失败就整轮重来**。
+
+**半写的产物不会被当成完成。** 子 Agent 被杀在写盘中途时，会留下一个存在但
+截断的文件。`claim status` 把这类单元单独报成 `corrupt`，它们照常会被重新派出去；
+收口时 `--all` 只作废那一片并在 `unparsable` 里报数，**不会因为一个坏文件
+让整轮过闸退出**。想一次清干净就跑 `state.py doctor --run-dir <run> --fix`。
+
+输出无法解析成 JSONL 时**重试一次**，提示"上次输出无法解析"；二次失败按上面第 3 条处理。
+
+子 Agent 频繁失败（而不是偶发）时，先降 `concurrency.parallelism`，
+再考虑调低 `chunking.max_text_tokens` 让单元变小——**不要提高并发去"赶进度"**。
+
+### 第 4.5 步：两条支线在做什么（错别字 / 范式）
 
 这两类问题都**不能靠主审查顺带发现**，各走独立通道：脚本出候选 → 模型答封闭题 →
-过同样的两道闸门。两条支线各有独立配额，不占用主审查每片的问题上限。
+过同样的两道闸门。两条支线各有独立配额，不占用主审查每片的条数上限。
 
-与主审查是三次独立调用，**绝不合并**。支线在同一个 claim 周期里做完。
+候选扫描与题面渲染都在第 3 步做完了，第 4 步的第三波只是去答题。
+`typo_scan.py scan` 的返回里带每片的候选数，**候选为 0 的片不会生成单元**，
+不需要你判断。
 
-**候选扫描在第 3 步之后由主 Agent 整篇跑一次，不要每片跑一次**——
-它是纯脚本，一次跑完全部分片；分到每片去跑只是多 N 轮工具往返：
+**错别字**（`typo_check.enabled` 默认开）：模型对错别字有鲁棒性，让它自己找先天不利，
+所以退化成二选一——A 原字正确 / B 应改 / C 都不对。裁定按 `tid` 回填，
+`typo_scan.py merge` 只采纳 B。
 
-```
-typo_scan.py scan --run-dir <run>                        # 不带 --chunk = 整篇
-scan_patterns.py scan --run-dir <run> [--patterns <规则包>]   # 范式支线开启时
-```
-
-返回里带每片的 `candidates`。**候选为 0 的片直接跳过对应支线**，不要为它发起调用。
-
-**错别字**（`typo_check.enabled` 默认开）——模型对错别字有鲁棒性，让它自己找先天不利：
-对 `work/typos/typos-<id>.json` 的每个 batch，按 `prompts/pass1-typo.md` 发起调用
-（二选一：A 原字正确 / B 应改 / C 都不对），整块写入 `typos-<id>.verdicts.jsonl`，
-随后由第 4 步第三轮那条命令里的 `typo_scan.py merge` + 两道闸门收口。
-
-**范式**（`pattern_review.enabled` 默认关，无规则包时自动跳过）——用户提供规则包后才有内容：
-按 `prompts/pass1-pattern.md` 逐 batch 裁定（每个要件只答 Y/N/U），写入
-`work/patterns/patterns-<id>.verdicts.jsonl`，然后：
-
-```
-scan_patterns.py merge --run-dir <run> --chunk <id> [--patterns <规则包>] && \
-verify_span.py --run-dir <run> --chunk <id> \
-  --in work/issues/issues-<id>.patterns.jsonl --out work/issues/issues-<id>.patterns.jsonl --cap 40 && \
-filter_neverflag.py --run-dir <run> --chunk <id> --file work/issues/issues-<id>.patterns.jsonl
-```
-
-**`--in` 与 `--out` 必须同时给且指向支线自己的文件**——不给 `--out` 会覆盖主通道的
-`issues-<id>.jsonl`。路径用 `workspace.py resolve --kind issues|typos|patterns` 取。
-
-两条支线的调用各自计量（`metrics.py bump --pass typo` / `--pass pattern`），
-不要并进 `pass1_review`——它们每片各多一次调用，压测时要能单独算出耗时占比。
+**范式**（`pattern_review.enabled` 默认关，无规则包时自动跳过）：每个要件只答 Y/N/U，
+U 按「要件齐备」处理。
 
 用户要求"重点查错别字"时，把 `typo_check.max_typos_per_chunk` 调高即可；
 **不要去放宽闸门②的 A1 阈值**——召回靠词表，不靠放松校验。
@@ -391,7 +393,7 @@ workspace.py clean-temp --run-dir <run>
 | `workspace.py deliver` | 取产物路径与去向 | `--run-dir [--kind]` | paths（交付物）+ artifacts（全部及去向） |
 | `workspace.py clean-temp` | 删除本次 run 的临时目录 | `--run-dir` | 已删路径 + 保留的交付物 |
 | `workspace.py lease` | 租约 status/acquire/takeover/heartbeat/verify/release | `--doc-dir --session` | owner |
-| `workspace.py claim` | 分片 next/renew/release/status | `--run-dir --session` | chunk |
+| `workspace.py claim` | 单元 next/renew/release/status/reclaim（`--stage` 分波） | `--run-dir --session [--stage]` | unit / prompt / output |
 | `env_probe.py` | 环境探测 | `--require-doc` | converters / can_convert_doc |
 | `convert_doc.py` | doc→docx（输出路径显式指定） | `--run-dir` | docx |
 | `unpack.py run` | 解包 + 合并 run + 记录 D9 基线 | `--run-dir` | 合并统计 |
@@ -399,10 +401,11 @@ workspace.py clean-temp --run-dir <run>
 | `extract.py` | 段落抽取 + 标题树 + 页码估算 | `--run-dir` | paragraphs / headings |
 | `glossary_scan.py` | 候选术语预筛 + 概念族聚类 | `--run-dir` | candidates / batches |
 | `import_glossary.py` | 术语表导入 + 自检 + 三层合并 | `--run-dir --authoritative --fallback` | entries / layers |
-| `chunk.py` | 分片（按 token） | `--run-dir` | chunks / single_pass |
+| `chunk.py` | 分片（按 token） | `--run-dir` | chunks / single_pass / stale_chunks_cleared |
+| `prompt_pack.py build\|list` | 渲染每次调用的自包含 prompt（一个单元一个文件） | `--run-dir [--stage --chunk]` | written / max_chars |
 | `verify_span.py` | 闸门②③ | `--run-dir --chunk [--in --out --cap]` | 各闸门丢弃计数 |
 | `verify_pass2.py build\|merge\|consistency` | 闸门④盲测 A/B 脚手架（build 按批落盘，可并行复核） | `--run-dir [--arrangement]` | items / batches / pass / drop / 一致率 |
-| `filter_neverflag.py` | 不改清单硬过滤 | `--run-dir --chunk\|--all [--file]` | dropped / by_rule |
+| `filter_neverflag.py` | 不改清单硬过滤 | `--run-dir --chunk\|--all [--channel --file]` | dropped / by_rule |
 | `ledger.py build\|rebuild\|stats` | 台账 SQLite 索引 | `--run-dir` | stats |
 | `detect_conflicts.py` | L01–L32 冲突检测 | `--run-dir [--rules]` | total / by_rule |
 | `adjudicate_pass4.py build\|collect\|status` | Pass 4 裁定脚手架（分批题面 + 归并 + 漏答报数） | `--run-dir` | batches / verdicts / missing |
@@ -464,11 +467,15 @@ workspace.py clean-temp --run-dir <run>
 加入协作还需同时满足：配置快照哈希一致、技能版本一致、工作目录在本地文件系统（`workspace.py fscheck`）、Pass 0 已完成。任一不满足只能独立重跑。
 
 主 Agent 主动并行时用同一套 claim 机制：每轮启动 `parallelism`（默认 5，上限建议 8）个子 Agent，
-**每个只领一片、做完即退**，本轮全部返回后再派下一轮，**主 Agent 不做任何分配决策**。
+**每个只领一个单元（一次调用、一份产物）、做完即退**，本轮全部返回后再派下一轮，
+**主 Agent 不做任何分配决策**。
 
-不要让子 Agent 循环领片：它的上下文会随做过的片数累积，而每一次工具往返都要
-重算当下的全部上下文——连做的开销是平方级的。同样的道理适用于第 5 步与第 7 步，
-那两步也是按批分文件、各批独立，照样派子 Agent 并行。
+不要让子 Agent 循环领活，也不要让它一个人做完一片的三次调用：它的上下文会随做过的
+单元累积，而每一次工具往返都要重算当下的全部上下文——连做的开销是平方级的，
+窗口偏小时还会直接溢出。第 5 步与第 7 步同理，那两步也是按批分文件、各批独立。
+
+**并发不是越高越好。** 子 Agent 频繁失败时先降 `parallelism`：失败的单元要重派，
+重派的开销比串行还大。
 
 ---
 
@@ -485,6 +492,10 @@ workspace.py clean-temp --run-dir <run>
 9. 每片有条数上限（`max_issues_per_chunk`，默认 40）。无上限时模型会持续"发现"问题以显得尽职。
    片变大时这个上限要同步变大——它是截断源，不是「每片就这么多问题」。
 10. 每次调用无状态、自包含，不做多轮对话。
+11. **一个子 Agent = 一次调用 = 一份产物。** 前一条说的"无状态"对 API 调用天然成立，
+    但子 Agent 是一个持续的会话：让它连做几件事，前面读过的正文、写过的产物会全程
+    留在它的上下文里，既撑爆窗口，也让每一轮工具往返都要重算一遍。
+    调用要用的东西由 `prompt_pack.py` 预先拼成一个文件，**子 Agent 不读 `references/`**。
 
 **禁止让模型输出 `confidence` 分数并据此卡阈值。** 言语化置信度存在系统性过度自信与分数饱和，不存在有效阈值点；且已作出判断的 Agent 倾向为自身判断辩护。质量由四道工程闸门保证，不由模型自评保证。
 

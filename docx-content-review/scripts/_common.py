@@ -106,6 +106,40 @@ def read_json(path: str | os.PathLike, default: Any = None) -> Any:
         return default
 
 
+def product_ok(path: str | os.PathLike) -> bool:
+    """产物是否「完整可用」。**「文件存在」不等于「做完了」。**
+
+    脚本写盘走 atomic_write_*，半写不会表现为完成；但子 Agent 是用 shell 写的，
+    环境抖动、被杀、写到一半断开，都会留下一个**存在但截断**的文件。
+    而续跑判定看的是文件在不在——于是这个单元被判为已完成，
+    内容却是半截：JSONL 少了后一半，或 JSON 根本解析不了（`read_json` 静默返回默认值，
+    整片事实凭空消失，报告里也看不出来）。
+
+    所以凡是子 Agent 写的产物，判完成时都要过这一关。
+    """
+    p = Path(path)
+    if not p.exists() or p.stat().st_size == 0:
+        return False
+    try:
+        text = p.read_text(encoding="utf-8")
+    except (OSError, UnicodeDecodeError):
+        return False
+    if p.suffix == ".jsonl":
+        for line in text.splitlines():
+            if not line.strip():
+                continue
+            try:
+                json.loads(line)
+            except json.JSONDecodeError:
+                return False
+        return True
+    try:
+        json.loads(text)
+        return True
+    except json.JSONDecodeError:
+        return False
+
+
 def read_jsonl(path: str | os.PathLike) -> Iterator[dict]:
     p = Path(path)
     if not p.exists():

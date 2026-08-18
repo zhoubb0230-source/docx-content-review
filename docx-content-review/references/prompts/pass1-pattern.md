@@ -13,11 +13,13 @@
 
 ## 输入
 
-`work/patterns/patterns-<chunk>.json`，每批 ≤20 个候选（`batches[i].items`）。
-每个候选带 `cid` / `text` / `checks`（要件清单），`rules[]` 里带该规则的正反例。
+**一批一个文件**：`work/patterns/patterns-<chunk>.<批>.json`，每批 ≤20 个候选。
+每条带 `cid` / `text` / `checks`（要件清单）；`rules[]` 里只放本批用到的规则及其正反例。
 
-**发起调用时把对应规则的正反例一并贴进 prompt**——反例比正例更重要，
-尤其是标了 `why_not_flag` 的那些。
+**正反例必须一并进 prompt**——反例比正例更重要，尤其是标了 `why_not_flag` 的那些。
+`prompt_pack.py` 已经把它们渲染进 `work/prompts/pattern-<片>-<批>.md`，
+实际发起调用时读那一个文件即可，主文件 `patterns-<chunk>.json` 不要读
+（那是给 `merge` 用的全量候选）。
 
 ## prompt 形式
 
@@ -55,7 +57,7 @@
 
 ## 输出与写回
 
-逐行追加到 `work/patterns/patterns-<chunk>.verdicts.jsonl`：
+整块写入**本批自己的文件** `work/patterns/patterns-<chunk>.<批>.verdicts.jsonl`：
 
 ```json
 {"cid":"0001-001","key":"impact","answer":"Y"}
@@ -78,8 +80,8 @@
 - 温度 0；一次 ≤20 个候选（`batch_size`）。
 - 一次调用只做这一件事，**不要和 Pass 1 的审查或事实抽取合并**。
 - 无状态、自包含，不做多轮对话。
-- 候选数有独立配额 `max_pattern_issues_per_chunk`（默认 20），
-  不占用主审查的 20 条。
+- 候选数有独立配额 `max_pattern_issues_per_chunk`（默认 40），
+  不占用主审查的条数上限。
 
 ## 之后会发生什么（不需要你做）
 
@@ -87,3 +89,22 @@
 `rule_id` 是规则号（如 `P-RISK-01`），`suggested_text` 恒为空。
 随后照常过闸门② `verify_span.py` 与闸门③ `filter_neverflag.py`，
 并入 Pass 2 的待复核集。
+
+---
+
+<!-- RUNTIME -->
+<!-- 以下是 prompt_pack.py 渲染进 work/prompts/pattern-<片>-<批>.md 的正文。
+     上面那些是写给开发者的说明，不进 prompt。 -->
+
+下面每段文字都属于某一类描述（每条已标明范式名）。
+对每段，逐项判断**指定的信息是否在这段文字中出现**。
+
+- 该信息以任何措辞出现了 → `Y`
+- 该信息确实没有出现 → `N`
+- 拿不准 → `U`
+
+三件**不要**做的事：
+
+1. 不判断这段该不该适用这条范式——场景已由脚本定位好，你只看要件在不在。
+2. 不判断写得好不好。要件"出现了但写得潦草"一律算出现（`Y`）。
+3. 不给建议。这一类永远不生成修订，输出里没有建议字段的位置。

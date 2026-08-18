@@ -54,7 +54,9 @@ logic:
 typo_check:
   enabled: true                 # 独立通道：脚本出候选 → LLM 二选一裁定 → 过闸门②③
   max_typos_per_chunk: 200      # 独立配额，不占用 max_issues_per_chunk
-  batch_size: 100
+  # 每批一个题面文件，子 Agent 只读自己那一批。批越大，单个子 Agent 的上下文越大——
+  # 这条通道的候选量是三条里最大的，50 是实测能稳住的上限。
+  batch_size: 50
   require_llm_adjudication: true # 脚本候选不得直接生成修订
   # 未登录词检测（切词后查不到的词即可疑）需 5 万词级词表才有信噪比，
   # 内置词表远未达到该规模，故不启用。召回率上限 = common-typos.txt 的覆盖范围。
@@ -125,7 +127,9 @@ concurrency:
   pipeline_pass2: false         # v1 不做 Pass1/Pass2 流水线并行
   allow_collaboration: true     # 允许多会话分工处理同一文档（§11.3）
   lease_minutes: 30             # 独占租约 TTL（心跳续租，不基于 pid）
-  chunk_claim_minutes: 60       # 分片 claim TTL（覆盖单片全程：三次调用 + 闸门）
+  # 单元 claim TTL。一个单元 = 一次调用，正常几分钟就完；定得越长，子 Agent 崩掉
+  # 之后那个单元被锁死的时间越长（所以每波结束都要 claim reclaim 一次）。
+  chunk_claim_minutes: 30
   require_local_fs: true        # 非本地文件系统时关闭协作，fail-closed
   on_conflict: ask              # ask | join | refuse
 

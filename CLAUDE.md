@@ -49,6 +49,8 @@
 | 闸门④盲测 A/B（拼装、判定表、一致率） | `scripts/verify_pass2.py` | `prompts/pass2-verify.md`；**改动必须重跑泄题检查（含分批 payload）** |
 | Pass 4 裁定的分批题面与归并、漏答报数 | `scripts/adjudicate_pass4.py` | `prompts/pass4-adjudicate.md` + `references/schemas.md` |
 | 分片预算、token 系数、重切片后作废旧产物 | `scripts/chunk.py` | `assets/config.default.yaml` 的 `chunking`；**改了预算必须重跑 chunk.py** |
+| 子 Agent 看到的 prompt（自包含渲染） | `scripts/prompt_pack.py` | 对应的 `prompts/*.md`；**改了模板要重跑 prompt_pack build** |
+| 阶段化单元（claim 的粒度、崩溃回收） | `scripts/workspace.py` 的 `stage_units` / `reclaim_stage` | `SKILL.md` 第 4 步 + 回归第 23 节 |
 | **某个类别进不进交付物** | `verify_pass2.py` 的 `KEEP_SCOPE`（**不是** `REVIEW_SCOPE`） | `prompts/pass2-verify.md` 触发范围表 |
 | **新增一条 L 规则** | `scripts/detect_conflicts.py`（加 `RULES` 项 + `r_LNN` 函数） | `references/logic-rules.md` + `logic-injection.facts.json` + 回归断言 |
 | 事实台账字段 | `scripts/ledger.py` 的 `MAPPING` | `references/schemas.md` + `prompts/pass1-extract.md` |
@@ -88,6 +90,12 @@ sudo apt-get install -y libreoffice-writer # 仅 .doc 转换需要
 
 ## 编码约定
 
+**子 Agent 的上下文是硬约束。** 凡是会被子 Agent 读到的产物，都要按
+「一个单元一个文件」落盘，且**只放这个单元用得上的字段**。主文件（全量候选）
+只给 merge 用。同一批数据不要在一个文件里存两份（`candidates` + `batches[].items`
+就是这么把 typo payload 撑到两倍的）。stdout 同理：`claim next` 曾经把整条 chunk 元信息
+连同三个 pid 列表一起吐出来，一条工具输出几 KB，全程留在子 Agent 的上下文里。
+
 每个 `scripts/*.py` 必须：
 
 - **可独立 CLI 调用**，`--help` 有效；
@@ -123,7 +131,8 @@ ledger 重建幂等、术语表自检、修订回写、**D9 负向对照**、
 P 类无建议文本、裁定 U 不成条目、三通道产物互不覆盖）、
 闸门④脚手架（payload 不泄题、排列可复现、判定表六条淘汰路径）、
 **分片预算与重切片后作废旧产物（含"不清就静默跳片"的负向对照）**、
-**闸门④与 Pass 4 的分批并行（分批不泄题、并行与串行判定逐字相同、漏答必须报数）**。
+**闸门④与 Pass 4 的分批并行（分批不泄题、并行与串行判定逐字相同、漏答必须报数）**、
+**阶段化单元（prompt 自包含、claim 不吐大对象、崩溃回收与重派、三通道 --all 收口互不覆盖）**。
 
 **扩词表时记住**：左串不能是常见词组的碎片。「按全」会被「按全流程」拆出来——
 这类条目既抬误报又白耗裁定调用，让「扩表不抬高误报率」的前提失效。

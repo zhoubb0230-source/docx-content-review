@@ -38,6 +38,7 @@ from _common import (  # noqa: E402
     die,
     emit,
     now_iso,
+    product_ok,
     read_json,
     run_cli,
     sha256_file,
@@ -69,6 +70,7 @@ KINDS = {
     "paragraphs": "work/paragraphs.jsonl",
     "headings": "work/headings.json",
     "chunks": "work/chunks",
+    "prompts": "work/prompts",
     "chunk_index": "work/chunks/index.json",
     "issues": "work/issues",
     "facts": "work/facts",
@@ -606,8 +608,10 @@ class Heartbeat:
 # --------------------------------------------------------------------------
 # 分片 claim（spec §11.3.2）
 # --------------------------------------------------------------------------
-def claim_path(run_dir: Path, chunk_id: str) -> Path:
-    return resolve_path(run_dir, "chunks") / f"{chunk_id}.claim"
+def claim_path(run_dir: Path, chunk_id: str, stage: str | None = None) -> Path:
+    """claim 文件。`stage` 为空是整片 claim（旧形态），否则是阶段化单元。"""
+    name = f"{chunk_id}.claim" if not stage else f"{stage}-{chunk_id}.claim"
+    return resolve_path(run_dir, "chunks") / name
 
 
 def _claim_live(p: Path) -> bool:
@@ -619,9 +623,9 @@ def _claim_live(p: Path) -> bool:
 
 
 def claim_acquire(run_dir: Path, chunk_id: str, session: str, generation: int | None,
-                  minutes: int) -> bool:
+                  minutes: int, stage: str | None = None) -> bool:
     """O_EXCL 原子创建。返回 False 表示该片已被他人持有。"""
-    p = claim_path(run_dir, chunk_id)
+    p = claim_path(run_dir, chunk_id, stage)
     guard_write_path(p, run_dir)
     p.parent.mkdir(parents=True, exist_ok=True)
     now = datetime.now(timezone.utc).astimezone()
@@ -652,9 +656,10 @@ def claim_acquire(run_dir: Path, chunk_id: str, session: str, generation: int | 
     return True
 
 
-def claim_renew(run_dir: Path, chunk_id: str, session: str, minutes: int) -> bool:
-    """每次 LLM 调用前后续期，避免退避超出 TTL（spec §7.4.2 第 1 条）。"""
-    p = claim_path(run_dir, chunk_id)
+def claim_renew(run_dir: Path, chunk_id: str, session: str, minutes: int,
+                stage: str | None = None) -> bool:
+    """长时间退避时续期。单元变小之后正常情况下用不到。"""
+    p = claim_path(run_dir, chunk_id, stage)
     data = read_json(p)
     if not isinstance(data, dict) or data.get("session_id") != session:
         return False
@@ -664,8 +669,9 @@ def claim_renew(run_dir: Path, chunk_id: str, session: str, minutes: int) -> boo
     return True
 
 
-def claim_release(run_dir: Path, chunk_id: str, session: str | None = None) -> bool:
-    p = claim_path(run_dir, chunk_id)
+def claim_release(run_dir: Path, chunk_id: str, session: str | None = None,
+                  stage: str | None = None) -> bool:
+    p = claim_path(run_dir, chunk_id, stage)
     if not p.exists():
         return False
     if session:
@@ -696,6 +702,145 @@ def list_chunk_ids(run_dir: Path) -> list[str]:
     if isinstance(idx, dict) and idx.get("chunks"):
         return [c["chunk_id"] for c in idx["chunks"]]
     return sorted(p.stem.split("-")[-1] for p in resolve_path(run_dir, "chunks").glob("chunk-*.txt"))
+
+
+# --------------------------------------------------------------------------
+# 阶段化单元（Pass 1 的最小可重试单位）
+#
+# 旧形态是「一个子 Agent 领一片，做完审查 + 抽取 + 错别字三件事」。它要求这个
+# 子 Agent 的上下文同时装下：类型体系 + 不改清单 + facts schema + 整片正文
+# + 错别字候选 + 三份产物。实测在 64k 级别的子 Agent 上会溢出，而且**失败一次
+# 要重做整片**——环境抖动一下，一片的三次调用全白跑。
+#
+# 拆成阶段之后，一个单元 = 一次调用 = 一份产物：只读一个 prompt 文件、只写一个
+# 输出文件，上下文按单元封顶，失败只丢一次调用。三个阶段之间没有依赖，
+# 可以整波并行，也可以先跑完一波再跑下一波。
+# --------------------------------------------------------------------------
+STAGES = ("review", "extract", "typo", "pattern")
+
+
+def _batch_ids(path: Path) -> list[str]:
+    d = read_json(path, {}) or {}
+    return [b.get("batch_id") for b in (d.get("batches") or []) if b.get("batch_id")]
+
+
+def stage_units(run_dir: Path, stage: str) -> list[dict]:
+    """枚举某阶段的全部单元。按 unit 排序，保证可复现。
+
+    每个单元自带三条路径：`prompt`（要读的那一个文件）、`output`（要写的那一份产物）、
+    `source`（原始数据，排障用）。**子 Agent 只需要 prompt 与 output 两项。**
+    """
+    if stage not in STAGES:
+        die(EX.USAGE, f"未知阶段：{stage}", f"可选：{'/'.join(STAGES)}")
+    idx = read_json(resolve_path(run_dir, "chunk_index"), {}) or {}
+    chunks = idx.get("chunks", [])
+    pdir = resolve_path(run_dir, "prompts")
+    out = []
+    for c in chunks:
+        cid = c["chunk_id"]
+        if stage == "review":
+            if c.get("chunk_type") == "table_only":
+                continue                      # 纯表格片不发起审查调用
+            out.append({"unit": cid, "chunk_id": cid,
+                        "prompt": pdir / f"review-{cid}.md",
+                        "output": resolve_path(run_dir, "issues") / f"issues-{cid}.raw.jsonl",
+                        "done_marker": resolve_path(run_dir, "issues") / f"issues-{cid}.jsonl",
+                        "source": Path(c.get("path") or "")})
+        elif stage == "extract":
+            out.append({"unit": cid, "chunk_id": cid,
+                        "prompt": pdir / f"extract-{cid}.md",
+                        "output": resolve_path(run_dir, "facts") / f"facts-{cid}.json",
+                        "done_marker": resolve_path(run_dir, "facts") / f"facts-{cid}.json",
+                        "source": Path(c.get("path") or "")})
+        else:
+            kind = "typos" if stage == "typo" else "patterns"
+            stem = "typos" if stage == "typo" else "patterns"
+            master = resolve_path(run_dir, kind) / f"{stem}-{cid}.json"
+            for bid in _batch_ids(master):
+                unit = f"{cid}.{bid}"
+                out.append({"unit": unit, "chunk_id": cid, "batch_id": bid,
+                            "prompt": pdir / f"{stage}-{cid}-{bid}.md",
+                            "output": resolve_path(run_dir, kind)
+                            / f"{stem}-{cid}.{bid}.verdicts.jsonl",
+                            "done_marker": resolve_path(run_dir, kind)
+                            / f"{stem}-{cid}.{bid}.verdicts.jsonl",
+                            # source = 本批题面（不是主文件）：主文件是给 merge 用的全量候选
+                            "source": resolve_path(run_dir, kind) / f"{stem}-{cid}.{bid}.json",
+                            "master": master})
+    out.sort(key=lambda u: u["unit"])
+    return out
+
+
+def _unit_view(u: dict, stage: str) -> dict:
+    """给子 Agent 看的视图：**只有它需要的那几条路径**。
+
+    以前 `claim next` 把整条 chunk 元信息原样吐出来，其中 `pids` / `review_pids` /
+    `context_pids` 三个列表在 800 页文档上是几百个条目——一条工具输出就是几 KB 噪音，
+    还全程留在子 Agent 的上下文里。「不打印大对象」这条约定，claim 自己先破了。
+    """
+    return {"unit": u["unit"], "chunk_id": u["chunk_id"], "stage": stage,
+            **({"batch_id": u["batch_id"]} if u.get("batch_id") else {}),
+            "prompt": str(u["prompt"]), "output": str(u["output"])}
+
+
+def next_pending_unit(run_dir: Path, stage: str, session: str, generation: int | None,
+                      minutes: int) -> dict | None:
+    for u in stage_units(run_dir, stage):
+        if product_ok(u["done_marker"]):
+            claim_release(run_dir, u["unit"], stage=stage)
+            continue
+        cp = claim_path(run_dir, u["unit"], stage)
+        if cp.exists() and _claim_live(cp):
+            continue
+        if cp.exists():
+            claim_release(run_dir, u["unit"], stage=stage)
+        if claim_acquire(run_dir, u["unit"], session, generation, minutes, stage=stage):
+            return _unit_view(u, stage)
+    return None
+
+
+def stage_status(run_dir: Path, stage: str) -> dict:
+    units = stage_units(run_dir, stage)
+    done = [u for u in units if product_ok(u["done_marker"])]
+    # 存在但解析不了 = 子 Agent 写到一半就断了。它既不算完成，也不该被当成"没跑过"
+    # 而静默重来——报出来，主 Agent 才知道这一波为什么不收敛。
+    corrupt = [u["unit"] for u in units
+               if u["done_marker"].exists() and not product_ok(u["done_marker"])]
+    claimed = [u for u in units
+               if not product_ok(u["done_marker"])
+               and _claim_live(claim_path(run_dir, u["unit"], stage))]
+    pending = [u["unit"] for u in units if not product_ok(u["done_marker"])]
+    missing_prompt = [u["unit"] for u in units if not u["prompt"].exists()]
+    return {"stage": stage, "total": len(units), "done": len(done),
+            "claimed": len(claimed), "pending": len(pending),
+            "corrupt": len(corrupt), "corrupt_units": corrupt[:20],
+            # 前 20 个就够定位了；全量在 stage_units 里，不往 stdout 倒
+            "pending_units": pending[:20],
+            "prompts_missing": len(missing_prompt),
+            "note": ("有单元还没有 prompt 文件，先跑 prompt_pack.py build"
+                     if missing_prompt else "")}
+
+
+def reclaim_stage(run_dir: Path, stage: str, session: str | None = None) -> dict:
+    """回收没有产物的 claim。**子 Agent 崩了以后必须做这一步**——
+
+    claim 的 TTL 是按「一个单元正常跑多久」定的（默认 60 分钟），环境抖动导致
+    子 Agent 中途死掉时，那个单元会被锁到 TTL 到期为止，整轮都在等一个不会回来的活。
+    带 `--session` 只回收本会话自己的（别人的正在跑，不能动）。
+    """
+    released = []
+    for u in stage_units(run_dir, stage):
+        if product_ok(u["done_marker"]):
+            continue
+        cp = claim_path(run_dir, u["unit"], stage)
+        if not cp.exists():
+            continue
+        data = read_json(cp) or {}
+        mine = (not session) or data.get("session_id") == session
+        if mine or not _claim_live(cp):
+            cp.unlink()
+            released.append(u["unit"])
+    return {"stage": stage, "released": len(released), "units": released[:20]}
 
 
 def next_pending_chunk(run_dir: Path, session: str, generation: int | None, minutes: int) -> dict | None:
@@ -958,18 +1103,38 @@ def cmd_lease(args) -> int:
     return EX.OK
 
 
+# 整片 claim 的返回里只留子 Agent 用得上的字段。三个 pid 列表在长文档上
+# 是几百个条目，一条工具输出几 KB，而且会全程留在子 Agent 的上下文里。
+CHUNK_VIEW_FIELDS = ("chunk_id", "path", "chunk_type", "text_tokens", "pages_est",
+                     "page_from", "page_to", "para_count", "needs_review_call", "oversized")
+
+
 def cmd_claim(args) -> int:
     run_dir = Path(args.run_dir).resolve()
-    cfg = load_config(args.config)
-    minutes = int((cfg.get("concurrency") or {}).get("chunk_claim_minutes") or 20)
+    cfg = load_run_config(run_dir, args.config)
+    minutes = int((cfg.get("concurrency") or {}).get("chunk_claim_minutes") or 60)
+    stage = getattr(args, "stage", None)
+    unit = getattr(args, "unit", None) or args.chunk
     if args.op == "next":
-        got = next_pending_chunk(run_dir, args.session, args.generation, minutes)
+        if stage:
+            got = next_pending_unit(run_dir, stage, args.session, args.generation, minutes)
+        else:
+            got = next_pending_chunk(run_dir, args.session, args.generation, minutes)
+            if got:
+                got = {k: v for k, v in got.items() if k in CHUNK_VIEW_FIELDS}
         emit({"ok": True, "chunk": got, "exhausted": got is None})
     elif args.op == "renew":
-        emit({"ok": True, "renewed": claim_renew(run_dir, args.chunk, args.session, minutes)})
+        emit({"ok": True,
+              "renewed": claim_renew(run_dir, unit, args.session, minutes, stage=stage)})
     elif args.op == "release":
-        emit({"ok": True, "released": claim_release(run_dir, args.chunk, args.session)})
+        emit({"ok": True,
+              "released": claim_release(run_dir, unit, args.session, stage=stage)})
+    elif args.op == "reclaim":
+        emit({"ok": True, **reclaim_stage(run_dir, stage or "review", args.session)})
     elif args.op == "status":
+        if stage:
+            emit({"ok": True, **stage_status(run_dir, stage)})
+            return EX.OK
         ids = list_chunk_ids(run_dir)
         idx = read_json(resolve_path(run_dir, "chunk_index"), {}) or {}
         metas = {c["chunk_id"]: c for c in idx.get("chunks", [])}
@@ -1072,12 +1237,16 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--config")
     p.set_defaults(func=cmd_lease)
 
-    p = sub.add_parser("claim", help="分片 claim")
-    p.add_argument("op", choices=["next", "renew", "release", "status"])
+    p = sub.add_parser("claim", help="分片 / 阶段单元 claim")
+    p.add_argument("op", choices=["next", "renew", "release", "status", "reclaim"])
     p.add_argument("--run-dir", required=True)
     p.add_argument("--session")
     p.add_argument("--generation", type=int)
-    p.add_argument("--chunk")
+    p.add_argument("--chunk", help="兼容旧写法；阶段化时用 --unit")
+    p.add_argument("--unit", help="阶段单元 id（review/extract 是 chunk_id，"
+                                  "typo/pattern 是 <chunk>.<batch>）")
+    p.add_argument("--stage", choices=list(STAGES),
+                   help="不给 = 旧的整片 claim（一个子 Agent 做完一片的全部调用）")
     p.add_argument("--config")
     p.set_defaults(func=cmd_claim)
 

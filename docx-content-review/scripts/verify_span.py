@@ -27,6 +27,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from _common import (  # noqa: E402
+    SkillError,
     EX, atomic_write_json, atomic_write_jsonl, die, emit, is_subsequence, levenshtein,
     normalize_ws, read_json, read_jsonl, run_cli,
 )
@@ -356,10 +357,57 @@ def process(run_dir: Path, chunk_id: str, raw_path: Path, cfg: dict,
             "truncated": truncated, **counters}
 
 
+# 三条通道各自的文件与配额。侧通道的输入输出是同一个文件（原地过闸），
+# 而主通道是 raw → 正式产物；混用会让侧通道覆盖主通道，这是踩过的坑。
+CHANNELS = {
+    "main":     ("issues-{c}.raw.jsonl", "issues-{c}.jsonl",
+                 ("chunking", "max_issues_per_chunk", 40)),
+    "typos":    ("issues-{c}.typos.jsonl", "issues-{c}.typos.jsonl",
+                 ("typo_check", "max_typos_per_chunk", 200)),
+    "patterns": ("issues-{c}.patterns.jsonl", "issues-{c}.patterns.jsonl",
+                 ("pattern_review", "max_pattern_issues_per_chunk", 40)),
+}
+
+
+def sweep(run_dir: Path, cfg: dict, channel: str) -> dict:
+    """整轮过闸：一条命令扫完全部分片。
+
+    阶段化之后，闸门不再由「领了这一片的子 Agent」顺手跑——它是纯脚本，
+    由主 Agent 在一波结束后统一收口。按片各发一次工具调用，
+    在 20 片的文档上就是 20 轮往返，而这一轮往返什么判断都不做。
+    """
+    idir = resolve_path(run_dir, "issues")
+    raw_pat, out_pat, (sect, key, dflt) = CHANNELS[channel]
+    cap = int((cfg.get(sect) or {}).get(key) or dflt)
+    results, unparsable = [], []
+    for cid in [c["chunk_id"] for c in
+                (read_json(resolve_path(run_dir, "chunk_index"), {}) or {}).get("chunks", [])]:
+        raw = idir / raw_pat.format(c=cid)
+        if not raw.exists():
+            continue                    # 这一片没有这条通道的产出，不是错误
+        try:
+            results.append(process(run_dir, cid, raw, cfg, idir / out_pat.format(c=cid), cap))
+        except SkillError:
+            # 半写文件（子 Agent 写到一半断了）只作废这一片，不能拖垮整轮：
+            # 一个坏文件让整轮 --all 退出，等于让一次环境抖动废掉全部分片的过闸。
+            raw.unlink()
+            unparsable.append(cid)
+    return {"channel": channel, "chunks": len(results),
+            "unparsable": len(unparsable), "unparsable_chunks": unparsable[:20],
+            "count": sum(r["count"] for r in results),
+            "truncated": sum(1 for r in results if r.get("truncated")),
+            "dropped": sum(sum(v for k, v in r.items()
+                               if k.startswith("drop_") and isinstance(v, int))
+                           for r in results)}
+
+
 def main(argv: list[str]) -> int:
     ap = argparse.ArgumentParser(prog="verify_span.py", description="闸门②可验证性")
     ap.add_argument("--run-dir", required=True)
-    ap.add_argument("--chunk", required=True)
+    ap.add_argument("--chunk")
+    ap.add_argument("--all", action="store_true", help="扫全部分片（与 --channel 配合）")
+    ap.add_argument("--channel", choices=sorted(CHANNELS), default="main",
+                    help="--all 时决定读写哪一条通道的文件与配额")
     ap.add_argument("--in", dest="raw", help="原始 JSONL；默认 issues-<chunk>.raw.jsonl")
     ap.add_argument("--out", help="过闸后的输出；默认 issues-<chunk>.jsonl。"
                                   "侧通道（错别字/范式）必须指定，否则会覆盖主通道产物")
@@ -368,11 +416,17 @@ def main(argv: list[str]) -> int:
     ap.add_argument("--config")
     args = ap.parse_args(argv)
     run_dir = Path(args.run_dir).resolve()
+    cfg = load_run_config(run_dir, args.config)
+    if args.all:
+        emit({"ok": True, **sweep(run_dir, cfg, args.channel)})
+        return EX.OK
+    if not args.chunk:
+        die(EX.USAGE, "要么给 --chunk，要么给 --all")
     raw = Path(args.raw) if args.raw else resolve_path(run_dir, "issues") / f"issues-{args.chunk}.raw.jsonl"
     if not raw.exists():
         die(EX.PARSE, f"原始输出不存在：{raw}",
             "子 Agent 的 Pass 1 输出应先写入该路径（一行一条 JSON，无代码围栏）。")
-    emit({"ok": True, **process(run_dir, args.chunk, raw, load_run_config(run_dir, args.config),
+    emit({"ok": True, **process(run_dir, args.chunk, raw, cfg,
                                 Path(args.out) if args.out else None, args.cap)})
     return EX.OK
 

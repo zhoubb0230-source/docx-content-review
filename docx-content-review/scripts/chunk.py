@@ -151,6 +151,10 @@ def clear_stale_products(run_dir: Path, stale: list[str]) -> int:
     for cid in stale:
         targets = [claim_path(run_dir, cid),
                    resolve_path(run_dir, "facts") / f"facts-{cid}.json"]
+        # 阶段化 claim 与按片渲染的 prompt 一并作废
+        targets += sorted(resolve_path(run_dir, "chunks").glob(f"*-{cid}.claim"))
+        targets += sorted(resolve_path(run_dir, "prompts").glob(f"*-{cid}.md"))
+        targets += sorted(resolve_path(run_dir, "prompts").glob(f"*-{cid}-*.md"))
         targets += sorted(resolve_path(run_dir, "issues").glob(f"issues-{cid}.*"))
         targets += sorted(resolve_path(run_dir, "typos").glob(f"typos-{cid}.*"))
         targets += sorted(resolve_path(run_dir, "patterns").glob(f"patterns-{cid}.*"))
