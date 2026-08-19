@@ -2715,6 +2715,55 @@ seed11 '{"objectives":[{"obj_id":"O1","statement":"提升良率","pid":"p-000002
 check "负向对照：有对应关系时 L29 照常报没被认领的目标" "$(fired11 L29)" 1
 check "负向对照：有验收指标时 L30 照常报没有验收的举措" "$(fired11 L30)" 1
 
+echo "══ 30. 诊断包：可外发，且不含正文 ══"
+# 真实语料是优化这个技能的唯一有效输入，而语料通常不能外传。
+# 诊断包抽的是「排障需要、但不泄露内容」的那一层。
+# **不含正文这件事必须是可验证的，不能是承诺**——所以自检拿 paragraphs.jsonl
+# 逐条去撞，且这里配了负向对照：塞一句真正文进去，自检必须抓到。
+
+DG=$(python3 "$S/diagnose.py" --run-dir "$RUN2")
+check "诊断包生成成功且通过泄漏自检" "$(echo "$DG" | jget "['leak_check']")" passed
+python3 - "$S" "$RUN2" "$(echo "$DG" | jget "['path']")" <<PYEOF
+import json,pathlib,sys
+sys.path.insert(0, sys.argv[1])
+import diagnose as dg
+from workspace import load_run_config
+run=pathlib.Path(sys.argv[2]); bundle=json.load(open(sys.argv[3],encoding="utf-8"))
+bad=[]
+# ① 正向：包里该有的几块都在，且都是数字不是文本
+for sec in ("structure","workload","funnel","facts","conflicts","typos"):
+    if sec not in bundle: bad.append(f"缺少 {sec}")
+st=bundle.get("structure",{})
+for k in ("paragraphs","tables","parallel_tables","figure_table_labels","numbered_headings"):
+    if k not in st: bad.append(f"structure 缺少 {k}")
+# ② 负向对照：塞一句真正文，自检必须抓到。抓不到就说明这道自检是摆设
+para=json.loads(open(run/"work"/"paragraphs.jsonl",encoding="utf-8").readline())
+probe=dict(bundle); probe["_leak"]=para["text"]
+if not dg._assert_no_text(probe, run):
+    bad.append("负向对照：塞进正文后自检没有抓到")
+# ③ 正常包必须干净
+if dg._assert_no_text(bundle, run):
+    bad.append("正常诊断包里出现了正文")
+for b in bad[:3]: print("   ", b)
+sys.exit(1 if bad else 0)
+PYEOF
+check "诊断包结构完整；负向对照：塞进正文即被自检抓到" "$?" 0
+
+# 编号方案与平行表是两条最贵误报的直接指纹（ADR-047 ①②），必须报出来
+python3 - "$(echo "$DG" | jget "['path']")" <<PYEOF
+import json,sys
+st=json.load(open(sys.argv[1],encoding="utf-8"))["structure"]
+lab=st["figure_table_labels"]
+bad=[]
+if set(lab) != {"chapter_scheme","flat_scheme"}: bad.append(f"编号方案指纹不对：{lab}")
+if not isinstance(st["parallel_tables"], int): bad.append("平行表计数缺失")
+print(f"    指纹：编号 章-序 {lab['chapter_scheme']} / 流水 {lab['flat_scheme']}，"
+      f"疑似平行表 {st['parallel_tables']} 张")
+for b in bad: print("   ", b)
+sys.exit(1 if bad else 0)
+PYEOF
+check "诊断包带出编号方案与平行表指纹（两类最贵误报的来源）" "$?" 0
+
 echo
 printf '通过 \033[32m%d\033[0m，失败 \033[31m%d\033[0m\n' "$PASS" "$FAIL"
 [ "$FAIL" -eq 0 ]

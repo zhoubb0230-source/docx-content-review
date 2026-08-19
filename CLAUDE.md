@@ -68,6 +68,7 @@
 | 范式的场景定位逻辑、规则包校验 | `scripts/scan_patterns.py` | `references/patterns.md` + `prompts/pass1-pattern.md` |
 | 错别字通道 | `scripts/typo_scan.py` + `assets/dict/` | `prompts/pass1-typo.md` |
 | **扩充错别字词表**（提召回的唯一杠杆） | `assets/dict/common-typos.txt` | 白名单进 `typo-whitelist.txt`；**误报句进 `typo-traps.txt`** |
+| 诊断包收哪些项、泄漏自检 | `scripts/diagnose.py` | 回归第 30 节；**加一项必须问它会不会带出正文** |
 | 默认配置 | `assets/config.default.yaml` | `docs/SPEC.md` §16 |
 
 ---
