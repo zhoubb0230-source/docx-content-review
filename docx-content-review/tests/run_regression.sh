@@ -1866,20 +1866,28 @@ check "非审查阶段的 prompt 小于三份 references 之和" "$?" 0
 
 # claim next 是给子 Agent 看的：只给它用得上的路径，不吐 pid 列表
 CN=$(python3 "$S/workspace.py" claim next --run-dir "$RUN6" --stage review --session s-st)
-check "claim next 返回单元与两个路径" "$(echo "$CN" | jget "['chunk']['unit']")" 0001
+check "claim next 返回单元与它要读的 prompt" "$(echo "$CN" | jget "['chunk']['unit']")" 0001
 python3 - <<PYEOF
 import json,sys
-d=json.loads('''$CN''')["chunk"]
+r=json.loads('''$CN''')
+d=r["chunk"]
 bad=[k for k in ("pids","review_pids","context_pids") if k in d]
 if bad: print("    claim 输出里有大列表：", bad)
-if len(json.dumps(d,ensure_ascii=False)) > 600: print("    claim 输出过大：", len(json.dumps(d)))
-sys.exit(1 if bad or len(json.dumps(d,ensure_ascii=False)) > 600 else 0)
+# 目录只说一次（顶层 dir），单元里必须是文件名而不是绝对路径——每个单元一条绝对路径，
+# 在 stdout 与派活指令里各出现一次，60 个单元就是几万字符
+if "/" in d.get("prompt",""): bad.append("prompt 是绝对路径，应为文件名")
+if "output" in d: bad.append("output 冗余：prompt 抬头已写明输出路径")
+if not r.get("dir"): bad.append("顶层缺 dir")
+n=len(json.dumps(d,ensure_ascii=False))
+if n > 120: bad.append("单元视图过大 %d" % n)
+for b in bad[:3]: print("   ", b)
+sys.exit(1 if bad else 0)
 PYEOF
-check "claim next 不吐大对象（无 pid 列表、体量受控）" "$?" 0
+check "claim next 单元视图只有 unit 与 prompt 文件名（目录只说一次）" "$?" 0
 
 # 阶段之间互不干扰：review 被占住，extract 照领不误
 CE=$(python3 "$S/workspace.py" claim next --run-dir "$RUN6" --stage extract --session s-st2)
-check "另一阶段的同一分片可并行领取" "$(echo "$CE" | jget "['chunk']['stage']")" extract
+check "另一阶段的同一分片可并行领取" "$(echo "$CE" | jget "['stage']")" extract
 CR=$(python3 "$S/workspace.py" claim next --run-dir "$RUN6" --stage review --session s-other)
 check "同阶段同单元不会被两个会话同时领走" "$(echo "$CR" | jget "['exhausted']")" True
 
@@ -2168,12 +2176,29 @@ cfg=yaml.safe_load((run/"config.snapshot.yaml").read_text(encoding="utf-8"))
 budget=cfg["concurrency"]["subagent_budget_chars"]
 idx=json.load(open(run/"work"/"prompts"/"index.json",encoding="utf-8"))
 chars=sum(idx[f"review/{u['unit']}"] for u in got["units"])
-byts=sum(len(pathlib.Path(u["prompt"]).read_bytes()) for u in got["units"])
+byts=sum(len((pathlib.Path(got["dir"])/u["prompt"]).read_bytes()) for u in got["units"])
 print(f"    本组 {got['count']} 个单元：{chars} 字符 / {byts} 字节（预算 {budget}）")
 assert chars <= budget, "超预算"
 assert byts > budget, "构造无效：这组的字节数没有超过预算，测不出字符/字节的差别"
 PYEOF
 check "打包按字符数算预算，不是字节数（负向对照：同一组按字节算会超）" "$?" 0
+
+# 主 Agent 的上下文预算：run_dir 那条绝对路径**每次领取只准出现一次**。
+# 实测 800 页文档的 Pass 1，主 Agent 上下文里近一半的字符是这条前缀的重复——
+# 每单元两条绝对路径，在 stdout 里一次、转给子 Agent 时再一次。
+python3 - "$RUN7" "$P1" <<PYEOF
+import json,sys
+run,got=sys.argv[1],json.loads(sys.argv[2])
+raw=json.dumps(got,ensure_ascii=False)
+bad=[]
+if raw.count(run) != 1: bad.append(f"run_dir 在一条 claim next 里出现了 {raw.count(run)} 次，应为 1（顶层 dir）")
+per=[len(json.dumps(u,ensure_ascii=False)) for u in got["units"]]
+if per and max(per) > 120: bad.append(f"单元视图 {max(per)} 字符，超出预算")
+print(f"    一条 claim next：{len(raw)} 字符，单元视图最大 {max(per) if per else 0} 字符")
+for b in bad: print("   ", b)
+sys.exit(1 if bad else 0)
+PYEOF
+check "claim next 里 run_dir 只出现一次（主 Agent 上下文预算）" "$?" 0
 
 # 领过的不会再被领走
 P2=$(python3 "$S/workspace.py" claim next --run-dir "$RUN7" --stage review --count 8 --session pk2)
@@ -2321,10 +2346,11 @@ while rounds < total*4 + 10:
         if got.get("exhausted") or not got["units"]: break
         units += got["units"]
     if not units: break
-    for u in units:                                      # 子 Agent 照 prompt 写 output
+    outs={x["unit"]: x["output"] for x in ws.stage_units(pathlib.Path(run), stage)}
+    for u in units:                                      # 子 Agent 读 prompt、按它抬头写 output
         if u["unit"] in seen: print(f"    重复派发：{stage}/{u['unit']}")
         seen.add(u["unit"])
-        out=pathlib.Path(u["output"]); out.parent.mkdir(parents=True,exist_ok=True)
+        out=outs[u["unit"]]; out.parent.mkdir(parents=True,exist_ok=True)
         out.write_text('{"terms":[],"acronyms":[],"entities":[],"metrics":[],"positions":[],'
                        '"objectives":[],"initiatives":[],"acceptance":[],"dates":[],'
                        '"versions":[],"roles":[],"xrefs":[],"numbering":[],"commitments":[],'

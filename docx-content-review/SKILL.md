@@ -247,22 +247,42 @@ chunk.py --run-dir <run> && typo_scan.py scan --run-dir <run> && prompt_pack.py 
 ```
 workspace.py claim next --run-dir <run> --stage <阶段> --count 4 \
   --session <sid> --generation <n>
-  → exhausted:true 就换下一波；否则拿到一组 units（每个带 prompt 与 output 两个路径）
+  → exhausted:true 就换下一波；否则拿到 dir（prompt 目录，说一次）
+     与 units（每个只有 unit 与 prompt 文件名）
 ```
 
-**`--count` 是"一个子 Agent 领几个单元"，不是并发数。** 脚本按
-`concurrency.subagent_budget_chars`（默认 40000 字符）封顶，所以给 4 也可能只返回 2：
-审查单元近两万字符，一次两个；错别字单元只有几千字符，一次能给五六个。
+**`--count` 是"一个子 Agent 领几个单元"，不是并发数。** 脚本还会按
+`concurrency.subagent_budget_chars`（默认 40000 字符）再封一道顶，两者取小。
+默认值下审查单元近两万字符，一次只给两个。
+
+**这两个数按你的子 Agent 窗口调，默认值是按小窗口定的。** 800 页文档 60 个单元的实测：
+
+| `--count` / `subagent_budget_chars` | claim next 次数 | 子 Agent 个数 | 主 Agent 上下文 |
+|---|---|---|---|
+| 4 / 40000（默认，窗口 ≤64k） | 34 | 29 | 53k 字符 |
+| 6 / 120000（窗口 ≥128k） | 14 | 10 | 33k 字符 |
+| 8 / 160000（窗口 ≥256k） | 14 | 8 | 32k 字符 |
+
+**打得更包省的是派活开销与主 Agent 的上下文，不是生成时间**——总输出量不变。
+代价在子 Agent 那边：它一次装下的 prompt 越多，每一轮工具往返要重算的上下文越大
+（连做是平方级的），而且崩一次丢掉的单元也越多。所以**不要一路调到窗口上限**，
+留出输出与重算的余量；子 Agent 开始失败就往回调，别靠重试硬扛。
 
 **为什么要打包**：派活的固定开销与单元大小无关——拉起子 Agent、领单元、读文件、
 回话，每一步都要模型先把这次工具调用吐出来。在 60 token/s 这种出字速度下，
 **一次工具调用光"说出口"就要一两秒**，几十个单元摊下来，固定开销能占总耗时三四成。
 
-把这组 units 原样交给子 Agent，指令就一句：
+把 `dir` 与这组文件名交给子 Agent，指令就一句：
 
-> 依次处理下面这几个单元。每个单元：读它的 `prompt` 文件，照文件里写的做，
-> 把结果写到它指定的 `output`。全部做完再返回 `[{"unit":…, "lines":N}, …]`。
+> prompt 目录是 `<dir>`。依次处理下面这几个文件：`review-0007.md`、`review-0008.md`。
+> 每个文件：读它，照它写的做，把结果写到**它抬头写明的那个输出路径**。
+> 全部做完再返回 `[{"unit":…, "lines":N}, …]`。
 > **不要读别的文件，不要把正文内容带回来。**
+
+**目录只说一次，别把每个单元的绝对路径都展开写。** 实测 800 页文档的 Pass 1，
+主 Agent 上下文里近一半的字符是同一条 run_dir 前缀的重复——`claim next` 的
+stdout 里一次，你转给子 Agent 时再一次，60 个单元乘两条路径。
+输出路径不必你来说：prompt 文件抬头本来就写着「输出写到：…」，连返回格式都写好了。
 
 每轮派 `parallelism` 个子 Agent，全部返回后再派下一轮，直到 `exhausted`。
 **主 Agent 上下文里只留统计数字。**
@@ -480,14 +500,14 @@ workspace.py clean-temp --run-dir <run>
 
 | 脚本 | 用途 | 关键输入 | 输出 |
 |---|---|---|---|
-| `workspace.py init` | 建工作目录、复制源文档、续跑判定 | `--source` | run_dir / action / lease |
+| `workspace.py init` | 建工作目录、复制源文档、续跑判定 | `--source` | run_dir / action / lease（产物路径找 `deliver`，init 不给） |
 | `workspace.py locate` | 只查已有文档目录 | `--source` | doc_dir / stage |
 | `workspace.py reconfigure` | **改本次 run 的配置（唯一入口）** | `--run-dir --set a.b=值\|--config` | changed / rerun |
 | `workspace.py resolve` | 取临时目录内的标准路径 | `--run-dir --kind` | path |
 | `workspace.py deliver` | 取产物路径与去向 | `--run-dir [--kind]` | paths（交付物）+ artifacts（全部及去向） |
 | `workspace.py clean-temp` | 删除本次 run 的临时目录 | `--run-dir` | 已删路径 + 保留的交付物 |
 | `workspace.py lease` | 租约 status/acquire/takeover/heartbeat/verify/release | `--doc-dir --session` | owner |
-| `workspace.py claim` | 单元 next/renew/release/status/reclaim（`--stage` 分波；`reclaim` 不带 `--session` = 回收所有会话的残留 claim） | `--run-dir --session [--stage]` | unit / prompt / output |
+| `workspace.py claim` | 单元 next/renew/release/status/reclaim（`--stage` 分波；`reclaim` 不带 `--session` = 回收所有会话的残留 claim） | `--run-dir --session [--stage --count]` | dir（说一次）+ units（unit 与 prompt 文件名） |
 | `env_probe.py` | 环境探测 | `--require-doc` | converters / can_convert_doc |
 | `convert_doc.py` | doc→docx（输出路径显式指定） | `--run-dir` | docx |
 | `unpack.py run` | 解包 + 合并 run + 记录 D9 基线 | `--run-dir` | 合并统计 |

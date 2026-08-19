@@ -378,10 +378,18 @@ def main(argv: list[str]) -> int:
                              target or (idir / f"issues-{c}{suffix}.jsonl"
                                         if suffix else None))
                for c in ids]
+    # **只列有丢弃的片。** 逐片一行在 800 页文档上是 30 行、3000 页是 120 行，
+    # 而绝大多数是 dropped 0 —— 主 Agent 从这些零里读不出任何东西，
+    # 却要把它们全程带在上下文里。按规则汇总一次才是可行动的信息。
+    by_rule: dict[str, int] = {}
+    for r in results:
+        for k, v in (r.get("by_rule") or {}).items():
+            by_rule[k] = by_rule.get(k, 0) + int(v)
     emit({"ok": True, "chunks": len(results),
           "dropped": sum(r.get("dropped", 0) for r in results),
           "kept": sum(r.get("kept", 0) for r in results),
-          "results": results})
+          "by_rule": by_rule,
+          "results": [r for r in results if r.get("dropped")]})
     return EX.OK
 
 

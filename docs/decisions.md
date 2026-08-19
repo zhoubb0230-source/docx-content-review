@@ -1161,3 +1161,39 @@ L 规则表、目录结构、配置项）不在此重复。
 - **说明**：`metrics.py collect` 读的是 `issues-*.gates.json`，一直是对的；
   错的只是主 Agent 每一波唯一看得见的那个摘要数字。
 - **影响**：`scripts/verify_span.py`、回归第 27 节（含负向对照）。
+
+## ADR-046　主 Agent 的上下文预算：绝对路径每处只说一次
+
+- **日期**：2026-08-19
+- **现场**：ADR-043 修完之后重跑，主 Agent 上下文占用仍然偏高（窗口 256k）。
+- **量了一遍**：照 SKILL.md 主流程在 800 页语料（30 片 / 60 个 Pass 1 单元）上回放，
+  逐条记下主 Agent 会看到的 stdout 与它自己要吐出的命令——**97,680 字符 / 68 次工具往返**。
+  其中 **49% 是同一条 run_dir 绝对路径的重复**：每个单元两条绝对路径，
+  在 `claim next` 的 stdout 里出现一次，主 Agent 把它转给子 Agent 时再出现一次，
+  60 个单元乘 2 条路径乘 2 处 = 240 处。
+- **决策**：
+  1. `claim next` 的单元视图砍到 `{"unit", "prompt"}`，`prompt` 只留**文件名**，
+     目录由顶层 `dir` 说一次。
+     - **`output` 是冗余的**：prompt 文件抬头本来就写着「输出写到：…」，
+       连返回格式都写好了。子 Agent 只读这一个文件——这正是 ADR-040 的原则；
+       主 Agent 要看进度有 `claim status`，不需要自己对文件。
+     - `chunk_id` 与 `stage` 同样冗余：`unit` 就是 `chunk_id`，`stage` 在顶层。
+  2. `workspace.py init` 不再吐 `artifacts`（五条绝对路径）。产物路径由
+     `workspace.py deliver` 按需给出——init 这一刻它们都还不存在。
+  3. `filter_neverflag --all` 与 `typo_scan scan` 只列**非零**的片，另给一个按规则的汇总。
+     逐片报零在 800 页上是 30 行、3000 页上是 120 行，读不出任何信息却按片数线性占用上下文。
+- **实测**：97,680 → **53,121 字符（降 45%）**；一条 `claim next` 从 985 → 267 字符。
+- **配套的第二个杠杆（配置，不改代码）**：`--count` 与 `subagent_budget_chars`
+  的默认值是按 ≤64k 窗口定的，`--count 4` 才是真正的上限而不是预算。
+  同一份语料：`4/40000` → 34 次 claim / 29 个子 Agent / 53k 字符；
+  `6/120000` → 14 次 / 10 个 / 33k 字符；`8/160000` → 14 次 / 8 个 / 32k 字符。
+  **不改默认值**：默认要能在小窗口上跑。已写进 SKILL.md 与配置注释，按窗口自行调。
+- **要说清的取舍**：打得更包省的是**派活开销与主 Agent 上下文，不是生成时间**——
+  总输出量不变。代价在子 Agent：一次装下的 prompt 越多，每轮工具往返要重算的
+  上下文越大（连做是平方级的，ADR-040 就是为此把单位拆到「一次调用」的），
+  崩一次丢掉的单元也越多。所以不要一路调到窗口上限。
+- **守卫**：回归第 26 节新增「一条 `claim next` 里 run_dir 只准出现一次、
+  单元视图不超过 120 字符」。这类退化不会让任何断言变红，只会让上下文悄悄涨回去，
+  所以得有一条数字断言盯着。
+- **影响**：`scripts/workspace.py`、`scripts/filter_neverflag.py`、`scripts/typo_scan.py`、
+  `assets/config.default.yaml`、`SKILL.md` 第 4 步与契约表、`tests/run_regression.sh`。

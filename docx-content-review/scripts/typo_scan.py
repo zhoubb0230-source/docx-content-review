@@ -239,9 +239,12 @@ def scan(run_dir: Path, cfg: dict, chunk_id: str | None) -> dict:
         guard_write_path(ipath, run_dir)
         atomic_write_json(ipath, {**version_header(), "candidates": total,
                                   "batches": gbatches})
+    # 只列有候选的片：候选为 0 的片不产单元，逐片报零对主 Agent 没有信息量，
+    # 却按片数线性占用它的上下文。截断过的片必须留下——那是要处理的。
     return {"enabled": True, "candidates": total, "chunks": len(results),
             "batches": len(gbatches) or sum(r["batches"] for r in results),
-            "results": results}
+            "truncated_chunks": [r["chunk_id"] for r in results if r.get("truncated")],
+            "results": [r for r in results if r.get("candidates") or r.get("truncated")]}
 
 
 def merge(run_dir: Path, cfg: dict, chunk_id: str) -> dict:

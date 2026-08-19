@@ -804,15 +804,25 @@ def stage_units(run_dir: Path, stage: str) -> list[dict]:
 
 
 def _unit_view(u: dict, stage: str) -> dict:
-    """给子 Agent 看的视图：**只有它需要的那几条路径**。
+    """给子 Agent 看的视图：**一个单元只留一样东西——它要读的那个 prompt 文件名**。
 
     以前 `claim next` 把整条 chunk 元信息原样吐出来，其中 `pids` / `review_pids` /
     `context_pids` 三个列表在 800 页文档上是几百个条目——一条工具输出就是几 KB 噪音，
     还全程留在子 Agent 的上下文里。「不打印大对象」这条约定，claim 自己先破了。
+
+    这一版继续往下砍。实测 800 页文档的 Pass 1，主 Agent 上下文里近一半的字符
+    是同一条 run_dir 绝对路径的重复——每个单元两条绝对路径，在 `claim next` 的
+    stdout 里出现一次，主 Agent 把它转给子 Agent 时再出现一次：
+
+    - **`output` 是冗余的**。prompt 文件的抬头本来就写着「输出写到：<路径>」，
+      连返回格式都写好了。子 Agent 只读这一个文件就够——这正是 ADR-040 的原则。
+      主 Agent 要看完成情况有 `claim status`，不需要自己去对文件。
+    - **`chunk_id` 与 `stage` 也是冗余的**：review/extract 的 `unit` 就是 `chunk_id`，
+      而 `stage` 已经在返回的顶层。
+    - **目录只说一次**。全部 prompt 都在同一个目录下，路径前缀由 `claim next`
+      顶层的 `dir` 给出，单元这里只留文件名。
     """
-    return {"unit": u["unit"], "chunk_id": u["chunk_id"], "stage": stage,
-            **({"batch_id": u["batch_id"]} if u.get("batch_id") else {}),
-            "prompt": str(u["prompt"]), "output": str(u["output"])}
+    return {"unit": u["unit"], "prompt": u["prompt"].name}
 
 
 def next_pending_units(run_dir: Path, stage: str, session: str, generation: int | None,
@@ -1055,7 +1065,9 @@ def cmd_init(args) -> int:
         "lease": lease_status(doc_dir),
         "next": "workspace.py lease acquire --doc-dir <doc_dir> --session <sid> "
                 f"--runid {runid} --stage pass-1",
-        "deliverables": deliver_all(run_dir), "artifacts": artifact_all(run_dir),
+        # 只给交付物路径。全部产物及其去向由 `workspace.py deliver` 按需给出——
+        # 在 init 这一刻它们都还不存在，五条绝对路径进主 Agent 上下文纯属占位。
+        "deliverables": deliver_all(run_dir),
     })
     return EX.OK
 
@@ -1182,11 +1194,16 @@ def cmd_claim(args) -> int:
             budget = int((cfg.get("concurrency") or {}).get("subagent_budget_chars") or 40000)
             got = next_pending_units(run_dir, stage, args.session, args.generation,
                                      minutes, args.count, budget)
-            emit({"ok": True, "stage": stage, "units": got, "count": len(got),
-                  "exhausted": not got})
+            # `dir` 说一次，单元里只留文件名。派活时照抄这一句即可：
+            # 「prompt 目录是 <dir>，依次处理下面这几个文件」。
+            emit({"ok": True, "stage": stage, "dir": str(resolve_path(run_dir, "prompts")),
+                  "units": got, "count": len(got), "exhausted": not got})
             return EX.OK
         if stage:
             got = next_pending_unit(run_dir, stage, args.session, args.generation, minutes)
+            emit({"ok": True, "stage": stage, "dir": str(resolve_path(run_dir, "prompts")),
+                  "chunk": got, "exhausted": got is None})
+            return EX.OK
         else:
             got = next_pending_chunk(run_dir, args.session, args.generation, minutes)
             if got:
