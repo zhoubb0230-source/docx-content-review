@@ -1649,7 +1649,7 @@ import json,pathlib,sys
 sys.path.insert(0, sys.argv[1])
 import chunk as ck, workspace as ws
 run=pathlib.Path(sys.argv[2])
-for p,c in ((run/"work"/"issues"/"issues-0001.jsonl",""),
+for p,c in ((run/"work"/"issues"/"issues-0001.raw.jsonl",""),
             (run/"work"/"facts"/"facts-0001.json","{}")):
     p.parent.mkdir(parents=True,exist_ok=True); p.write_text(c,encoding="utf-8")
 ck.clear_stale_products = lambda run_dir, stale: 0          # 关掉清理
@@ -2197,7 +2197,7 @@ import json,pathlib,sys
 run=pathlib.Path(sys.argv[1])
 d=run/"work"/"issues"; d.mkdir(parents=True,exist_ok=True)
 for c in json.load(open(run/"work"/"chunks"/"index.json",encoding="utf-8"))["chunks"]:
-    (d/f"issues-{c['chunk_id']}.jsonl").write_text("",encoding="utf-8")
+    (d/f"issues-{c['chunk_id']}.raw.jsonl").write_text("",encoding="utf-8")
 PYEOF
 P4=$(python3 "$S/workspace.py" claim next --run-dir "$RUN7" --stage review --count 8 --session pk4)
 check "零问题的分片算已完成（空 JSONL 是合法产物，不得无限重派）" "$(echo "$P4" | jget "['exhausted']")" True
@@ -2264,6 +2264,155 @@ print("    各片各归各的：", per)
 sys.exit(0 if len(per) >= 2 else 1)
 PYEOF
 check "裁定落回了多个分片的产物（没有全堆到第一片）" "$?" 0
+
+echo "══ 27. 照 SKILL.md 第 4 步把波内循环跑一遍 ══"
+# 单元测试全绿不等于主流程能跑（CLAUDE.md）。这一节不测单个脚本，测的是
+# **SKILL.md 写的那个顺序**：claim next → 子 Agent 写 output → claim reclaim → 再来一轮，
+# **中途不跑任何闸门**（闸门按 SKILL.md 是整波跑完之后的收口）。
+# 上一版在这里断掉过：review 的完成标记指向闸门产物 issues-<片>.jsonl，
+# 而闸门要等全波跑完才跑 —— done 恒 0、pending 恒不降、reclaim 把做完的单元一并放掉，
+# 下一轮又领到同样的单元。第一波永远出不去，而每个脚本的单元测试都是绿的。
+
+RUN9=$(python3 "$S/workspace.py" init --source "$WORK/big2/big2.docx" --resume new \
+       --output-dir "$DELIVER" --temp-dir "$TEMP" | jget "['run_dir']")
+python3 "$S/unpack.py" run --run-dir "$RUN9" >/dev/null
+python3 "$S/extract.py" --run-dir "$RUN9" >/dev/null
+# 切小一点，逼出多轮循环：一片一轮的现场测不出「第二轮又领到同一个单元」
+python3 "$S/workspace.py" reconfigure --run-dir "$RUN9" \
+        --set chunking.max_text_tokens=300 --set chunking.single_pass_limit=100 >/dev/null
+python3 "$S/chunk.py" --run-dir "$RUN9" >/dev/null
+ge "构造：切成多片才测得出多轮循环" \
+  "$(python3 "$S/workspace.py" claim status --run-dir "$RUN9" --stage review | jget "['total']")" 5
+python3 "$S/typo_scan.py" scan --run-dir "$RUN9" >/dev/null
+python3 "$S/prompt_pack.py" build --run-dir "$RUN9" >/dev/null
+
+# ① 通用守卫：完成标记必须就是子 Agent 写的那个文件。
+#    这一条挡的是整类缺陷，不只是 review 那一处。
+python3 - "$S" "$RUN9" <<'PYEOF'
+import pathlib,sys
+sys.path.insert(0, sys.argv[1])
+import workspace as ws
+run=pathlib.Path(sys.argv[2]); bad=[]
+for st in ws.STAGES:
+    for u in ws.stage_units(run, st):
+        if u["done_marker"] != u["output"]:
+            bad.append(f"{st}/{u['unit']}: 完成标记 {u['done_marker'].name} ≠ 产物 {u['output'].name}")
+for b in bad[:3]: print("   ", b)
+sys.exit(1 if bad else 0)
+PYEOF
+check "每个阶段的完成标记就是子 Agent 自己写的产物" "$?" 0
+
+# ② 回放波内循环。派活规模照 SKILL.md：每轮 parallelism 个子 Agent，各领一组。
+replay_wave() {   # $1=run_dir $2=stage —— 回显「轮数 完成数 是否 exhausted」
+  python3 - "$S" "$1" "$2" <<'PYEOF'
+import json,pathlib,subprocess,sys
+S,run,stage=sys.argv[1],sys.argv[2],sys.argv[3]
+sys.path.insert(0, S); import workspace as ws
+def call(*a):
+    return json.loads(subprocess.run([sys.executable,f"{S}/workspace.py","claim",*a,
+        "--run-dir",run,"--stage",stage],capture_output=True,text=True).stdout)
+total=call("status")["total"]
+seen, rounds, prev_pending = set(), 0, total+1
+while rounds < total*4 + 10:
+    rounds += 1
+    units=[]
+    for _ in range(5):                                   # parallelism 个子 Agent
+        got=call("next","--count","4","--session","w1","--generation","1")
+        if got.get("exhausted") or not got["units"]: break
+        units += got["units"]
+    if not units: break
+    for u in units:                                      # 子 Agent 照 prompt 写 output
+        if u["unit"] in seen: print(f"    重复派发：{stage}/{u['unit']}")
+        seen.add(u["unit"])
+        out=pathlib.Path(u["output"]); out.parent.mkdir(parents=True,exist_ok=True)
+        out.write_text('{"terms":[],"acronyms":[],"entities":[],"metrics":[],"positions":[],'
+                       '"objectives":[],"initiatives":[],"acceptance":[],"dates":[],'
+                       '"versions":[],"roles":[],"xrefs":[],"numbering":[],"commitments":[],'
+                       '"statuses":[],"enumerations":[],"conclusions":[]}'
+                       if out.suffix==".json" else "", encoding="utf-8")
+    call("reclaim","--session","w1")                     # SKILL.md：每波结束回收崩掉的 claim
+    st=call("status")
+    if st["pending"] >= prev_pending:
+        print(f"    第 {rounds} 轮 pending 没有下降：{prev_pending} → {st['pending']}")
+        break
+    prev_pending=st["pending"]
+final=call("status"); ex=call("next","--session","w1","--generation","1").get("exhausted")
+print(f"{rounds} {final['done']}/{final['total']} {ex}")
+PYEOF
+}
+for st in review extract typo; do
+  R=$(replay_wave "$RUN9" "$st"); echo "$R" | grep -q '^ ' && echo "$R"
+  L=$(echo "$R" | tail -1)
+  echo "    $st：$(echo "$L" | cut -d' ' -f1) 轮，完成 $(echo "$L" | cut -d' ' -f2)"
+  check "$st 波：不跑闸门也能一路收敛到 exhausted" "$(echo "$L" | cut -d' ' -f3)" True
+  check "$st 波：全部单元都拿到了产物" \
+    "$(echo "$L" | cut -d' ' -f2 | awk -F/ '{print ($1==$2)?"yes":"no"}')" yes
+done
+
+# ③ 负向对照：把 review 的完成标记换回闸门产物，同一段循环必须立刻退化成无限重派
+python3 - "$S" "$RUN9" <<'PYEOF'
+import json,pathlib,sys
+sys.path.insert(0, sys.argv[1])
+import workspace as ws
+run=pathlib.Path(sys.argv[2])
+for f in (run/"work"/"issues").glob("issues-*.raw.jsonl"): f.unlink()
+orig=ws.stage_units
+def patched(run_dir, stage):                       # 完成标记 = 闸门产物（旧行为）
+    us=orig(run_dir, stage)
+    if stage=="review":
+        for u in us:
+            u["done_marker"]=ws.resolve_path(run_dir,"issues")/f"issues-{u['chunk_id']}.jsonl"
+    return us
+ws.stage_units=patched
+first=[u["unit"] for u in ws.next_pending_units(run,"review","neg",1,30,4,40000)]
+for u in ws.stage_units(run,"review"):
+    if u["unit"] in first: u["output"].write_text("", encoding="utf-8")
+ws.reclaim_stage(run,"review","neg")
+again=[u["unit"] for u in ws.next_pending_units(run,"review","neg",1,30,4,40000)]
+print("    旧行为下第二轮又领到：", again[:2])
+sys.exit(0 if first and first==again else 1)
+PYEOF
+check "负向对照：完成标记指向闸门产物即退化成无限重派（说明这项断言咬得住）" "$?" 0
+
+# ⑤ 闸门摘要必须报出真实丢弃数。这是主 Agent 每一波唯一能看到的闸门信号：
+#    报 0 的时候，「模型什么都没查出来」与「查出来的全被闸门丢了」长得一模一样。
+python3 - "$S" "$RUN9" <<'PYEOF'
+import json,pathlib,sys
+sys.path.insert(0, sys.argv[1]); import workspace as ws
+run=pathlib.Path(sys.argv[2])
+for f in (run/"work"/"issues").glob("issues-*"): f.unlink()
+u=ws.stage_units(run,"review")[0]
+u["output"].parent.mkdir(parents=True,exist_ok=True)
+# 跨度只有 2 字 → 必被 min_span_chars 丢掉
+u["output"].write_text(json.dumps({"pid":"p-000001","category":"A2","original_text":"的的",
+    "suggested_text":"的","evidence":"重复","severity":"High"},ensure_ascii=False)+"\n",
+    encoding="utf-8")
+PYEOF
+VS9=$(python3 "$S/verify_span.py" --run-dir "$RUN9" --all --channel main)
+check "闸门摘要报出真实丢弃数（负向对照：按错误的键名前缀累加恒为 0）" \
+  "$(echo "$VS9" | jget "['dropped']")" 1
+check "被闸门丢光时 count 为 0（与 dropped 一同读才不误判）" \
+  "$(echo "$VS9" | jget "['count']")" 0
+rm -rf "$RUN9"/work/issues "$RUN9"/work/facts
+
+# ④ 续跑可见性：会话被平台杀掉之后，接手的会话必须看得见已经做了多少。
+#    init 会在 manifest 里写一个全零的 stats 占位——以前 stats 只在缺失时才重建，
+#    于是这个占位永远命中，续跑的会话看到的永远是 0/0/0。
+rm -rf "$RUN9"/work/issues "$RUN9"/work/facts
+python3 - "$S" "$RUN9" <<'PYEOF'
+import pathlib,sys
+sys.path.insert(0, sys.argv[1]); import workspace as ws
+run=pathlib.Path(sys.argv[2])
+for u in ws.stage_units(run,"review")[:3]:
+    u["output"].parent.mkdir(parents=True,exist_ok=True)
+    u["output"].write_text("", encoding="utf-8")
+PYEOF
+ST9=$(python3 "$S/state.py" stats --run-dir "$RUN9")
+check "续跑：stats 报出真实的每波进度（不是 init 写下的全零占位）" \
+  "$(echo "$ST9" | jget "['stages']['review']['done']")" 3
+ge "续跑：stats 同时给出各波总数" "$(echo "$ST9" | jget "['stages']['extract']['total']")" 5
+check "续跑：分片级 done 仍按「审查+抽取都做完」算（没被每波进度顶掉）" \
+  "$(echo "$ST9" | jget "['stats']['done']")" 0
 
 echo
 printf '通过 \033[32m%d\033[0m，失败 \033[31m%d\033[0m\n' "$PASS" "$FAIL"

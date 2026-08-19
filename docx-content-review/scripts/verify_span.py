@@ -396,8 +396,13 @@ def sweep(run_dir: Path, cfg: dict, channel: str) -> dict:
             "unparsable": len(unparsable), "unparsable_chunks": unparsable[:20],
             "count": sum(r["count"] for r in results),
             "truncated": sum(1 for r in results if r.get("truncated")),
-            "dropped": sum(sum(v for k, v in r.items()
-                               if k.startswith("drop_") and isinstance(v, int))
+            # 丢弃数 = 进来多少 − 留下多少。**不要去枚举丢弃原因的键名**：
+            # 上一版按前缀 `drop_` 累加，而计数器实际叫 `length_drop` / `bad_schema` /
+            # `dedup_drop`，一个都没匹配上——这一行永远输出 0。实测 233 条候选
+            # 被长度闸门全数丢弃，摘要报的仍是「count 0 / dropped 0」，
+            # 读起来像"模型什么都没查出来"，而不是"查出来的全被闸门丢了"。
+            # 减法自维护：以后新增丢弃原因不必回来改这里。
+            "dropped": sum(int(r.get("raw") or 0) - int(r.get("count") or 0)
                            for r in results)}
 
 

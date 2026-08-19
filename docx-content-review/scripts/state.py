@@ -30,7 +30,7 @@ from _common import (  # noqa: E402
 )
 from workspace import (  # noqa: E402
     chunk_done, claim_path, guard_write_path, lease_heartbeat, lease_status, lease_verify,
-    STAGES, list_chunk_ids, load_run_config, resolve_path, stage_units,
+    STAGES, list_chunk_ids, load_run_config, resolve_path, stage_status, stage_units,
 )
 
 
@@ -219,11 +219,21 @@ def main(argv: list[str]) -> int:
     if args.cmd == "rebuild":
         emit({"ok": True, **rebuild(run_dir, cfg)})
     elif args.cmd == "stats":
+        # **每次都重建**。manifest 是派生视图，权威状态是产物文件本身；而 init 写下的
+        # manifest 里已经有一个全零的 stats 占位。以前只在 stats 缺失时才重建，
+        # 于是这个占位永远命中——续跑的会话照 SKILL.md 跑 stats，看到的永远是
+        # total 0 / done 0 / pending 0，等于「看不见自己已经做了多少」。
+        # 重建就是扫一遍产物目录，800 页文档实测毫秒级，没有省它的理由。
         man = read_json(resolve_path(run_dir, "manifest"), {}) or {}
-        if not man.get("stats"):
-            man = {**man, **rebuild(run_dir, cfg)}
+        man = {**man, **rebuild(run_dir, cfg)}
+        # 分片级的 done 要求「审查 + 抽取都做完」，Pass 1 跑到一半时它恒为 0。
+        # 续跑的会话真正要知道的是**每一波各差多少**，所以一并给出，
+        # 省掉四次 claim status（在串行 harness 上每次工具往返都是一两秒）。
+        stages = {st: {k: v for k, v in stage_status(run_dir, st).items()
+                       if k in ("total", "done", "claimed", "pending", "corrupt")}
+                  for st in STAGES}
         emit({"ok": True, "stage": man.get("stage"), "stats": man.get("stats", {}),
-              "lease": lease_status(run_dir.parent)})
+              "stages": stages, "lease": lease_status(run_dir.parent)})
     elif args.cmd == "stage":
         if args.session:
             lease_verify(run_dir.parent, args.session, args.generation)

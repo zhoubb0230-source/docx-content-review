@@ -1100,3 +1100,64 @@ L 规则表、目录结构、配置项）不在此重复。
 - **影响**：`scripts/workspace.py`、`scripts/prompt_pack.py`、`scripts/typo_scan.py`、
   `scripts/_common.py`、`assets/config.default.yaml`、`SKILL.md` 第 4/4.5 步、
   `prompts/pass1-typo.md`、回归第 26 节（新增 13 项）。
+
+## ADR-043　完成标记必须是子 Agent 自己写的产物，不能是闸门产物
+
+- **日期**：2026-08-19
+- **现场**：用户在 OpenCode 与 Deepseek 上各跑一次 800 页（211,573 字符）的文档，
+  十几个小时都停在第一波，日志里是上下文溢出与二十多条排队中的子 Agent 消息，
+  平台统计显示智能体在约 90 分钟处终止。
+- **根因**：`stage_units()` 给 `review` 阶段的 `done_marker` 指的是
+  `issues-<片>.jsonl`——那是**闸门②③的产物**；而子 Agent 写的是
+  `issues-<片>.raw.jsonl`。闸门按 SKILL.md 是「整波跑完之后的收口」，于是环闭上了：
+
+  1. 子 Agent 把 `.raw.jsonl` 写好返回；
+  2. `claim status` 仍报 `done: 0 / pending: 30`（它看的是闸门产物）；
+  3. SKILL.md 要求每波结束跑一次 `claim reclaim`，而 `reclaim_stage` 释放
+     「没有 done_marker」的全部 claim——**刚做完的单元也被放掉**；
+  4. 下一次 `claim next` 又把同样的单元发出去。
+
+  `exhausted` 永远不为 true，收口永远不会开始，第一波永远出不去。
+  已复现：三个子 Agent 做完 0001–0003 之后，下一轮领到的还是 0001、0002。
+- **决策**：`done_marker` 一律等于该单元的 `output`。`chunk_products` 拆出
+  `issues_raw`，`chunk_done` 改判子 Agent 产物且过 `product_ok`（半写不算完成）。
+- **备选**：把闸门改成每波跑一次。否决——闸门是纯脚本收口，按片各跑一次正是
+  ADR-039 花力气压掉的工具往返；而且这会让「做完了没有」依赖一个可以不跑的步骤。
+- **为什么 221 项回归全绿还漏掉**：第 26 节的构造顺序是「写 raw → **立刻跑闸门** →
+  断言 exhausted」，恰好把这个缺陷盖住了；而 SKILL.md 的顺序是「写 raw → reclaim →
+  再派一轮 → …… → 最后才跑闸门」。这正是 CLAUDE.md 记下的那一条：
+  **没有一项测试是照着 SKILL.md 的主流程从头跑一遍的。**
+- **影响**：`scripts/workspace.py`（`chunk_products` / `chunk_done` / `stage_units`）、
+  `tests/run_regression.sh` 第 27 节（新增，含负向对照与"完成标记必须等于产物"的
+  通用守卫）、`SKILL.md` 第 4 步。
+
+## ADR-044　`state.py stats` 每次重扫产物；并给出每一波的进度
+
+- **日期**：2026-08-19
+- **现场**：`workspace.py init` 会在 manifest 里写一个占位
+  `stats: {total_chunks: 0, done: 0, failed: 0, pending: 0}`，而 `stats` 子命令
+  只在 `not man.get("stats")` 时才重建——全零字典是真值，这个分支**永远不进**。
+  于是整个 run 期间 `state.py stats` 恒定输出 0/0/0。
+  而 SKILL.md 第 0 步的续跑路径写的正是「跳到 `state.py stats` 看还差哪些分片」：
+  接手的会话看到的永远是"什么都没做"。
+- **决策**：`stats` 每次都重建（就是扫一遍产物目录，800 页实测毫秒级），
+  并在返回里增加 `stages`，给出 review/extract/typo/pattern 四波各自的
+  total / done / claimed / pending / corrupt。
+- **理由**：manifest 自己的文档就写着「不是权威状态，只是派生视图」。既然如此，
+  就不该有"缓存命中"这条路径。分片级的 `stats.done` 要求审查与抽取都做完，
+  Pass 1 跑到一半时它恒为 0——续跑时真正要看的是每一波各差多少，
+  一次调用给全，也省掉四次 `claim status`（串行 harness 上每次往返都是一两秒）。
+- **影响**：`scripts/state.py`、`SKILL.md` 第 0 步与契约表、回归第 27 节。
+
+## ADR-045　闸门摘要的丢弃数用减法算，不枚举丢弃原因的键名
+
+- **日期**：2026-08-19
+- **现场**：`verify_span.py --all` 的 `dropped` 按前缀 `drop_` 累加计数器，
+  而计数器实际叫 `length_drop` / `bad_schema` / `context_pid` / `dedup_drop`——
+  一个都匹配不上，这一行**永远输出 0**。压测中 233 条候选被长度闸门全数丢弃，
+  摘要报的是 `count: 0, dropped: 0`，读起来是"模型什么都没查出来"，
+  而实情是"查出来的全被闸门丢了"。这两件事要采取的行动完全相反。
+- **决策**：`dropped = Σ(raw − count)`。减法自维护，以后新增丢弃原因不必回来改。
+- **说明**：`metrics.py collect` 读的是 `issues-*.gates.json`，一直是对的；
+  错的只是主 Agent 每一波唯一看得见的那个摘要数字。
+- **影响**：`scripts/verify_span.py`、回归第 27 节（含负向对照）。

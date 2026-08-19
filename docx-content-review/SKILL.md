@@ -88,9 +88,29 @@ workspace.py init --source <文档路径> [--output-dir <交付目录>] [--temp-
 |---|---|---|
 | `created` | 新建了 run | 继续第 1 步 |
 | `resume_available` | 该文档有未完成的 run | **必须问用户**：续跑还是新建，再用 `--resume reuse` 或 `--resume new` 重新调用 |
-| `resumed` | 已挂到旧 run | 跳到 `state.py stats` 看还差哪些分片 |
+| `resumed` | 已挂到旧 run | 跳到 `state.py stats` 看每一波还差多少 |
 
-若返回中 `lease.held` 为 true，说明另一个会话正在处理同一文档 → 见下方「并发」。
+若返回中 `lease.held` 为 true，**先看 owner 的 `session_id` 是不是上一次的自己**。
+长文档跑不完一个会话是常态（见「一个会话跑不完怎么办」），此时握着租约的是
+一个已经不存在的会话，不是并发——照下面这段接手，不要按「并发」一节去问用户：
+
+```
+workspace.py init --source <文档路径> --resume reuse
+workspace.py lease takeover --doc-dir <doc_dir> --session <新sid> --runid <runid> --stage pass-1
+workspace.py claim reclaim --run-dir <run> --stage review      # 四个阶段各来一次，
+workspace.py claim reclaim --run-dir <run> --stage extract      # **不带 --session**：
+workspace.py claim reclaim --run-dir <run> --stage typo         # 上一次会话的 claim
+workspace.py claim reclaim --run-dir <run> --stage pattern      # 没有人会来释放它
+state.py stats --run-dir <run>                                  # 每一波各差多少
+```
+
+`claim reclaim` 不带 `--session` 会把**所有**没有产物的 claim 放掉。只有在确认
+没有别的会话正在跑时才这么用——它就是为"上一次的自己已经死了"这个场合准备的。
+已完成的单元不受影响：判定看产物，不看 claim。
+
+`state.py stats` 的 `stages` 给出四波各自的 total / done / pending，
+**这是续跑时唯一要看的数字**；同一返回里的 `stats.done` 是分片级的
+（要求审查与抽取都做完），Pass 1 跑到一半时它恒为 0，不代表没有进展。
 
 **拿到 run 之后立刻取独占租约**（`lease.held` 为 false 时直接取；为 true 时先按「并发」一节问过用户）：
 
@@ -252,7 +272,8 @@ workspace.py claim next --run-dir <run> --stage <阶段> --count 4 \
 > `subagent_budget_chars` 提到子 Agent 窗口允许的最大值（单元打得更包一些，
 > 少几次派活），以及少生成 token。
 
-**收口（纯脚本，主 Agent 一次跑完，不要按片各跑一次）**：
+**收口（纯脚本，主 Agent 一次跑完，不要按片各跑一次）**——
+这几条是在**整波 `exhausted` 之后**跑的，波内循环不依赖它们：
 
 ```
 verify_span.py --run-dir <run> --all --channel main && \
@@ -294,7 +315,11 @@ filter_neverflag.py --run-dir <run> --all --channel typos
    （带 `--session` 只回收本会话自己的；别人的正在跑，不能动。）
 2. **看 `claim status`。** `workspace.py claim status --run-dir <run> --stage <阶段>`
    给出 total / done / claimed / pending，以及前 20 个 pending 单元。
-   `pending` 不再下降就是卡住了，不要空转。
+   **一个单元「做完了」的判据是它自己的 `output` 文件存在且可解析**——闸门还没跑
+   不影响它算完成（闸门是整波之后的收口，见下）。所以每派完一组、子 Agent 回话之后，
+   `done` 就该涨、`pending` 就该降。
+   **`pending` 一轮都不降就是真卡住了**：先看 `corrupt`（子 Agent 写到一半），
+   再看 `prompts_missing`（第 3 步没跑完），不要接着空转重派。
 3. **同一单元连续失败 3 次就放过它**（`retry.max_attempts_per_chunk`）：
    `state.py mark --run-dir <run> --chunk <片> --status failed --error "<原因>"`，
    继续下一波。报告会写明哪些片没审到——**不要因为一片失败就整轮重来**。
@@ -462,7 +487,7 @@ workspace.py clean-temp --run-dir <run>
 | `workspace.py deliver` | 取产物路径与去向 | `--run-dir [--kind]` | paths（交付物）+ artifacts（全部及去向） |
 | `workspace.py clean-temp` | 删除本次 run 的临时目录 | `--run-dir` | 已删路径 + 保留的交付物 |
 | `workspace.py lease` | 租约 status/acquire/takeover/heartbeat/verify/release | `--doc-dir --session` | owner |
-| `workspace.py claim` | 单元 next/renew/release/status/reclaim（`--stage` 分波） | `--run-dir --session [--stage]` | unit / prompt / output |
+| `workspace.py claim` | 单元 next/renew/release/status/reclaim（`--stage` 分波；`reclaim` 不带 `--session` = 回收所有会话的残留 claim） | `--run-dir --session [--stage]` | unit / prompt / output |
 | `env_probe.py` | 环境探测 | `--require-doc` | converters / can_convert_doc |
 | `convert_doc.py` | doc→docx（输出路径显式指定） | `--run-dir` | docx |
 | `unpack.py run` | 解包 + 合并 run + 记录 D9 基线 | `--run-dir` | 合并统计 |
@@ -481,7 +506,7 @@ workspace.py clean-temp --run-dir <run>
 | `apply_revisions.py plan\|apply` | 修订回写（两段式） | `--run-dir` | patches / applied |
 | `apply_comments.py plan\|apply` | 批注回写（六文件联动） | `--run-dir` | comments / anchored |
 | `validate_docx.py` | 回写后四项校验 | `--run-dir` | pass / failed |
-| `state.py rebuild\|stats\|stage\|mark\|heartbeat\|doctor` | 状态与续跑 | `--run-dir` | stats / stage |
+| `state.py rebuild\|stats\|stage\|mark\|heartbeat\|doctor` | 状态与续跑（`stats` 每次重扫产物） | `--run-dir` | stats（分片级）/ **stages（每波级，续跑看这个）** / stage |
 | `metrics.py bump\|collect\|show` | 闸门丢弃率统计 | `--run-dir` | gates / gate_rates |
 | `import_decisions.py import\|apply\|show` | 审查记忆 | `--run-dir` | hits |
 | `report.py` | report.md + issues.xlsx（写 run/output/） | `--run-dir` | 路径 / 计数 / artifacts |
@@ -525,6 +550,34 @@ workspace.py clean-temp --run-dir <run>
 确实被接管时（`held: true` 且 owner 不是本会话）不重试、不降级。转达为人话：本会话写入权限已失效，该文档已被另一个会话接管；已完成的分片结果仍然有效并已保留；建议切换到另一个会话查看进度，或选择「独立重跑」。
 
 ---
+
+## 一个会话跑不完怎么办
+
+**长文档跑不完一个会话是常态，不是故障。** 一份 800 页（约 21 万字符）的文档实测切成
+30 片 = 60 个 Pass 1 单元，再加闸门④与 Pass 4 的分批。确定性脚本全程合计不到两秒，
+墙上时间几乎全部是**模型出字**：读题、作答、把工具调用"说出口"。在 60 token/s 这类
+出字速度上，光 Pass 1 就是小时级；而多数运行载体对单个会话有墙上时间上限。
+
+所以要按「跑不完」来安排，而不是指望一口气跑完：
+
+1. **每一波都是可断点的。** 完成判定看产物文件，claim 只是防重复。会话被杀掉，
+   已完成的单元一个都不会丢。
+2. **下一个会话照第 0 步那段接手**（`--resume reuse` → `lease takeover` →
+   四个阶段各 `claim reclaim`（不带 `--session`）→ `state.py stats`），
+   从 `pending` 继续派活。
+3. **如实告诉用户这件事**：这份文档预计要分几次跑完，每次会话结束时说清
+   已完成多少、下次从哪继续。**不要在快到时间时草草收尾**——Pass 1 只做了一半就往下走，
+   报告会显示"审查完成"，而没审到的那部分在交付物里看不出来。
+
+**跑到一半时不要动 `chunking` 下的任何参数。** 改了就必须重跑第 3 步，而重切片会
+把与旧片号对不上的 `issues-*` / `facts-*` 一并作废（`stale_products_removed`）——
+已经跑掉的几个小时全部归零。分片大小要在第 3 步、派活之前一次定好：
+`prompt_pack.py build` 的退出码 8 就是为此存在的。
+
+**先量一下这个载体的子 Agent 是不是真并行**（派两个只写文件的空单元，看墙上时间是
+各自之和还是最大值）。是串行的话 `parallelism` 调多少都没用，能动的只有两处：
+把 `concurrency.subagent_budget_chars` 提到子 Agent 窗口允许的最大值（少几次派活），
+以及少让模型生成 token（`max_issues_per_chunk` 别开太大）。
 
 ## 并发：同一文档被多个会话处理
 

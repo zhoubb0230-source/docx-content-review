@@ -683,17 +683,27 @@ def claim_release(run_dir: Path, chunk_id: str, session: str | None = None,
 
 
 def chunk_products(run_dir: Path, chunk_id: str) -> dict:
+    """`issues_raw` 是子 Agent 写的，`issues` 是闸门②③写的。
+
+    **判「这一片做完了没有」只能看 `issues_raw`。** 闸门是整轮收口时才跑的一步，
+    拿它的产物当完成标记，等于要求「先过闸门才算做完、而过闸门要等全波做完」——
+    环就闭上了：整波永远不 exhausted，已完成的单元被一遍遍重派。
+    """
     return {
+        "issues_raw": resolve_path(run_dir, "issues") / f"issues-{chunk_id}.raw.jsonl",
         "issues": resolve_path(run_dir, "issues") / f"issues-{chunk_id}.jsonl",
         "facts": resolve_path(run_dir, "facts") / f"facts-{chunk_id}.json",
     }
 
 
 def chunk_done(run_dir: Path, chunk_id: str, *, need_issues: bool = True) -> bool:
-    """文件存在性即状态（spec §11.3.3）。纯表格片不产 issues，只看 facts。"""
+    """产物存在**且可解析**即状态（spec §11.3.3）。纯表格片不产 issues，只看 facts。
+
+    判据是子 Agent 的产物（`issues-*.raw.jsonl` / `facts-*.json`），不是闸门产物。
+    """
     prod = chunk_products(run_dir, chunk_id)
-    ok_facts = prod["facts"].exists()
-    ok_issues = prod["issues"].exists() or not need_issues
+    ok_facts = product_ok(prod["facts"])
+    ok_issues = product_ok(prod["issues_raw"]) or not need_issues
     return ok_facts and ok_issues
 
 
@@ -758,10 +768,15 @@ def stage_units(run_dir: Path, stage: str) -> list[dict]:
         if stage == "review":
             if c.get("chunk_type") == "table_only":
                 continue                      # 纯表格片不发起审查调用
+            raw = resolve_path(run_dir, "issues") / f"issues-{cid}.raw.jsonl"
+            # done_marker 必须是**子 Agent 自己写的那个文件**。曾经指向闸门产物
+            # issues-<cid>.jsonl，而闸门是整波跑完才收口的一步 —— 于是 done 恒为 0、
+            # pending 恒不下降、claim reclaim 把做完的单元一并放掉，
+            # 下一次 claim next 又把同样的单元发出去。第一波永远出不去。
             out.append({"unit": cid, "chunk_id": cid,
                         "prompt": pdir / f"review-{cid}.md",
-                        "output": resolve_path(run_dir, "issues") / f"issues-{cid}.raw.jsonl",
-                        "done_marker": resolve_path(run_dir, "issues") / f"issues-{cid}.jsonl",
+                        "output": raw,
+                        "done_marker": raw,
                         "source": Path(c.get("path") or "")})
         elif stage == "extract":
             out.append({"unit": cid, "chunk_id": cid,
