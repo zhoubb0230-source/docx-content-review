@@ -615,6 +615,11 @@ def r_L15(ctx, seq):
         if not tgt:
             continue
         if typ.startswith("sec") or typ in ("章节", "section"):
+            # 与下面的图/附录同理：一个带编号的标题都没认出来时闭嘴。
+            # 上一轮补这道判据时只补了图与附录，章节这一支漏了——
+            # 同一条判据在三个分支里只落实了两个，扫查当场把它揪了出来。
+            if not known["section"]:
+                continue
             norm = tgt.lstrip("第§").rstrip("节章")
             if SECTION_RE.match(norm) and norm not in known["section"]:
                 out.append(make("L15", ctx, [ctx.side(r["pid"], {"target": tgt})], tgt,
@@ -973,6 +978,12 @@ def r_L29(ctx, seq):
     out = []
     served = {normalize_key(str(r["meta"].get("serves_objective") or ""))
               for r in ctx.rows("initiative")} - {""}
+    # **整篇一条对应关系都没有时闭嘴。** 抽取 prompt 明确要求
+    # `serves_objective` 只在文档显式写明时才填、"宁可留 null"——所以"全篇皆空"
+    # 是预期内的常态，而不是"这份文档的目标都没人认领"。不拦这一下，
+    # 这条规则会把**每一个**目标都报一遍，且看不出根因。
+    if not served:
+        return out
     for o in ctx.rows("objective"):
         oid = normalize_key(str(o["subject"] or ""))
         if oid and oid not in served:
@@ -985,6 +996,9 @@ def r_L29(ctx, seq):
 def r_L30(ctx, seq):
     out = []
     targets = {normalize_key(str(r["subject"] or "")) for r in ctx.rows("acceptance")} - {""}
+    # 整篇一条验收指标都没抽到 = 这一类没抽出来，不是"每个举措都缺验收"
+    if not targets:
+        return out
     for i in ctx.rows("initiative"):
         iid = normalize_key(str(i["subject"] or ""))
         if iid and iid not in targets:

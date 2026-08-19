@@ -2625,6 +2625,96 @@ sys.exit(1 if bad else 0)
 PYEOF
 check "用户术语表在生成候选之前就起作用（负向对照：不登记则照常出候选）" "$?" 0
 
+echo "══ 29. 扫查：证据基为空时不许下结论 ══"
+# 这一节不测某一条规则，测的是**一整类缺陷**：
+#   「我在集合 S 里没找到 X」——当 S 是空的，这句话说明的是"我一个都没认出来"，
+#   不是"文档里没有 X"。此时每一条 X 都成立，表现为满屏误报而看不出根因。
+# L15 的流水式图号（ADR-047）就是这么误报的；这一节把这类缺陷变成可枚举的。
+#
+# **加一条「声称某物不存在」的规则时，必须在这里补一行。** 否则它迟早重演。
+
+# 用自己的源文件，不蹭前面小节的残留——这一节要能单独看懂、单独重跑
+mkdir -p "$WORK/ev"
+cp "$F/sample-basic.docx" "$WORK/ev/ev.docx"
+RUN11=$(python3 "$S/workspace.py" init --source "$WORK/ev/ev.docx" \
+        --output-dir "$DELIVER" --temp-dir "$TEMP" | jget "['run_dir']")
+[ -f "$RUN11/work/source-copy.docx" ] || bad "第 29 节构造失败：init 没有复制源文档"
+python3 "$S/unpack.py" run --run-dir "$RUN11" >/dev/null
+python3 "$S/extract.py" --run-dir "$RUN11" >/dev/null
+python3 "$S/chunk.py" --run-dir "$RUN11" >/dev/null
+
+# 把语料换成「一个可识别结构都没有」：无编号标题、无图表编号、无附录
+python3 - "$RUN11" <<PYEOF
+import json,pathlib,sys
+run=pathlib.Path(sys.argv[1])
+paras=[{"pid":f"p-{i:06d}","index":i,"text":t,"is_heading":False,"level":None,"style":None,
+        "in_table":False,"table_id":None,"row_idx":None,"cell_idx":None,"is_code":False,
+        "is_list":False,"is_quote":False,"heading_path":["概述"],"page_hint":1}
+       for i,t in enumerate(["系统概述","本系统由接入层与数据层组成，各层通过标准接口交互。",
+                             "详见前文相关说明。"],1)]
+with open(run/"work"/"paragraphs.jsonl","w",encoding="utf-8") as f:
+    for r in paras: f.write(json.dumps(r,ensure_ascii=False)+"\n")
+(run/"work"/"headings.json").write_text(json.dumps({"headings":[]},ensure_ascii=False),
+                                        encoding="utf-8")
+PYEOF
+
+seed11() {  # $1=facts JSON（单行）
+  python3 - "$RUN11" "$1" <<PYEOF
+import json,pathlib,sys
+run=pathlib.Path(sys.argv[1])
+allk={k:[] for k in ("terms","acronyms","entities","metrics","positions","objectives",
+ "initiatives","acceptance","dates","versions","roles","xrefs","numbering","commitments",
+ "statuses","enumerations","conclusions")}
+allk.update(json.loads(sys.argv[2]))
+fd=run/"work"/"facts"; fd.mkdir(parents=True,exist_ok=True)
+for old in fd.glob("facts-*.json"): old.unlink()
+(fd/"facts-0001.json").write_text(json.dumps(allk,ensure_ascii=False),encoding="utf-8")
+PYEOF
+  python3 "$S/ledger.py" rebuild --run-dir "$RUN11" >/dev/null
+}
+fired11() { python3 "$S/detect_conflicts.py" --run-dir "$RUN11" --force | jget "['by_rule']['$1']"; }
+
+# L15 三个分支：图 / 章节 / 附录。三个分支同一条判据，
+# 上一轮只落实了两个（ADR-047 补图与附录时漏了章节），所以三个都要断言。
+seed11 '{"xrefs":[{"type":"figure","target":"图33","pid":"p-000002"}]}'
+check "L15/图：一个图号都没认出来时不报" "$(fired11 L15)" 0
+seed11 '{"xrefs":[{"type":"section","target":"9.9","pid":"p-000002"}]}'
+check "L15/章节：一个带编号的标题都没有时不报" "$(fired11 L15)" 0
+seed11 '{"xrefs":[{"type":"appendix","target":"附录Z","pid":"p-000002"}]}'
+check "L15/附录：一条附录都没有时不报" "$(fired11 L15)" 0
+
+# L29/L30：覆盖性规则。整类证据为空 = 这一类没抽出来，不是"每一条都缺"
+seed11 '{"objectives":[{"obj_id":"O1","statement":"提升良率","pid":"p-000002"}],"initiatives":[{"init_id":"I1","statement":"建平台","serves_objective":null,"pid":"p-000002"}]}'
+check "L29：全篇没有一条对应关系时不报（prompt 本就要求宁可留 null）" "$(fired11 L29)" 0
+seed11 '{"initiatives":[{"init_id":"I1","statement":"建平台","serves_objective":null,"pid":"p-000002"}]}'
+check "L30：全篇一条验收指标都没抽到时不报" "$(fired11 L30)" 0
+
+# 负向对照：证据基一旦非空，这些规则必须照常开口，否则这道守卫就成了静音开关
+python3 - "$RUN11" <<PYEOF
+import json,pathlib,sys
+run=pathlib.Path(sys.argv[1])
+rows=[json.loads(l) for l in open(run/"work"/"paragraphs.jsonl",encoding="utf-8")]
+rows.append({"pid":"p-000004","index":4,"text":"图1 系统总体架构","is_heading":False,
+  "level":None,"style":None,"in_table":False,"table_id":None,"row_idx":None,"cell_idx":None,
+  "is_code":False,"is_list":False,"is_quote":False,"heading_path":["概述"],"page_hint":1})
+rows.append({"pid":"p-000005","index":5,"text":"1.1 接入层","is_heading":True,"level":2,
+  "style":None,"in_table":False,"table_id":None,"row_idx":None,"cell_idx":None,
+  "is_code":False,"is_list":False,"is_quote":False,"heading_path":["概述"],"page_hint":1})
+rows.append({"pid":"p-000006","index":6,"text":"附录A 缩略语表","is_heading":False,"level":None,
+  "style":None,"in_table":False,"table_id":None,"row_idx":None,"cell_idx":None,
+  "is_code":False,"is_list":False,"is_quote":False,"heading_path":["概述"],"page_hint":1})
+with open(run/"work"/"paragraphs.jsonl","w",encoding="utf-8") as f:
+    for r in rows: f.write(json.dumps(r,ensure_ascii=False)+"\n")
+(run/"work"/"headings.json").write_text(json.dumps(
+    {"headings":[{"pid":"p-000005","text":"1.1 接入层","level":2}]},ensure_ascii=False),
+    encoding="utf-8")
+PYEOF
+seed11 '{"xrefs":[{"type":"figure","target":"图33","pid":"p-000002"},{"type":"section","target":"9.9","pid":"p-000002"},{"type":"appendix","target":"附录Z","pid":"p-000002"}]}'
+check "负向对照：证据基非空时三个分支照常报（守卫不是静音开关）" "$(fired11 L15)" 3
+seed11 '{"objectives":[{"obj_id":"O1","statement":"提升良率","pid":"p-000002"},{"obj_id":"O2","statement":"降本","pid":"p-000002"}],"initiatives":[{"init_id":"I1","statement":"建平台","serves_objective":"O1","pid":"p-000002"}],"acceptance":[{"target":"I9","criterion":"接入率≥80%","pid":"p-000002"}]}'
+check "负向对照：有对应关系时 L29 照常报没被认领的目标" "$(fired11 L29)" 1
+check "负向对照：有验收指标时 L30 照常报没有验收的举措" "$(fired11 L30)" 1
+
 echo
 printf '通过 \033[32m%d\033[0m，失败 \033[31m%d\033[0m\n' "$PASS" "$FAIL"
 [ "$FAIL" -eq 0 ]
