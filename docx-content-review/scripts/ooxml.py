@@ -119,19 +119,26 @@ def run_is_plain(run) -> bool:
     return run.find(q("t")) is not None
 
 
-def locate_span(para, needle: str) -> tuple[int, int, list] | None:
+def locate_span(para, needle: str, occurrence: int = 0) -> tuple[int, int, list] | None:
     """在段落的可定位 run 序列中找到 needle，返回 (起始偏移, 结束偏移, runs)。
 
     合并 run 之后多数短语已落在单个 run 内，但跨 run 的情况仍然存在
     （中间夹着超链接、书签、域），因此定位必须在拼接文本上做。
+
+    `occurrence` 指定要第几处（0 起）。**它存在的意义是让跨度可以缩到最小。**
+    没有它时，"改哪一处"只能靠把跨度撑宽到段内唯一——错别字通道就是这么做的，
+    结果一个两字的错字带出八十多字的 `original_text`，落笔时整句被删除重插，
+    批注也跟着圈住一大片。有了序号，跨度可以就是那两个字。
     """
     runs = [r for r in para_runs(para) if run_is_plain(r)]
-    if not runs:
+    if not runs or not needle:
         return None
     joined = "".join(run_text(r) for r in runs)
-    idx = joined.find(needle)
-    if idx < 0:
-        return None
+    idx = -1
+    for _ in range(max(0, occurrence) + 1):
+        idx = joined.find(needle, idx + 1)
+        if idx < 0:
+            return None
     return idx, idx + len(needle), runs
 
 
@@ -255,7 +262,7 @@ def _split_run_at(run, offset: int):
     return left, right
 
 
-def isolate_span(para, needle: str) -> list | None:
+def isolate_span(para, needle: str, occurrence: int = 0) -> list | None:
     """把 needle 精确切成独立的 run，返回构成该跨度的 run 列表（已在文档中就位）。
 
     批注范围的边界只能落在 run 之间，所以要让范围精确到字符，就得先让跨度
@@ -265,7 +272,7 @@ def isolate_span(para, needle: str) -> list | None:
     只切边界的两只 run，中间的原样保留；只动可拆分 run（`locate_span` 已保证）。
     定位不到返回 None，由调用方退回整段。
     """
-    loc = locate_span(para, needle)
+    loc = locate_span(para, needle, occurrence)
     if not loc:
         return None
     start, end, runs = loc

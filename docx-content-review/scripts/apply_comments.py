@@ -32,7 +32,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 import ooxml as ox  # noqa: E402
 from _common import (  # noqa: E402
     conflict_admitted, EX, SEVERITY_PREFIX, atomic_write_json, die, emit, read_json, read_jsonl, rule_label,
-    run_cli, version_header, warn,
+    run_cli, version_header, warn, page_ref,
 )
 from workspace import (  # noqa: E402
     Heartbeat, guard_write_path, lease_verify, load_run_config, resolve_path,
@@ -114,6 +114,39 @@ def _next_comment_id(run_dir: Path) -> int:
     return (max(used) + 1) if used else 1
 
 
+SENT_END = "。！？!?；;\n"
+
+
+def _sentence_around(para_text: str, needle: str, occurrence: int) -> dict | None:
+    """取包含该跨度的**整句**，切成 (前段, 后段) 两截。
+
+    评审人要的是"这句话被改了"，不是"这两个字被改了"，也不是"这一整段被改了"。
+    修订落笔之后原文进了 `w:del`，句子在文档里被劈成两截：改动之前那截、
+    改动之后那截。锚定范围从前截的开头拉到后截的结尾，中间的 del/ins 自然被圈进来，
+    结果正是「这一句话 + 修订的内容」。
+
+    前截或后截为空（改动就在句首/句末）时该侧返回空串，由调用方拿修订节点当边界。
+    定位不到就返回 None，退回原来的行为。
+    """
+    if not needle:
+        return None
+    i = -1
+    for _ in range(max(0, occurrence) + 1):
+        i = para_text.find(needle, i + 1)
+        if i < 0:
+            return None
+    j = i + len(needle)
+    lo = max(para_text.rfind(ch, 0, i) for ch in SENT_END)
+    his = [para_text.find(ch, j) for ch in SENT_END]
+    his = [x for x in his if x >= 0]
+    hi = min(his) + 1 if his else len(para_text)
+    prefix, suffix = para_text[lo + 1:i].strip(), para_text[j:hi].strip()
+    # 整句就是整段时不必特殊处理——退回修订节点比圈住整段更有用
+    if not prefix and not suffix:
+        return None
+    return {"prefix": prefix, "suffix": suffix}
+
+
 def _anchor_or_whole(anchor: str, para_text: str) -> str:
     """锚点在段内不唯一时置空 → 由 `_anchor_paragraph` 退回整段。
 
@@ -146,9 +179,15 @@ def build_plan(run_dir: Path, cfg: dict) -> dict:
 
     def _rev_item(pid: str, patch: dict, severity: str, text: str, ref: str) -> dict:
         a = rev_anchor.get(patch["patch_id"]) or {}
+        # 句子边界按**原始段落文本**算（与 `_anchor_or_whole` 同理，见那里的说明）：
+        # apply 之后段落已被改过，那时再算会得到与计划不一致的结论
+        sent = _sentence_around((paras.get(pid) or {}).get("text") or "",
+                                patch.get("original_text") or "",
+                                patch.get("occurrence") or 0)
         return {
             "comment_id": None, "pid": pid, "anchor": patch.get("original_text") or "",
             "revision": {"del_id": a.get("del_id"), "ins_id": a.get("ins_id")},
+            **({"sentence": sent} if sent else {}),
             "severity": severity, "text": text, "kind": "revision",
             "source": patch.get("source") or "issue", "ref": ref,
         }
@@ -228,7 +267,7 @@ def build_plan(run_dir: Path, cfg: dict) -> dict:
             if other and rule in RIVAL_RULES:
                 where = " > ".join(other.get("heading_path") or []) or "文档其他位置"
                 # 只引另一处。本处那一句批注范围已经精确圈住了，再抄一遍是重复。
-                lines.append(f"与「{where}」（第 {other.get('page_hint')} 页）的描述不一致："
+                lines.append(f"与「{where}」（{page_ref(other)}）的描述不一致："
                              f"{other.get('text','')[:80]}")
                 # 不判断哪一处是对的——文档之外的事实不在模型视野里
                 lines.append("请确认以哪一处为准。")
@@ -242,7 +281,7 @@ def build_plan(run_dir: Path, cfg: dict) -> dict:
                     lines.append(note)
                 if other:
                     where = " > ".join(other.get("heading_path") or []) or "文档其他位置"
-                    lines.append(f"相关位置：「{where}」第 {other.get('page_hint')} 页——"
+                    lines.append(f"相关位置：「{where}」{page_ref(other)}——"
                                  f"{other.get('text','')[:60]}")
                 lines.append("请核对后确认。")
             if unsure:
@@ -333,7 +372,35 @@ def _revision_nodes(para, rev: dict | None) -> tuple:
     return found[0], found[-1]
 
 
-def _anchor_paragraph(para, anchor: str, cid: int, rev: dict | None = None) -> bool:
+def _sentence_nodes(para, sent: dict | None, first, last):
+    """把范围从修订节点扩到整句：起点取前截的首节点，终点取后截的末节点。
+
+    任一截定位不到（或不唯一）就保留修订节点那一侧的边界——**扩不成就退回原样，
+    不猜**。圈错一处比圈得小更糟。
+    """
+    if not sent:
+        return first, last
+    pre, suf = sent.get("prefix") or "", sent.get("suffix") or ""
+    # **lxml 元素不能用真值判断**：没有子节点的元素是「假」的，
+    # `top_level_node(...) or first` 会在拿到一只空 run 时静默回退到修订节点，
+    # 表现为"有时圈整句、有时只圈两个字"，且没有任何报错。
+    if pre and ox.span_count(para, pre) == 1:
+        runs = ox.isolate_span(para, pre)
+        if runs:
+            node = ox.top_level_node(para, runs[0])
+            if node is not None:
+                first = node
+    if suf and ox.span_count(para, suf) == 1:
+        runs = ox.isolate_span(para, suf)
+        if runs:
+            node = ox.top_level_node(para, runs[-1])
+            if node is not None:
+                last = node
+    return first, last
+
+
+def _anchor_paragraph(para, anchor: str, cid: int, rev: dict | None = None,
+                      sentence: dict | None = None) -> bool:
     """在段落中放置 commentRangeStart / End / Reference。
 
     锚定属于核心层，不可省略——只写 comments.xml 而不在 document.xml 中锚定，
@@ -348,6 +415,10 @@ def _anchor_paragraph(para, anchor: str, cid: int, rev: dict | None = None) -> b
     ref = etree.SubElement(ref_run, ox.q("commentReference")); ref.set(ox.q("id"), str(cid))
 
     first, last = _revision_nodes(para, rev)
+    if first is not None:
+        # 修订处的批注：范围拉到整句，评审人看到的是「这句话被改了」。
+        # 只圈 del/ins 的话高亮只有两三个字，看不出改的是哪句
+        first, last = _sentence_nodes(para, sentence, first, last)
     # 锚点在段内出现多次时不猜是哪一处，退回整段。
     # 圈错一处比圈住整段更糟：评审人会照着高亮去找问题，而问题不在那里。
     if first is None and anchor and ox.span_count(para, anchor) != 1:
@@ -438,7 +509,8 @@ def apply_comments(run_dir: Path, cfg: dict) -> dict:
             t = etree.SubElement(r, ox.q("t"))
             t.text = line
             t.set(ox.XML_SPACE, "preserve")
-        if _anchor_paragraph(para, it.get("anchor") or "", cid, it.get("revision")):
+        if _anchor_paragraph(para, it.get("anchor") or "", cid, it.get("revision"),
+                             it.get("sentence")):
             anchored += 1
             written.append(it)
 

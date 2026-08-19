@@ -329,16 +329,23 @@ for pid_ in prov["applied"]:
     c=cov.get(str(it["comment_id"]))
     if not c:
         bad.append(f"修订 {pid_} 的批注没有锚定范围"); continue
-    # 范围必须严丝合缝地圈住这处改动：拒绝视图=原文，接受视图=建议
-    if c["reject"]!=patches[pid_]["original_text"]:
-        bad.append(f"修订 {pid_} 的批注圈住的原文不对："
-                   f"{c['reject']!r} != {patches[pid_]['original_text']!r}")
-    if c["accept"]!=patches[pid_]["suggested_text"]:
-        bad.append(f"修订 {pid_} 的批注圈住的新文不对：{c['accept']!r}")
+    # 范围 = **这处改动所在的整句**。评审人要看到的是「这句话被改了」：
+    #   只圈 del/ins 高亮只有两三个字，看不出改的是哪句；
+    #   圈住整段则又回到「不知道问题在哪」（这正是现场反馈的那条）。
+    # 所以断言两头：拒绝视图里必须含原文、接受视图里必须含建议，
+    # 且范围不得越过句子边界。
+    if patches[pid_]["original_text"] not in c["reject"]:
+        bad.append(f"修订 {pid_} 的批注范围没圈住原文："
+                   f"{c['reject']!r} 不含 {patches[pid_]['original_text']!r}")
+    if patches[pid_]["suggested_text"] not in c["accept"]:
+        bad.append(f"修订 {pid_} 的批注范围没圈住建议：{c['accept']!r}")
+    inner = c["reject"].strip()
+    if any(ch in inner[:-1] for ch in "。！？"):
+        bad.append(f"修订 {pid_} 的批注范围跨了句子边界：{inner!r}")
 for b in bad: print("   ",b)
 sys.exit(1 if bad else 0)
 PY
-check "每处修订都有说明批注，且精确锚在该处改动上" "$?" 0
+check "每处修订都有说明批注，范围是该处改动所在的整句" "$?" 0
 
 # 锚点是段落里的一小截时，范围必须精确到字符——真实文档上验一遍，
 # 顺带证明「为锚定而拆 run」没有动到正文与 rPr（四项校验在上面已经跑过）
@@ -2763,6 +2770,188 @@ for b in bad: print("   ", b)
 sys.exit(1 if bad else 0)
 PYEOF
 check "诊断包带出编号方案与平行表指纹（两类最贵误报的来源）" "$?" 0
+
+echo "══ 31. 落笔跨度与页码：现场反馈的两条 ══"
+# ① 一个两字的错字，不该落成「删掉一整句、再插入一整句」的修订，
+#    批注也不该圈住整段。跨度撑宽是为了消歧（唯一性），不该连编辑范围一起撑宽——
+#    有了「段内第几处」，跨度就能缩到错字本身。
+# ② 逐段页码在有分页标记时是精确的，没有标记时是线性推算。
+#    把推算写成确定的页码，评审人照着翻过去找不到东西，只会认为这条是误报。
+
+python3 - "$WORK" <<PYEOF
+import sys
+try:
+    from docx import Document
+except ImportError:
+    sys.exit(9)
+d=Document(); d.add_heading("1 总则", level=1)
+# 三句一段：错字在中间那句。批注该圈中间这句，不是整段、也不只是那两个字
+d.add_paragraph("本系统采用分层架构，接入层负责协议转换与鉴权。"
+                "平台已完成布署并通过验收，运行状态良好。"
+                "后续按季度评估容量并输出报告。")
+# 同一个错字在同段出现两次：靠序号消歧，两处都该能落笔
+d.add_paragraph("一期布署完成后进入试运行。二期布署计划于下季度启动。")
+import pathlib; pathlib.Path(sys.argv[1],"span").mkdir(parents=True,exist_ok=True)
+d.save(str(pathlib.Path(sys.argv[1],"span","span.docx")))
+PYEOF
+if [ $? -eq 9 ]; then
+  echo "  （跳过：本机无 python-docx，无法生成本节 fixture）"
+else
+RUN12=$(python3 "$S/workspace.py" init --source "$WORK/span/span.docx" \
+        --output-dir "$DELIVER" --temp-dir "$TEMP" | jget "['run_dir']")
+python3 "$S/workspace.py" lease acquire --doc-dir "$(dirname "$RUN12")" --session sp \
+        --runid "$(basename "$RUN12")" --stage pass-1 >/dev/null
+for c in "unpack.py run" "extract.py" "chunk.py" "typo_scan.py scan"; do
+  python3 $S/$c --run-dir "$RUN12" >/dev/null
+done
+
+# 候选必须带段内序号，且同段两处各有各的序号
+python3 - "$RUN12" <<PYEOF
+import json,pathlib,sys
+run=pathlib.Path(sys.argv[1]); t=run/"work"/"typos"
+cands=[c for f in t.glob("typos-????.json")
+       for c in json.load(open(f,encoding="utf-8")).get("candidates",[])]
+bad=[]
+if not cands: bad.append("没有候选，构造无效")
+if any("occurrence" not in c for c in cands): bad.append("候选没有带段内序号")
+byp={}
+for c in cands: byp.setdefault(c["pid"],[]).append(c["occurrence"])
+dup=[v for v in byp.values() if len(v)>1]
+if not dup: bad.append("构造无效：没有同段两处的情形")
+elif sorted(dup[0])!=[0,1]: bad.append(f"同段两处的序号不对：{dup}")
+# 全部裁定为 B
+for f in sorted(t.glob("typos-g*.json")):
+    items=json.load(open(f,encoding="utf-8"))["items"]
+    (t/f"{f.stem}.verdicts.jsonl").write_text("".join(
+        json.dumps({"tid":i["tid"],"verdict":"B"},ensure_ascii=False)+"\n" for i in items),
+        encoding="utf-8")
+for b in bad: print("   ",b)
+sys.exit(1 if bad else 0)
+PYEOF
+check "错别字候选带段内序号（同段两处各有各的序号）" "$?" 0
+
+python3 "$S/typo_scan.py" merge --run-dir "$RUN12" >/dev/null
+python3 - "$RUN12" <<PYEOF
+import json,pathlib,sys
+rows=[json.loads(l) for l in
+      open(pathlib.Path(sys.argv[1],"work","issues","issues-0001.typos.jsonl"),encoding="utf-8")]
+bad=[]
+if not rows: bad.append("merge 没有产出")
+for r in rows:
+    if len(r["original_text"])>4:
+        bad.append(f"落笔跨度不是错字本身：{r['original_text']!r}（{len(r['original_text'])} 字）")
+    if len(r["suggested_text"])!=len(r["original_text"]):
+        bad.append(f"建议与原文长度不一致：{r['suggested_text']!r}")
+print(f"    落笔跨度：{[r['original_text'] for r in rows]} → {[r['suggested_text'] for r in rows]}")
+for b in bad[:3]: print("   ",b)
+sys.exit(1 if bad else 0)
+PYEOF
+check "落笔跨度就是错字本身（不再撑宽到唯一性窗口）" "$?" 0
+
+python3 "$S/verify_span.py" --run-dir "$RUN12" --all --channel typos >/dev/null
+python3 "$S/filter_neverflag.py" --run-dir "$RUN12" --all --channel typos >/dev/null
+KEPT=$(python3 - "$RUN12" <<PYEOF
+import json,pathlib,sys
+p=pathlib.Path(sys.argv[1],"work","issues","issues-0001.typos.jsonl")
+print(sum(1 for _ in open(p,encoding="utf-8")))
+PYEOF
+)
+ge "两字跨度过得了闸门②（A1 的下限独立于 min_span_chars）" "$KEPT" 2
+
+python3 "$S/verify_pass2.py" build --run-dir "$RUN12" >/dev/null
+python3 - "$RUN12" <<PYEOF
+import json,pathlib,sys
+run=pathlib.Path(sys.argv[1]); vd=run/"work"/"verify"
+key=json.loads((vd/"pass2-primary.key.json").read_text(encoding="utf-8"))["key"]
+for f in sorted(vd.glob("pass2-primary.v[0-9][0-9].json")):
+    items=json.loads(f.read_text(encoding="utf-8"))["items"]
+    (vd/f"{f.stem}.verdicts.jsonl").write_text("".join(
+        json.dumps({"id":i["id"],"answer":key[i["id"]]["orig_side"]},ensure_ascii=False)+"\n"
+        for i in items),encoding="utf-8")
+PYEOF
+python3 "$S/verify_pass2.py" merge --run-dir "$RUN12" >/dev/null
+python3 "$S/apply_revisions.py" plan  --run-dir "$RUN12" --session sp --generation 1 >/dev/null
+AP=$(python3 "$S/apply_revisions.py" apply --run-dir "$RUN12" --session sp --generation 1)
+ge "同段两处各自落笔（靠序号消歧，不再整条拒绝）" "$(echo "$AP" | jget "['applied']")" 2
+check "落笔没有失败项" "$(echo "$AP" | jget "['failed']")" 0
+
+python3 "$S/apply_comments.py" plan  --run-dir "$RUN12" --session sp --generation 1 >/dev/null
+python3 "$S/apply_comments.py" apply --run-dir "$RUN12" --session sp --generation 1 >/dev/null
+python3 - "$S" "$RUN12" <<PYEOF
+import pathlib,sys
+sys.path.insert(0, sys.argv[1])
+from lxml import etree
+import ooxml as ox
+root=etree.parse(str(pathlib.Path(sys.argv[2],"work","unpacked","word","document.xml"))).getroot()
+paras={}
+cov=ox.comment_coverage(root)
+bad=[]
+three=[c for c in cov.values() if "分层架构" in c["reject"] or "运行状态良好" in c["reject"]]
+if not three: bad.append("没找到三句段落上的批注")
+for c in three:
+    r=c["reject"].strip()
+    if "分层架构" in r or "按季度评估" in r:
+        bad.append(f"批注圈到了同段的其它句子：{r!r}")
+    if "布署" not in r: bad.append(f"批注没圈住被改的那句：{r!r}")
+    if len(r) < 8: bad.append(f"批注只圈住了错字本身，看不出改的是哪句：{r!r}")
+    print(f"    批注范围：{r!r}")
+for b in bad[:3]: print("   ",b)
+sys.exit(1 if bad else 0)
+PYEOF
+check "批注圈住的是被改的那一句（不是整段，也不只是那两个字）" "$?" 0
+VD=$(python3 "$S/validate_docx.py" --run-dir "$RUN12")
+check "回写四项校验通过" "$(echo "$VD" | jget "['pass']")" True
+fi
+
+# ② 页码：有渲染分页标记时逐段精确；没有时是线性推算，措辞必须带「约」
+python3 - "$S" <<PYEOF
+import sys
+sys.path.insert(0, sys.argv[1])
+from _common import page_ref
+bad=[]
+if page_ref({"page_hint":36,"page_estimated":False}) != "第 36 页": bad.append("精确页码措辞不对")
+if page_ref({"page_hint":36,"page_estimated":True}) != "约第 36 页": bad.append("估算页码没带「约」")
+if page_ref({"page_hint":36}) != "约第 36 页": bad.append("缺字段时未按估算处理（默认必须保守）")
+for b in bad: print("   ",b)
+sys.exit(1 if bad else 0)
+PYEOF
+check "估算出来的页码不写成确定的页码" "$?" 0
+
+python3 - "$S" "$RUN2" <<PYEOF
+import json,pathlib,shutil,subprocess,sys
+S,run=sys.argv[1],pathlib.Path(sys.argv[2])
+from lxml import etree
+W="http://schemas.openxmlformats.org/wordprocessingml/2006/main"
+doc=run/"work"/"unpacked"/"word"/"document.xml"
+backup=doc.read_bytes()
+t=etree.parse(str(doc)); r=t.getroot()
+ps=list(r.iter(f"{{{W}}}p")); n=0
+for i,p in enumerate(ps):
+    if i and i%3==0:
+        run_el=p.find(f"{{{W}}}r")
+        if run_el is not None:
+            run_el.insert(0, etree.Element(f"{{{W}}}lastRenderedPageBreak")); n+=1
+t.write(str(doc), xml_declaration=True, encoding="UTF-8", standalone=True)
+out=json.loads(subprocess.run([sys.executable,f"{S}/extract.py","--run-dir",str(run)],
+                              capture_output=True,text=True).stdout)
+rows=[json.loads(l) for l in open(run/"work"/"paragraphs.jsonl",encoding="utf-8")]
+bad=[]
+if out["page_density"].get("page_hint_source")!="rendered_breaks":
+    bad.append(f"有分页标记却没用：{out['page_density']}")
+if any(x["page_estimated"] for x in rows): bad.append("按分页标记算出来的页码仍被标为估算")
+if max(x["page_hint"] for x in rows) < 2: bad.append("页码没有随分页标记递增")
+print(f"    注入 {n} 个渲染分页标记 → 来源 {out['page_density'].get('page_hint_source')}，"
+      f"最大页 {max(x['page_hint'] for x in rows)}")
+doc.write_bytes(backup)
+subprocess.run([sys.executable,f"{S}/extract.py","--run-dir",str(run)],capture_output=True)
+rows2=[json.loads(l) for l in open(run/"work"/"paragraphs.jsonl",encoding="utf-8")]
+# 负向对照：把标记去掉，必须退回线性推算并标为估算
+if not all(x["page_estimated"] for x in rows2):
+    bad.append("负向对照：没有分页标记时仍声称页码精确")
+for b in bad[:3]: print("   ",b)
+sys.exit(1 if bad else 0)
+PYEOF
+check "有分页标记就逐段精确；负向对照：没有标记时退回推算并标为估算" "$?" 0
 
 echo
 printf '通过 \033[32m%d\033[0m，失败 \033[31m%d\033[0m\n' "$PASS" "$FAIL"

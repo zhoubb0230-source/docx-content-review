@@ -175,6 +175,11 @@ def process(run_dir: Path, chunk_id: str, raw_path: Path, cfg: dict,
     glossary = read_json(resolve_path(run_dir, "glossary_merged"), {}) or {}
     v = cfg.get("verification") or {}
     min_len = int(v.get("min_span_chars") or 4)
+    # A1 的跨度下限独立。`min_span_chars` 挡的是"模型圈了一两个字、没有依据"，
+    # 而 A1 的跨度由确定性词表给出、模型只答 A/B——两个字的错字就是两个字。
+    # 拿同一个下限套过来，等于逼着错别字通道把跨度撑宽，那正是修订与批注
+    # 圈住一大片的根因（这与 ADR-034 的 max_span_chars 误杀 P 类是同一个形状）。
+    min_len_a1 = int(((cfg.get("typo_check") or {}).get("min_span_chars")) or 2)
     max_len = int(v.get("max_span_chars") or 120)
     # P 类的跨度上限必须与 A/B 类分开。
     # `max_span_chars` 的判据是"跨度太长说明模型在圈整段"——那是针对"这句话哪里写错了"
@@ -218,7 +223,8 @@ def process(run_dir: Path, chunk_id: str, raw_path: Path, cfg: dict,
 
         # ③ 长度校验（上限按类别取，见上面 p_max 的说明）
         upper = (p_max or 10 ** 9) if cat in P_CLASSES else max_len
-        if not (min_len <= len(orig) <= upper):
+        lower = min_len_a1 if cat == "A1" else min_len
+        if not (lower <= len(orig) <= upper):
             counters["length_drop"] += 1
             continue
 
@@ -270,9 +276,14 @@ def process(run_dir: Path, chunk_id: str, raw_path: Path, cfg: dict,
             "severity": sev,
             "original_text": orig,
             "suggested_text": sugg,
+            # 段内第几处。**这个字段必须一路带到回写**：闸门这里是显式字段表，
+            # 漏掉它等于把"改哪一处"的依据丢在半路，回写侧只能退回"撑宽跨度求唯一"
+            **({"occurrence": rec["occurrence"]} if isinstance(rec.get("occurrence"), int) else {}),
             "evidence": ev,
             "heading_path": (para or {}).get("heading_path", []),
             "page_hint": (para or {}).get("page_hint"),
+            # 页码是否精确要跟着记录走，否则报告与批注只能假定它是精确的
+            "page_estimated": bool((para or {}).get("page_estimated", True)),
             "in_table": bool((para or {}).get("in_table")),
             "is_code": bool((para or {}).get("is_code")),
             "gate_note": gate_note,

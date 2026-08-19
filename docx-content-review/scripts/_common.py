@@ -111,6 +111,19 @@ def read_json(path: str | os.PathLike, default: Any = None) -> Any:
         return default
 
 
+def page_ref(rec: dict | None) -> str:
+    """页码的措辞。**估算出来的页码不能写成确定的页码。**
+
+    逐段页码只有在文档带分页标记时才是精确的；没有标记时是「字符偏移 ÷ 每页字符数」
+    的线性推算，而带表格与图片的长文档远非均匀分布，正文中段能偏出几十页。
+    评审人照着一个精确写法的页码翻过去找不到东西，只会认为这条是误报。
+    """
+    n = (rec or {}).get("page_hint")
+    if not n:
+        return "位置未知"
+    return f"第 {n} 页" if not (rec or {}).get("page_estimated", True) else f"约第 {n} 页"
+
+
 def product_ok(path: str | os.PathLike) -> bool:
     """产物是否「完整可用」。**「文件存在」不等于「做完了」。**
 

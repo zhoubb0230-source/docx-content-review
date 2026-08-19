@@ -121,13 +121,17 @@ def has_numbering(p) -> bool:
     return ppr is not None and ppr.find(f"{{{W}}}numPr") is not None
 
 
-def count_page_breaks(p) -> int:
-    n = 0
-    for br in p.iter(f"{{{W}}}br"):
-        if br.get(f"{{{W}}}type") == "page":
-            n += 1
-    n += sum(1 for _ in p.iter(f"{{{W}}}lastRenderedPageBreak"))
-    return n
+def count_page_breaks(p) -> tuple[int, int]:
+    """返回 (Word 渲染出的分页数, 手动分页符数)。
+
+    **两者不能相加。** 手动分页处 Word 同样会写一个 `lastRenderedPageBreak`，
+    加起来等于把那一页数了两遍。`lastRenderedPageBreak` 覆盖**全部**页边界
+    （含手动分页导致的），所以它一旦存在就该单独用；没有它才退回手动分页符。
+    """
+    explicit = sum(1 for br in p.iter(f"{{{W}}}br")
+                   if br.get(f"{{{W}}}type") == "page")
+    rendered = sum(1 for _ in p.iter(f"{{{W}}}lastRenderedPageBreak"))
+    return rendered, explicit
 
 
 def detect_code(text: str, style_info: dict) -> bool:
@@ -248,8 +252,8 @@ def extract(run_dir: Path, cfg: dict) -> dict:
                 heading_stack.pop()
             heading_stack.append((level, stripped))
 
-        breaks = count_page_breaks(p)
-        total_breaks += breaks
+        breaks = count_page_breaks(p)          # (渲染分页, 手动分页)
+        total_breaks += max(breaks)            # 只给 page_density 估总页数用
 
         pid = f"p-{idx:06d}"
         rec = {
@@ -279,19 +283,36 @@ def extract(run_dir: Path, cfg: dict) -> dict:
             headings.append({"pid": pid, "level": level, "text": stripped, "index": idx,
                              "path": list(rec["heading_path"])})
 
-    # 页码估算
+    # 页码。**「这份文档共几页」与「这一段在第几页」是两个问题，来源也不同。**
+    #
+    # 旧实现把两者绑在一起：app.xml 给得出总页数就走「字符偏移 ÷ 每页字符数」这条
+    # 线性路径，哪怕文档里明明有 Word 写好的分页标记。结果是**文档信息越全，
+    # 每段的页码反而越不准**——线性模型假设字符均匀分布，而带表格、图片、
+    # 分节符的长文档远非如此，正文中段能偏出几十页。
+    # 现场反馈就是这个：批注里引的那句话在所指页码上找不到。
+    #
+    # 现在分开取：总页数优先 app.xml；**每段的页码优先分页标记**（逐段精确），
+    # 一个标记都没有才退回线性估算，并把 page_estimated 置为 true。
     dens = page_density(unpacked, total_chars, total_breaks, cfg)
-    if dens["source"] == "pagebreak":
-        page = 1
+    total_rendered = sum(r["page_breaks"][0] for r in rows)
+    total_explicit = sum(r["page_breaks"][1] for r in rows)
+    which = 0 if total_rendered >= 3 else (1 if total_explicit >= 3 else None)
+    if which is not None:
+        page, exact = 1, True
         for rec in rows:
             rec["page_hint"] = page
-            page += rec["page_breaks"]
+            page += rec["page_breaks"][which]
+        dens = {**dens, "page_hint_source":
+                "rendered_breaks" if which == 0 else "explicit_breaks"}
     else:
+        exact = False
         cpp = dens["chars_per_page"] or 400
         for rec in rows:
             rec["page_hint"] = int(rec["char_offset"] // cpp) + 1
+        dens = {**dens, "page_hint_source": "char_linear"}
     for rec in rows:
-        rec["page_estimated"] = dens["estimated"]
+        # 逐段页码是否精确，与「总页数是否精确」是两件事，各记各的
+        rec["page_estimated"] = not exact
         rec.pop("char_offset", None)
         rec.pop("page_breaks", None)
 

@@ -64,6 +64,10 @@ logic:
 typo_check:
   enabled: true                 # 独立通道：脚本出候选 → LLM 二选一裁定 → 过闸门②③
   max_typos_per_chunk: 200      # 独立配额，不占用 max_issues_per_chunk
+  # A1 的跨度下限，独立于 verification.min_span_chars（那条挡的是"模型圈了
+  # 一两个字、没有依据"）。A1 的跨度来自确定性词表，两个字的错字就是两个字；
+  # 共用一个下限会逼着这条通道把跨度撑宽，修订与批注就会圈住一大片。
+  min_span_chars: 2
   # 每批一个题面文件，子 Agent 只读自己那一批。批越大，单个子 Agent 的上下文越大——
   # 这条通道的候选量是三条里最大的，50 是实测能稳住的上限。
   batch_size: 50

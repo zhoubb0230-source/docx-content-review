@@ -231,6 +231,9 @@ class Ctx:
         p = self.paras.get(pid) or {}
         return {"pid": pid, "text": (p.get("text") or "").strip()[:300],
                 "heading_path": p.get("heading_path", []), "page_hint": p.get("page_hint"),
+                # 页码是否精确要跟着一起传：批注与报告据此决定写「第 N 页」还是
+                # 「约第 N 页」。少了它，估算出来的页码会被写成确定的页码
+                "page_estimated": p.get("page_estimated", True),
                 **(extra or {})}
 
     def sort_key(self, pid: str) -> int:

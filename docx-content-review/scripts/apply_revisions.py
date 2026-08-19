@@ -52,6 +52,8 @@ def build_plan(run_dir: Path, cfg: dict) -> dict:
             "patch_id": rec.get("id") or f"P-{len(patches)+1:05d}",
             "pid": rec["pid"], "category": cat,
             "original_text": rec["original_text"], "suggested_text": sugg,
+            # 错别字通道会给出"段内第几处"。带着它，跨度不必撑宽到唯一
+            **({"occurrence": rec["occurrence"]} if isinstance(rec.get("occurrence"), int) else {}),
             "source": "issue",
         })
 
@@ -130,15 +132,25 @@ def apply_plan(run_dir: Path, cfg: dict) -> dict:
         # 剩下的原样留着，文档会变成半规范化状态。
         every = bool(patch.get("all_occurrences"))
         occ = ox.span_count(para, patch["original_text"])
-        if occ > 1 and not every:
+        # 第三条出路：候选自己说得清是第几处（错别字通道按段内序号给出）。
+        # 有序号就不存在"改哪一处"的疑问，跨度因此可以缩到错字本身——
+        # 撑宽跨度换唯一性的代价是修订与批注圈住一大片，评审人看不出改了什么。
+        nth = patch.get("occurrence")
+        nth = int(nth) if isinstance(nth, int) or (isinstance(nth, str) and nth.isdigit()) else None
+        if occ > 1 and not every and nth is None:
             failed.append({**patch, "reason": f"原文在该段落中出现 {occ} 次，无法唯一定位，未落笔"})
+            continue
+        if nth is not None and nth >= occ:
+            failed.append({**patch, "reason": f"指定的第 {nth + 1} 处不存在（该段共 {occ} 处），未落笔"})
             continue
 
         marks: list[tuple[str, str]] = []
         produced: list[str] = []
         src_rpr_key = ""
         while True:
-            loc = ox.locate_span(para, patch["original_text"])
+            # 带序号时只处理指定的那一处；处理完 original 已进 w:del、
+            # 不再参与定位，所以下一轮自然找不到，循环只跑一次
+            loc = ox.locate_span(para, patch["original_text"], nth or 0)
             if loc is None:
                 break
             start, end, runs = loc

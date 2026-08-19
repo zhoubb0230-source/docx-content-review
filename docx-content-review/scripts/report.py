@@ -24,7 +24,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from _common import (  # noqa: E402
     conflict_admitted, EX, atomic_write_text, emit, now_iso, read_json, read_jsonl, rule_label, run_cli,
-    version_header,
+    version_header, page_ref,
 )
 from workspace import (  # noqa: E402
     deliver_meta, deliver_path, guard_write_path, load_run_config, resolve_path,
@@ -233,7 +233,7 @@ def render_markdown(run_dir: Path, rows: list[dict], cfg: dict) -> str:
             w()
             w(f"- 章节：{' > '.join(r['heading_path']) or '（文档开头）'}")
             for i, s in enumerate(r.get("sides") or [], 1):
-                w(f"- 位置 {i}（第 {s.get('page_hint')} 页，"
+                w(f"- 位置 {i}（{page_ref(s)}，"
                   f"{' > '.join(s.get('heading_path') or []) or '—'}）：{s.get('text','')[:200]}")
             w(f"- 说明：{r['note']}")
             w()
