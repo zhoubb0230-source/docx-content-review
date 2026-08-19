@@ -87,7 +87,47 @@ MODALITY = {"必须": 3, "应当": 3, "应": 3, "不低于": 3, "不得": 3, "�
             "拟": 2, "宜": 1, "可": 1, "可选": 1, "建议": 1}
 PHASE_RE = re.compile(r"(一|二|三|四|五|六|1|2|3|4|5|6)\s*期|阶段\s*([0-9一二三四五六])")
 SECTION_RE = re.compile(r"^[0-9]+(?:\.[0-9]+)*$")
-LABEL_RE = re.compile(r"(图|表)\s*([0-9]+)\s*[-–—.－]\s*([0-9]+)")
+# 图表编号有两种方案，真实文档里都常见：
+#   章-序    图3-7、表 2 – 4
+#   全篇流水  图33、表 12（Word 自动编号出来的多半是这种）
+# 旧版只认前一种。后一种文档因此**一个已知编号都识别不出来**，于是
+# `_known_targets` 是空集，L15 把每一条「图33」都报成"未检索到"——
+# 实测就是这么误报的。第 3 组为 None 即流水式。
+LABEL_RE = re.compile(r"(图|表)\s*([0-9]+)(?:\s*[-–—.－]\s*([0-9]+))?")
+# 标题式编号后面必须有分隔符：「图33 系统架构」是图题，「图33所示的架构」是引用。
+# 章-序式几乎不会撞上，流水式会——所以这道判据是为流水式加的。
+CAPTION_SEP_RE = re.compile(r"[\s:：.、,，\-—－]")
+
+
+def label_key(m: "re.Match") -> str:
+    """把一处编号归一成可比较的键：图3-7 / 图33。"""
+    return f"{m.group(1)}{m.group(2)}-{m.group(3)}" if m.group(3) else f"{m.group(1)}{m.group(2)}"
+
+
+def label_series(m: "re.Match") -> tuple:
+    """编号所属的序列与序号。章-序式按 (类型, 章) 分列，流水式自成一列。
+
+    **两种方案不能混进同一列**——混了之后「图3-7」与「图33」会被当成同一序列的
+    两个号，跳号/重号立刻变成误报。
+    """
+    if m.group(3):
+        return (m.group(1), m.group(2)), int(m.group(3))
+    return (m.group(1), ""), int(m.group(2))
+
+
+def caption_label(text: str) -> "re.Match | None":
+    """这一段是不是图/表标题。是则返回编号匹配，否则 None。
+
+    判据：段首就是编号，且编号之后跟着分隔符与标题文字。
+    「图33所示的架构如下」不是标题，是正文引用——按标题算会凭空造出一个编号。
+    """
+    m = LABEL_RE.match(text.strip())
+    if not m:
+        return None
+    rest = text.strip()[m.end():]
+    if not rest or not CAPTION_SEP_RE.match(rest[0]):
+        return None
+    return m if rest.strip() else None
 MEASURE_WORDS = ("度量", "测量", "监测", "统计口径", "采集", "验证", "考核", "评估方式",
                  "计算方式", "口径", "验收")
 SECTION_PROMISE = {
@@ -195,6 +235,29 @@ class Ctx:
 
     def sort_key(self, pid: str) -> int:
         return self.order.get(pid, 10 ** 9)
+
+    def table_of(self, pid: str) -> int | None:
+        """这条事实来自哪张表；来自正文则为 None。"""
+        return (self.paras.get(pid) or {}).get("table_id")
+
+    def spans_tables(self, rows: list[dict]) -> bool:
+        """这组事实是否横跨了两张不同的表格。
+
+        **平行表是长文档的常态**：表1 是设备1 的各项指标，表2 是设备2 的同名指标。
+        两张表的行首写的都是「累计总投入」，区分它们的是表题里的设备名——
+        而表题不在单元格里，模型没有被要求把它填进 scope，于是两条事实的
+        (subject, scope) 完全相同，数值不同，就被判成了前后矛盾。实测误报。
+
+        判据只用确定性信息：事实所在段落的 table_id。
+        - 正文 ↔ 表格、同一张表之内：照常比（「正文说 200ms、表里写 300ms」是真冲突）
+        - **表A ↔ 表B：不比**，除非 scope 已经把它们分开（那样根本不会同组）
+
+        取舍写在明处：这会漏掉「两张表之间确实自相矛盾」的情形。
+        按 CLAUDE.md 的优先级序列，误报率高于逻辑检出率——
+        要救回这一类，正确做法是让 scope 带上表题，而不是放开这道判据。
+        """
+        tids = {self.table_of(r.get("pid") or "") for r in rows}
+        return len({t for t in tids if t is not None}) >= 2
 
 
 def make(rule: str, ctx: Ctx, sides: list[dict], subject: str, note: str,
@@ -342,6 +405,8 @@ def r_L06(ctx, seq):
             buckets.setdefault(key, r)
         if len(buckets) >= 2:
             picks = list(buckets.values())[:4]
+            if ctx.spans_tables(picks):
+                continue                      # 平行表的同名指标，见 Ctx.spans_tables
             # 批注是给评审人看的，note 里不能出现 kind= / scope= 这类字段名
             vals = "、".join(f"{r['value']}{r['unit'] or ''}" for r in picks)
             where = f"（适用范围：{rs[0]['scope']}）" if rs[0].get("scope") else ""
@@ -365,6 +430,8 @@ def r_L07(ctx, seq):
         for r in rs:
             units.setdefault(norm_unit(r["unit"]), r)
         if len(units) >= 2:
+            if ctx.spans_tables(list(units.values())[:4]):
+                continue
             out.append(make("L07", ctx, [ctx.side(r["pid"], {"unit": r["unit"], "value": r["value"]})
                                          for r in list(units.values())[:4]],
                             rs[0]["subject"], "单位不一致：" + "、".join(units), seq))
@@ -384,6 +451,8 @@ def r_L08(ctx, seq):
             for hi in highs:
                 a, b = to_base(lo["value"], lo["unit"]), to_base(hi["value"], hi["unit"])
                 if a and b and a[1] == b[1] and a[0] > b[0]:
+                    if ctx.spans_tables([lo, hi]):
+                        continue
                     out.append(make("L08", ctx,
                                     [ctx.side(lo["pid"], {"bound": "下限", "value": lo["value"]}),
                                      ctx.side(hi["pid"], {"bound": "上限", "value": hi["value"]})],
@@ -397,8 +466,10 @@ def r_L09(ctx, seq):
     groups = defaultdict(list)
     for r in ctx.rows("metric"):
         if norm_unit(r["unit"]) == "%" and parse_num(r["value"]) is not None:
-            groups[normalize_key(r["scope"] or "")].append(r)
-    for scope, rs in groups.items():
+            # 表格进 key：把两张表的构成比汇到一起求和，结果必然不是 100%——
+            # 那是把两组数加在了一起，不是文档写错了
+            groups[(normalize_key(r["scope"] or ""), ctx.table_of(r["pid"] or ""))].append(r)
+    for (scope, _tid), rs in groups.items():
         if not (3 <= len(rs) <= 12):
             continue
         total = sum(parse_num(r["value"]) or 0 for r in rs)
@@ -529,7 +600,7 @@ def _known_targets(ctx) -> dict:
     labels = set()
     for p in ctx.paras.values():
         for m in LABEL_RE.finditer(p["text"]):
-            labels.add(f"{m.group(1)}{m.group(2)}-{m.group(3)}")
+            labels.add(label_key(m))
     appendix = {m.group(1) for p in ctx.paras.values()
                 for m in [re.match(r"^\s*附录\s*([A-Za-z0-9一二三四五六七八九十]+)", p["text"])] if m}
     return {"section": sections, "figure": labels, "table": labels, "appendix": appendix}
@@ -549,12 +620,18 @@ def r_L15(ctx, seq):
                 out.append(make("L15", ctx, [ctx.side(r["pid"], {"target": tgt})], tgt,
                                 f"未检索到章节 {tgt}", seq))
         elif typ in ("figure", "图", "table", "表"):
+            # **已知编号一个都没识别出来时闭嘴。** 这时"没找到"说明的是我们没认出
+            # 这份文档的编号方案（列表式自动编号根本不进正文），不是文档缺了那张图。
+            # 空集之下每一条引用都成立，这正是压制方向的 fail-open——
+            # 表现为满屏"未检索到"，而输出里看不出根因（同 ADR-035）。
+            if not known["figure"]:
+                continue
             key = tgt if re.match(r"^[图表]", tgt) else None
             if key and key.replace(" ", "") not in {x.replace(" ", "") for x in known["figure"]}:
                 out.append(make("L15", ctx, [ctx.side(r["pid"], {"target": tgt})], tgt,
                                 f"未检索到 {tgt}", seq))
         elif typ in ("appendix", "附录"):
-            if tgt.replace("附录", "").strip() not in known["appendix"]:
+            if known["appendix"] and tgt.replace("附录", "").strip() not in known["appendix"]:
                 out.append(make("L15", ctx, [ctx.side(r["pid"], {"target": tgt})], tgt,
                                 f"未检索到附录 {tgt}", seq))
     return out
@@ -565,10 +642,12 @@ def r_L16(ctx, seq):
     series = defaultdict(list)
     for p in ctx.paras.values():
         t = p["text"].strip()
-        m = LABEL_RE.match(t)
-        # 只统计图表标题（段首编号 + 标题文字）；正文中的「如图 3-7 所示」是引用，不占编号
-        if m and len(t) > len(m.group(0)) + 1:
-            series[(m.group(1), m.group(2))].append((int(m.group(3)), p["pid"], m.group(0)))
+        # 只统计图表标题（段首编号 + 分隔符 + 标题文字）；
+        # 正文中的「如图 3-7 所示」「图33所示」是引用，不占编号
+        m = caption_label(t)
+        if m:
+            key, num = label_series(m)
+            series[key].append((num, p["pid"], m.group(0)))
     for (kind, chapter), items in series.items():
         nums = sorted({n for n, _, _ in items})
         dup = [n for n in nums if sum(1 for x, _, _ in items if x == n) > 1]
@@ -576,14 +655,15 @@ def r_L16(ctx, seq):
         gaps = [n for n in range(min(nums), max(nums)) if n not in nums] if len(nums) > 1 else []
         if gaps:
             first = next(i for i in items if i[0] == nums[0])
+            miss = "、".join(f"{kind}{chapter}-{g}" if chapter else f"{kind}{g}" for g in gaps)
             out.append(make("L16", ctx, [ctx.side(first[1], {"label": first[2]})],
-                            f"{kind}{chapter}",
-                            f"{kind}编号跳号：缺 " + "、".join(f"{kind}{chapter}-{g}" for g in gaps), seq))
+                            f"{kind}{chapter}", f"{kind}编号跳号：缺 " + miss, seq))
         for n in sorted(set(dup)):
             occ = [i for i in items if i[0] == n]
             if len({o[1] for o in occ}) > 1:
                 out.append(make("L16", ctx, [ctx.side(o[1], {"label": o[2]}) for o in occ[:4]],
-                                f"{kind}{chapter}-{n}", f"{kind}编号重号", seq))
+                                f"{kind}{chapter}-{n}" if chapter else f"{kind}{n}",
+                                f"{kind}编号重号", seq))
     return out
 
 
@@ -613,12 +693,12 @@ def r_L18(ctx, seq):
     captions, refs = {}, set()
     for p in ctx.paras.values():
         t = p["text"].strip()
-        m = LABEL_RE.match(t)
-        if m and len(t) > len(m.group(0)) + 1:
-            captions[f"{m.group(1)}{m.group(2)}-{m.group(3)}"] = p["pid"]
+        m = caption_label(t)
+        if m:
+            captions[label_key(m)] = p["pid"]
         for mm in LABEL_RE.finditer(t):
             if not (m and mm.start() == 0):
-                refs.add(f"{mm.group(1)}{mm.group(2)}-{mm.group(3)}")
+                refs.add(label_key(mm))
     for r in ctx.rows("xref"):
         if r["value"]:
             refs.add(str(r["value"]).replace(" ", ""))
@@ -863,6 +943,8 @@ def r_L27(ctx, seq):
                     continue
                 gap = max(bt[0], ba[0]) / min(bt[0], ba[0])
                 if gap > ratio:
+                    if ctx.spans_tables([t, a]):
+                        continue
                     out.append(make("L27", ctx,
                                     [ctx.side(t["pid"], {"kind": "目标", "value": t["value"]}),
                                      ctx.side(a["pid"], {"kind": "实测", "value": a["value"]})],

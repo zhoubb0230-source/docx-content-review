@@ -138,12 +138,26 @@ def scan(run_dir: Path, cfg: dict, chunk_id: str | None) -> dict:
     glossary = read_json(resolve_path(run_dir, "glossary_merged"), {}) or {}
 
     forbidden: list[tuple[str, str, str]] = []
+    # 用户术语表里的写法**也是白名单**。行业术语（半导体装备、医疗器械这类）
+    # 的用字与通用错词表天然会撞：只要术语里含着某条左串，这个词每出现一次
+    # 就产出一个注定要被否掉的候选——既是噪音，也白白消耗一次裁定调用。
+    # 以前术语表只在闸门③（N7）起作用，那已经是模型答完之后了。
+    protected: set[str] = set()
+    banned: set[str] = set()
     for e in glossary.get("entries", []):
         pref = e.get("preferred") or e.get("key")
         for f in (e.get("forbidden") or []):
             form = f.get("form") if isinstance(f, dict) else f
+            if form:
+                banned.add(form)
             if form and pref and levenshtein(form, pref, cap=2) <= 2:
                 forbidden.append((form, pref, "术语表登记的禁用写法"))
+        for w in (pref, e.get("key"), *(e.get("variants") or [])):
+            w = (w or "").strip() if isinstance(w, str) else ""
+            if w:
+                protected.add(w)
+    # 登记为禁用的写法不受保护——那正是要挑出来的
+    protected -= banned
 
     idx = read_json(resolve_path(run_dir, "chunk_index"), {}) or {}
     chunks = [c for c in idx.get("chunks", []) if not chunk_id or c["chunk_id"] == chunk_id]
@@ -169,6 +183,9 @@ def scan(run_dir: Path, cfg: dict, chunk_id: str | None) -> dict:
                 if any(w in text and wrong in w for w in whitelist):
                     continue
                 if wrong in whitelist:
+                    continue
+                # 术语表同理：左串落在用户登记的术语里就不生成候选
+                if any(w in text and wrong in w for w in protected):
                     continue
                 for m in re.finditer(re.escape(wrong), text):
                     lo, hi = _unique_window(text, m.start(), m.end())

@@ -19,13 +19,16 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
 import sqlite3
 import sys
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from _common import EX, die, emit, read_json, run_cli, sha256_file  # noqa: E402
+from _common import (  # noqa: E402
+    EX, die, emit, normalize_width, read_json, read_jsonl, run_cli, sha256_file,
+)
 from workspace import guard_write_path, resolve_path  # noqa: E402
 
 SCHEMA = """
@@ -70,6 +73,43 @@ MAPPING = {
 }
 
 
+# --------------------------------------------------------------------------
+# 事实的幻觉闸门
+#
+# 审查通道早就有这道闸门（verify_span 的 hallucination_drop：pid 必须存在、
+# original_text 必须在那个 pid 的正文里逐字找得到）。**事实通道一条都没有**——
+# 模型写什么就入库什么，而全部 L 规则都建立在这份台账上。
+# 后果是现场看到的样子：报告指着某一段说"目标与实测相差 N 倍"，
+# 评审人翻到那一段，那句话根本不在那里。
+#
+# 两道判据，都只用确定性信息：
+#   1. pid 必须在 paragraphs.jsonl 里（编造的 pid 一律丢）
+#   2. 数值类事实的 value，其数字部分必须在该段正文里出现
+# 第 2 条只对 metric 生效：statement / definition 这类值本来就是转述，不能逐字比。
+DIGITS_RE = re.compile(r"[0-9]+(?:\.[0-9]+)?")
+
+
+def _norm_num_text(t: str) -> str:
+    """比数字用的归一化：去千分位与空白，全角转半角。"""
+    return normalize_width(t or "").replace(",", "").replace("，", "").replace(" ", "")
+
+
+def value_grounded(kind: str, value: str | None, ptext: str) -> bool:
+    """这条事实的数值在正文里找得到吗。找不到即丢。
+
+    **只在能确定的时候判否**：value 里没有数字（纯文字的指标值）一律放行，
+    否则会把"高/中/低""是/否"这类合法取值全部误杀。
+    """
+    if kind != "metric" or not value:
+        return True
+    nums = DIGITS_RE.findall(_norm_num_text(str(value)))
+    if not nums:
+        return True
+    body = _norm_num_text(ptext)
+    # 任意一个数字对得上就算落地：模型可能把「不超过 200」整串写进 value
+    return any(n in body for n in nums)
+
+
 def connect(run_dir: Path) -> sqlite3.Connection:
     db = resolve_path(run_dir, "ledger_db")
     guard_write_path(db, run_dir)
@@ -79,7 +119,9 @@ def connect(run_dir: Path) -> sqlite3.Connection:
     return con
 
 
-def flatten(chunk_id: str, data: dict) -> list[tuple]:
+def flatten(chunk_id: str, data: dict, paras: dict | None = None,
+            dropped: dict | None = None) -> list[tuple]:
+    """展平成台账行。`paras` 给出时同时过幻觉闸门（见上）。"""
     rows = []
     for section, (kind, subj_key, val_key) in MAPPING.items():
         for item in (data.get(section) or []):
@@ -87,6 +129,16 @@ def flatten(chunk_id: str, data: dict) -> list[tuple]:
                 continue
             subject = item.get(subj_key)
             value = item.get(val_key) if val_key else None
+            if paras is not None:
+                pid = item.get("pid")
+                if not pid or pid not in paras:
+                    if dropped is not None:
+                        dropped["bad_pid"] = dropped.get("bad_pid", 0) + 1
+                    continue
+                if not value_grounded(kind, value, paras[pid]):
+                    if dropped is not None:
+                        dropped["value_not_found"] = dropped.get("value_not_found", 0) + 1
+                    continue
             rows.append((
                 kind, chunk_id, item.get("pid"),
                 str(subject).strip() if subject is not None else None,
@@ -108,6 +160,9 @@ def ingest(run_dir: Path, con: sqlite3.Connection, only: list[str] | None = None
     早先写的是空串、也从不比对，等于没有。
     """
     fdir = resolve_path(run_dir, "facts")
+    paras = {p["pid"]: (p.get("text") or "")
+             for p in read_jsonl(resolve_path(run_dir, "paragraphs"))}
+    dropped: dict[str, int] = {}
     done = {r[0]: r[1] for r in con.execute("SELECT chunk_id, sha FROM ingested")}
     added, refreshed, total = 0, 0, 0
     for path in sorted(fdir.glob("facts-*.json")):
@@ -126,7 +181,7 @@ def ingest(run_dir: Path, con: sqlite3.Connection, only: list[str] | None = None
         data = read_json(path)
         if not isinstance(data, dict):
             continue
-        rows = flatten(cid, data)
+        rows = flatten(cid, data, paras, dropped)
         con.executemany(
             "INSERT INTO facts(kind,chunk_id,pid,subject,value,unit,qualifier,scope,meta) "
             "VALUES (?,?,?,?,?,?,?,?,?)", rows)
@@ -134,7 +189,9 @@ def ingest(run_dir: Path, con: sqlite3.Connection, only: list[str] | None = None
                     (cid, len(rows), sha))
         total += len(rows)
     con.commit()
-    return {"chunks_ingested": added, "chunks_refreshed": refreshed, "rows_added": total}
+    # 丢弃数必须报出来：全部 L 规则都站在这份台账上，静默丢等于静默漏检
+    return {"chunks_ingested": added, "chunks_refreshed": refreshed, "rows_added": total,
+            "dropped": dropped}
 
 
 def stats(con: sqlite3.Connection) -> dict:

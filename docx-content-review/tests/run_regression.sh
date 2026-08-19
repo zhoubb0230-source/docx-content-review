@@ -182,11 +182,18 @@ check "删除 ledger.db 后重建结果一致" "$?" 0
 # 分片重跑后 facts 文件被改写，build 必须按 sha 重新入库——
 # 只按 chunk_id 判重的话，库里留的是上一轮的旧事实，而 Pass 3 全部建立在它之上
 python3 - "$RUN2" <<'PY'
-import json,sys,pathlib
-f=pathlib.Path(sys.argv[1],"work","facts","facts-0001.json")
+import json,re,sys,pathlib
+run=pathlib.Path(sys.argv[1])
+f=run/"work"/"facts"/"facts-0001.json"
 d=json.load(open(f,encoding="utf-8"))
-d.setdefault("metrics",[]).append({"pid":"p-000001","subject":"重跑后新增指标",
-                                   "value":"999","unit":"ms","kind":"目标"})
+# 事实必须落地：pid 要真实存在，数值要在那一段里找得到（ledger 的幻觉闸门）
+pid=num=None
+for l in open(run/"work"/"paragraphs.jsonl",encoding="utf-8"):
+    q=json.loads(l); m=re.search(r"[0-9]+", q["text"] or "")
+    if m: pid,num=q["pid"],m.group(0); break
+assert pid, "语料里没有带数字的段落，构造无效"
+d.setdefault("metrics",[]).append({"pid":pid,"subject":"重跑后新增指标",
+                                   "value":num,"unit":"ms","kind":"目标"})
 f.write_text(json.dumps(d,ensure_ascii=False),encoding="utf-8")
 PY
 LB=$(python3 "$S/ledger.py" build --run-dir "$RUN2")
@@ -2439,6 +2446,184 @@ check "续跑：stats 报出真实的每波进度（不是 init 写下的全零�
 ge "续跑：stats 同时给出各波总数" "$(echo "$ST9" | jget "['stages']['extract']['total']")" 5
 check "续跑：分片级 done 仍按「审查+抽取都做完」算（没被每波进度顶掉）" \
   "$(echo "$ST9" | jget "['stats']['done']")" 0
+
+echo "══ 28. 真实语料上报回来的三类误报 ══"
+# 三条都来自用户实跑的反馈，三条都配负向对照——压制方向的 fail-open 比放行方向
+# 更危险：它表现为"什么都没查出来"，输出里没有任何痕迹（ADR-035）。
+
+RUN10=$(python3 "$S/workspace.py" init --source "$WORK/big2/big2.docx" --resume new \
+        --output-dir "$DELIVER" --temp-dir "$TEMP" | jget "['run_dir']")
+python3 "$S/unpack.py" run --run-dir "$RUN10" >/dev/null
+python3 "$S/extract.py" --run-dir "$RUN10" >/dev/null
+python3 "$S/chunk.py" --run-dir "$RUN10" >/dev/null
+
+# 造现场：两张平行表（设备1 / 设备2，同名指标不同值）+ 流水式图号 + 一条引用
+seed10() {   # $1=facts 文件内容由 python 生成；每次重建 paragraphs 与台账
+  python3 - "$RUN10" "$1" <<PYEOF
+import json,pathlib,sys
+run,mode=pathlib.Path(sys.argv[1]),sys.argv[2]
+pp=run/"work"/"paragraphs.jsonl"
+base=[json.loads(l) for l in open(pp,encoding="utf-8") if json.loads(l)["pid"][:2]=="p-"
+      and not json.loads(l)["pid"].startswith("p-9")]
+def mk(pid,text,**kw):
+    d={"pid":pid,"index":900000+int(pid[-3:]),"text":text,"is_heading":False,"level":None,
+       "style":None,"in_table":False,"table_id":None,"row_idx":None,"cell_idx":None,
+       "is_code":False,"is_list":False,"is_quote":False,"heading_path":["附加"],"page_hint":9}
+    d.update(kw); return d
+extra=[
+  mk("p-900001","截至2024年12月底，累计总投入400元",in_table=True,table_id=901,row_idx=1,cell_idx=1),
+  mk("p-900002","截至2024年12月底，累计总投入460元",in_table=True,table_id=902,row_idx=1,cell_idx=1),
+  mk("p-900003","图33 系统总体架构"),
+  mk("p-900004","图33所示的架构分为三层，具体如下。"),
+  mk("p-900005","本期端到端时延目标为200ms，实测值为1200ms。"),
+  # 负向对照要用的两处：同一张表里的另一格、以及正文里的同一指标。
+  # 数值必须真的写在这一段里——ledger 的幻觉闸门会把对不上的事实丢掉
+  mk("p-900006","截至2024年12月底，累计总投入460元",in_table=True,table_id=901,row_idx=2,cell_idx=1),
+  mk("p-900007","截至2024年12月底，全项目累计总投入460元。"),
+]
+with open(pp,"w",encoding="utf-8") as f:
+    for r in base+extra: f.write(json.dumps(r,ensure_ascii=False)+"\n")
+M=lambda pid,v,**kw: dict({"subject":"累计总投入","value":v,"unit":"元","kind":"目标",
+                           "source":"表格","pid":pid},**kw)
+facts={"metrics":[]}
+if mode in ("parallel","same_table","body_vs_table"):
+    facts["metrics"]=[M("p-900001","400"), M("p-900002","460")]
+    if mode=="same_table":      # 负向对照：两条落在同一张表里 → 必须报
+        facts["metrics"][1]=M("p-900006","460")
+    if mode=="body_vs_table":   # 负向对照：正文 vs 表格 → 必须报
+        facts["metrics"][1]=M("p-900007","460",source="正文")
+if mode=="xref_ok":
+    facts["xrefs"]=[{"type":"figure","target":"图33","pid":"p-900004"}]
+if mode=="xref_missing":
+    facts["xrefs"]=[{"type":"figure","target":"图99","pid":"p-900004"}]
+if mode=="ghost_pid":
+    facts["metrics"]=[{"subject":"端到端时延","value":"200","unit":"ms","kind":"目标","pid":"p-900005"},
+                      {"subject":"端到端时延","value":"1200","unit":"ms","kind":"实测","pid":"p-777777"}]
+if mode=="ghost_value":
+    facts["metrics"]=[{"subject":"端到端时延","value":"200","unit":"ms","kind":"目标","pid":"p-900005"},
+                      {"subject":"端到端时延","value":"9900","unit":"ms","kind":"实测","pid":"p-900003"}]
+if mode=="grounded":
+    facts["metrics"]=[{"subject":"端到端时延","value":"200","unit":"ms","kind":"目标","pid":"p-900005"},
+                      {"subject":"端到端时延","value":"1200","unit":"ms","kind":"实测","pid":"p-900005"}]
+fd=run/"work"/"facts"; fd.mkdir(parents=True,exist_ok=True)
+for old in fd.glob("facts-*.json"): old.unlink()
+allkeys={k:[] for k in ("terms","acronyms","entities","metrics","positions","objectives",
+  "initiatives","acceptance","dates","versions","roles","xrefs","numbering","commitments",
+  "statuses","enumerations","conclusions")}
+allkeys.update(facts)
+(fd/"facts-0001.json").write_text(json.dumps(allkeys,ensure_ascii=False),encoding="utf-8")
+PYEOF
+  python3 "$S/ledger.py" rebuild --run-dir "$RUN10" >/dev/null
+}
+rule_count() {  # $1=规则号 —— 回显该规则检出条数
+  python3 "$S/detect_conflicts.py" --run-dir "$RUN10" --force | jget "['by_rule']['$1']"
+}
+
+# ① 平行表：表1 是设备1、表2 是设备2，行首都写「累计总投入」——不是前后矛盾
+seed10 parallel
+check "平行表的同名指标不判冲突（用户实跑误报）" "$(rule_count L06)" 0
+seed10 same_table
+check "负向对照：同一张表内的同名指标不同值，照常报" "$(rule_count L06)" 1
+seed10 body_vs_table
+check "负向对照：正文与表格对不上，照常报" "$(rule_count L06)" 1
+
+# ② 流水式图号：文档用「图33」而不是「图3-3」，旧版一个已知编号都认不出来
+seed10 xref_ok
+check "流水式编号能被识别，引用存在即不报（用户实跑误报）" "$(rule_count L15)" 0
+seed10 xref_missing
+check "负向对照：引用了不存在的编号，照常报" "$(rule_count L15)" 1
+python3 - "$S" <<PYEOF
+import sys
+sys.path.insert(0, sys.argv[1]); import detect_conflicts as dc
+bad=[]
+if not dc.caption_label("图33 系统总体架构"): bad.append("「图33 系统总体架构」应判为图题")
+if not dc.caption_label("图3-7 系统总体架构"): bad.append("「图3-7 …」应判为图题")
+if dc.caption_label("图33所示的架构分为三层"): bad.append("「图33所示…」是引用，不是图题")
+k=[dc.label_key(m) for m in dc.LABEL_RE.finditer("见图33 与图 3-7")]
+if k != ["图33","图3-7"]: bad.append(f"编号归一化不对：{k}")
+if dc.label_series(dc.LABEL_RE.match("图33"))[0] == dc.label_series(dc.LABEL_RE.match("图3-7"))[0]:
+    bad.append("两种编号方案被混进了同一序列")
+for b in bad: print("   ", b)
+sys.exit(1 if bad else 0)
+PYEOF
+check "图题与引用分得开，两种编号方案不混列" "$?" 0
+
+# ③ 事实的幻觉闸门：审查通道一直有，事实通道一条都没有
+seed10 grounded
+check "落地的事实照常进台账并检出（负向对照的基线）" "$(rule_count L27)" 1
+seed10 ghost_pid
+LG=$(python3 "$S/ledger.py" rebuild --run-dir "$RUN10")
+check "编造的 pid 被丢弃并报数" "$(echo "$LG" | jget "['dropped'].get('bad_pid',0)")" 1
+check "丢掉幻觉事实后不再产出无处可查的冲突" "$(rule_count L27)" 0
+seed10 ghost_value
+LG2=$(python3 "$S/ledger.py" rebuild --run-dir "$RUN10")
+check "数值在该段正文里找不到的事实被丢弃并报数" \
+  "$(echo "$LG2" | jget "['dropped'].get('value_not_found',0)")" 1
+check "丢掉不落地的数值后不再产出对不上的冲突" "$(rule_count L27)" 0
+python3 - "$S" <<PYEOF
+import sys
+sys.path.insert(0, sys.argv[1]); import ledger
+bad=[]
+# 只在能确定的时候判否：纯文字的指标值必须放行，否则「高/中/低」会被全部误杀
+if not ledger.value_grounded("metric","高","散热性能高"): bad.append("非数值指标被误杀")
+if not ledger.value_grounded("metric","1,200","上限为 1200 台"): bad.append("千分位没归一")
+if not ledger.value_grounded("commitment","9999","随便一句话"): bad.append("非 metric 不该逐字比")
+if ledger.value_grounded("metric","460","累计总投入400元"): bad.append("对不上的数值没被拦住")
+for b in bad: print("   ", b)
+sys.exit(1 if bad else 0)
+PYEOF
+check "闸门只在能确定时判否（非数值/千分位/非 metric 一律放行）" "$?" 0
+
+# ④ 行业术语与通用错词表撞车：术语表要在**生成候选之前**就起作用，
+#    而不是等模型答完再由闸门③压制——那时一次裁定调用已经花掉了
+python3 - "$S" "$RUN10" <<PYEOF
+import json,pathlib,subprocess,sys
+S,run=sys.argv[1],pathlib.Path(sys.argv[2])
+sys.path.insert(0, S)
+import typo_scan as ts
+pairs=ts._load_pairs("common-typos.txt")
+assert pairs, "错词表为空，构造无效"
+wrong,right,_=pairs[0]
+term=wrong+"机"                       # 造一个含左串的"行业术语"
+gm=run/"work"/"glossary.merged.json"
+para={"pid":"p-950001","index":950001,"text":f"本项目采用{term}完成镀膜工序。",
+      "is_heading":False,"level":None,"style":None,"in_table":False,"table_id":None,
+      "row_idx":None,"cell_idx":None,"is_code":False,"is_list":False,"is_quote":False,
+      "heading_path":["附加"],"page_hint":9}
+pp=run/"work"/"paragraphs.jsonl"
+rows=[json.loads(l) for l in open(pp,encoding="utf-8")]
+rows=[r for r in rows if r["pid"]!="p-950001"]+[para]
+with open(pp,"w",encoding="utf-8") as f:
+    for r in rows: f.write(json.dumps(r,ensure_ascii=False)+"\n")
+idx=json.load(open(run/"work"/"chunks"/"index.json",encoding="utf-8"))
+idx["chunks"][0].setdefault("review_pids",[]).append("p-950001")
+json.dump(idx,open(run/"work"/"chunks"/"index.json","w",encoding="utf-8"),ensure_ascii=False)
+
+def scan(entries):
+    gm.write_text(json.dumps({"entries":entries},ensure_ascii=False),encoding="utf-8")
+    out=subprocess.run([sys.executable,f"{S}/typo_scan.py","scan","--run-dir",str(run)],
+                       capture_output=True,text=True)
+    d=json.loads(out.stdout)
+    tot=0
+    for f in (run/"work"/"typos").glob("typos-????.json"):
+        for it in json.load(open(f,encoding="utf-8")).get("candidates",[]):
+            if it.get("pid")=="p-950001": tot+=1
+    return tot
+
+no_term = scan([])                                            # 负向对照：没有术语表
+with_term = scan([{"key":term,"preferred":term,"variants":[],"forbidden":[]}])
+banned = scan([{"key":term,"preferred":term,"variants":[],
+                "forbidden":[{"form":term}]}])                # 登记为禁用的不受保护
+print(f"    含左串「{wrong}」的术语「{term}」：无术语表 {no_term} 条候选，"
+      f"登记后 {with_term} 条，登记为禁用写法 {banned} 条")
+bad=[]
+if no_term < 1: bad.append("构造无效：这个术语本来就不产候选，测不出保护效果")
+if with_term != 0: bad.append("术语表里的写法仍被生成为错别字候选")
+if banned < 1: bad.append("登记为禁用的写法被误保护了")
+for b in bad: print("   ", b)
+sys.exit(1 if bad else 0)
+PYEOF
+check "用户术语表在生成候选之前就起作用（负向对照：不登记则照常出候选）" "$?" 0
 
 echo
 printf '通过 \033[32m%d\033[0m，失败 \033[31m%d\033[0m\n' "$PASS" "$FAIL"
