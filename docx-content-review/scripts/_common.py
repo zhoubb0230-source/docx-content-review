@@ -124,6 +124,32 @@ def page_ref(rec: dict | None) -> str:
     return f"第 {n} 页" if not (rec or {}).get("page_estimated", True) else f"约第 {n} 页"
 
 
+def read_jsonl_salvage(path: str | os.PathLike) -> tuple[list, int]:
+    """尽量读：返回 (能解析的行, 丢掉的坏行数)。
+
+    子 Agent 的产物被截断时，坏的只有最后那一行——前面每一行都是完整的记录。
+    `read_jsonl` 遇到坏行直接抛（那是对的：主流程不该静默吃掉损坏数据），
+    但**收口时把整片丢掉是另一个极端**：一片二十条问题，因为最后一行断在半路
+    就全部作废，而那一片重跑还会撞上同一堵墙（输出装不下不是随机故障）。
+
+    所以严格读用 `read_jsonl`，收口抢救用这个，并且必须把丢了几行报出来。
+    """
+    p = Path(path)
+    if not p.exists():
+        return [], 0
+    rows, dropped = [], 0
+    with open(p, "r", encoding="utf-8") as fh:
+        for line in fh:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                rows.append(json.loads(line))
+            except json.JSONDecodeError:
+                dropped += 1
+    return rows, dropped
+
+
 def product_ok(path: str | os.PathLike) -> bool:
     """产物是否「完整可用」。**「文件存在」不等于「做完了」。**
 

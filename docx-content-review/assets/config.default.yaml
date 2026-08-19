@@ -40,12 +40,24 @@ chunking:
   split_point_fill_ratio: 0.7
   # 片变大时这个上限必须同步变大：它是截断源，不是"每片就这么多问题"。
   # 片大 2.5 倍而上限不动 = 拿召回换速度，与优先级排序相悖。
-  max_issues_per_chunk: 40
+  #
+  # **它同时是输出侧的上限，而输出侧才是子 Agent 真正撞墙的地方。**
+  # 40 条 × 最坏一条（跨度上限 120 字 ×2 + evidence 25 + 键名）≈ 14,000 token，
+  # 而 output_reserve_tokens 只留了 8,000——这两个数以前从来没有对过账。
+  # 实跑现场：个别片挂六次才偶然成功，harness 报「ran out of room」，
+  # 即子 Agent 单轮生成被截断、产物没写成。**这类失败重试无效**——
+  # 同一个 prompt 会再撞一次，成不成取决于当次思考多长（随机）。
+  # 一片被截断 = 这一片零产出，所以 20 条严格优于会截断的 40 条。
+  # prompt_pack.py build 现在会对这道账，超了就以退出码 8 拦在派活之前。
+  max_issues_per_chunk: 20
   min_b_class_slots: 10         # 截断时为 B 类保留的下限席位。A 类恒 High、B 类恒 Medium，
                                 # 纯按 severity 截断会让 B 类被 A 类整组挤掉（同 §9.7 的配额挤占）
   instruction_tokens: 9000      # 技能指令 + 类型体系 + 不改清单
   glossary_tokens: 4000         # 术语表摘要预算；**没有术语表时 chunk.py 按 0 计**
-  output_reserve_tokens: 8000   # 输出预留
+  # 输出预留。**这不再只是切分账上的一个数**：prompt_pack.py 拿它校验
+  # 「max_issues_per_chunk 条最坏输出」装不装得下。子 Agent 单轮输出额度确实
+  # 更大时可以调高，调高之后条数上限也能跟着放宽。
+  output_reserve_tokens: 10000
   table_only_text_ratio: 0.10   # 正文段落占比低于此值即判为纯表格片
 
 logic:

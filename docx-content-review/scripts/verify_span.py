@@ -27,6 +27,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from _common import (  # noqa: E402
+    read_jsonl_salvage,
     SkillError,
     EX, atomic_write_json, atomic_write_jsonl, die, emit, is_subsequence, levenshtein,
     normalize_ws, read_json, read_jsonl, run_cli,
@@ -194,7 +195,9 @@ def process(run_dir: Path, chunk_id: str, raw_path: Path, cfg: dict,
                 "hallucination_drop": 0, "length_drop": 0, "edit_gate_degrade": 0,
                 "truncated": 0, "kept": 0}
     kept = []
-    for rec in read_jsonl(raw_path):
+    rows, bad_lines = read_jsonl_salvage(raw_path)
+    counters["truncated_lines"] = bad_lines
+    for rec in rows:
         counters["raw"] += 1
         if not isinstance(rec, dict):
             counters["bad_schema"] += 1
@@ -397,14 +400,24 @@ def sweep(run_dir: Path, cfg: dict, channel: str) -> dict:
         if not raw.exists():
             continue                    # 这一片没有这条通道的产出，不是错误
         try:
-            results.append(process(run_dir, cid, raw, cfg, idir / out_pat.format(c=cid), cap))
+            r = process(run_dir, cid, raw, cfg, idir / out_pat.format(c=cid), cap)
+            # 产物被截断时**保住写完的那些行**。以前这里是整片删掉：
+            # 一片二十条问题，最后一行断在半路就全部作废，而那一片重跑还会撞上
+            # 同一堵墙——输出装不下不是随机故障，重试不改变任何条件。
+            # 不删也不影响重派：完成判定看 `product_ok`，坏文件本来就不算完成。
+            if r.get("truncated_lines"):
+                unparsable.append(cid)
+            results.append(r)
         except SkillError:
-            # 半写文件（子 Agent 写到一半断了）只作废这一片，不能拖垮整轮：
-            # 一个坏文件让整轮 --all 退出，等于让一次环境抖动废掉全部分片的过闸。
+            # 连一行都读不出来（整份不是 JSONL）：只作废这一片，不能拖垮整轮。
             raw.unlink()
             unparsable.append(cid)
+    salvaged = sum(r.get("count", 0) for r in results if r.get("truncated_lines"))
     return {"channel": channel, "chunks": len(results),
             "unparsable": len(unparsable), "unparsable_chunks": unparsable[:20],
+            # 截断片里抢回来的条数。这个数不为 0 = 有子 Agent 的输出被截断了，
+            # 该压 max_issues_per_chunk，而不是加重试次数
+            "salvaged_from_truncated": salvaged,
             "count": sum(r["count"] for r in results),
             "truncated": sum(1 for r in results if r.get("truncated")),
             # 丢弃数 = 进来多少 − 留下多少。**不要去枚举丢弃原因的键名**：

@@ -1428,3 +1428,72 @@ ADR-047 的①与②来自真实语料，合成输入扫不出来：
 - **影响**：`scripts/ooxml.py`、`typo_scan.py`、`verify_span.py`、`apply_revisions.py`、
   `apply_comments.py`、`extract.py`、`report.py`、`_common.py`、
   `assets/config.default.yaml`、`tests/run_regression.sh` 第 31 节。
+
+## ADR-051　派活前的体检只量了输入，而撞墙的是输出
+
+- **日期**：2026-08-19
+- **来源**：用户带来一份对 Pass 1 子 Agent 终止的分析。主体结论正确，
+  但其中一处读数错了，并由此导出了一条几乎无收益的建议。这条 ADR 记两件事：
+  确认的机制，以及那处读数错在哪。
+
+### 确认的机制
+
+Pass 1 有个别分片反复失败（一片挂六次才偶然成功），Pass 2（35 批）与 Pass 4（16 批）
+零失败。载体报的是「ran out of room」，即子 Agent 单轮生成的 stop reason 是
+`max_tokens`——**回复被截断在半路，产物没写成**。三个阶段同一套派发机制、同一次运行，
+唯一的变量是工作量：Pass 2/4 每批只吐十行一两个词，永远够不到上限。
+
+**这类失败重试是无效的**：同一个 prompt 会再撞一次，成不成取决于当次思考多长。
+表现像随机故障，很容易被当成环境问题一直重派。
+
+### 缺口的确切位置
+
+`prompt_pack.py` 的派活前体检**只量输入**（`max_prompt_chars`）。输出侧从来没有账。
+更准确地说，账目一直存在但从未对过：`chunking.max_issues_per_chunk` 说一片最多报几条，
+`chunking.output_reserve_tokens` 说切分时为输出留了多少——**两个数从来没有相互校验**。
+
+算一遍就露馅：一条 A 类记录最坏 = 跨度上限 120 字 ×2 + evidence 25 + 键名标点 ≈ 356 token，
+40 条 = **14,240 token**，而预留是 **8,000**。**发货默认值本身就不自洽**，
+每一次运行都带着这个风险，而任何断言都不会变红——它只在真实模型上表现为"某片老是挂"。
+
+- **决策**：
+  1. `prompt_pack.estimate_output()` 算这笔账，`build` 把 `est_output_tokens_worst`
+     报出来；装不下就以退出码 8 拦在派活之前，给出 `suggest_max_issues_per_chunk`。
+     **退出码 8 现在有两种，错误信息里写明是输入还是输出。**
+  2. 默认值改成自洽的一对：`max_issues_per_chunk: 40 → 20`，
+     `output_reserve_tokens: 8000 → 10000`（最坏 7,120 < 8,000 的 80% 余量）。
+     条数上限确实是截断源、会压召回——**但一片被截断是零产出**，
+     20 条严格优于会截断的 40 条。
+  3. 产物被截断时**保住写完的那些行**（`read_jsonl_salvage`），
+     `--all` 报 `salvaged_from_truncated`。以前是整片删掉，而那一片重跑还会撞同一堵墙。
+  4. SKILL.md 补一张表分清两种失败：**环境抖动重派就好，输出装不下重派无效**，
+     判据是"同一个单元连续失败而别的单元正常"。压的顺序：先条数上限
+     （不增加派活次数），再分片大小，最后才是确认载体的输出额度配置。
+
+### 那处读数错在哪
+
+分析里说「每片 ~27k 输入里有 ~17k 是『以下为上文参考』的纯参考段，占 60%」，
+据此建议裁剪参考上下文。**实测：参考段占 prompt 的 1.2%（216 / 18,443 字符）**，
+默认 `overlap_paragraphs: 2` 就是两段。
+
+那个 17k 是 `context_tokens − text_tokens`，即 `instruction_tokens(9000)
++ output_reserve_tokens(8000)`——**切分预算里的记账项，不是 prompt 里的内容**。
+其中 `output_reserve_tokens` 尤其不是输入，它恰恰是给输出留的额度。
+
+所以「裁剪参考上下文」实际收益约 1%，还会削弱 B1 指代类问题所需的上下文。已否掉。
+但这次误读反过来指出了正确的杠杆：那 8,000 的预留额度**一直只是记在切分账上，
+从来没有人拿它去校验模型真要吐多少**。
+
+### 其余几条的处置
+
+- 「调小 `max_text_tokens` 到 5000-6000」：方向对，但**顺序应放在条数上限之后**——
+  片数翻倍会把前两轮压下去的派活开销加回来，而条数上限直接作用于输出且不增加调用数。
+- 「skill 里没有自动重试」：不准确，SKILL.md 第 4 步早有重派 + `claim reclaim`
+  + `max_attempts_per_chunk`。真正缺的是**分清哪种失败值得重试**，已补。
+- 「输出过长时先写入前 10 条再继续」：与 ADR-039 压掉逐行落盘的结论冲突，未采纳；
+  改为在收口时抢救已写完的行，效果相同而不增加工具往返。
+- 「核对部署侧 maxTokens」：无法在技能内验证，但**这是最先该确认的一项**——
+  若该值被配得很小，上面所有减活都是在替一个配置错误买单。已写进 SKILL.md 第 3 条。
+
+- **影响**：`scripts/prompt_pack.py`、`scripts/verify_span.py`、`scripts/_common.py`、
+  `assets/config.default.yaml`、`SKILL.md`、`tests/run_regression.sh` 第 32 节。

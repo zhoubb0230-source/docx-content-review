@@ -210,9 +210,20 @@ prompt_pack.py build --run-dir <run>                      # 渲染每次调用�
 一个单元一个。子 Agent 因此只需要「读一个文件 → 作答 → 写一个文件」，
 既不必知道技能目录在哪，也没有机会顺手把 `references/` 下的大文件读进上下文。
 
-**退出码 8 = 分片对你的子 Agent 来说太大。** `prompt_pack.py` 会在派活之前
-量一遍每个单元的 prompt，超过 `chunking.max_prompt_chars`（默认 20000 字符）就终止，
-并在 stdout 的 JSON 里直接给出 `suggest_max_text_tokens`。照着改再重跑第 3 步：
+**`prompt_pack.py` 在派活之前量两笔账，输入一笔、输出一笔。**
+
+**输出那一笔容易被忽略，而实跑撞上的恰恰是它**：子 Agent 一轮的生成额度被
+「思考 + 这一片最多 N 条问题明细」吃光，回复被截断在半路——产物没写成，
+载体报的是「ran out of room」。输入侧一个字都没超，所以只量输入的体检看不见它。
+返回里的 `est_output_tokens_worst` 就是这笔账，拿它跟 `output_reserve_tokens` 比。
+
+**退出码 8 有两种，看错误信息区分：**
+
+- 「prompt 超过 max_prompt_chars」= 输入太大 → 按 `suggest_max_text_tokens` 调分片；
+- 「最坏输出超过为输出预留的 token」= 输出太大 → 按 `suggest_max_issues_per_chunk`
+  压条数上限。**先压条数**，它不增加派活次数；压完还失败再动分片大小。
+
+输入那一笔照着改再重跑第 3 步：
 
 ```
 workspace.py reconfigure --run-dir <run> --set chunking.max_text_tokens=<建议值>
@@ -351,8 +362,32 @@ filter_neverflag.py --run-dir <run> --all --channel typos
 
 输出无法解析成 JSONL 时**重试一次**，提示"上次输出无法解析"；二次失败按上面第 3 条处理。
 
+**先分清是哪一种失败，两种的处置完全相反：**
+
+| 现象 | 是什么 | 该做什么 |
+|---|---|---|
+| 零星一两个单元失败，重派就好 | 环境抖动 | 照上面重派，不用改配置 |
+| **同一个单元反复失败**（挂三次、六次，偶尔才成功）；载体报「ran out of room」「max tokens」「输出被截断」；产物存在但最后一行断在半路 | **子 Agent 一轮吐不完** | **重试无效**——同一个 prompt 会再撞一次，成不成取决于当次思考多长。必须把这一片最坏吐多少压下来 |
+
+**重试对第二种是无效的，而且看起来像随机故障**，很容易被当成环境问题一直重派下去。
+判据很明确：**同一个单元连续失败，而别的单元正常**，就是它。
+
+压的顺序（第一条最直接，且不增加派活次数）：
+
+1. `chunking.max_issues_per_chunk` —— 它就是这一片输出条数的上限。
+   `prompt_pack.py build` 会算「条数 × 每条最坏」对不对得上 `output_reserve_tokens`，
+   超了以退出码 8 拦在派活之前，并给出该设成多少。
+2. `chunking.max_text_tokens` —— 片小了，能报的问题自然少。但片数会翻倍，
+   派活开销跟着涨，所以放在第 1 条之后。
+3. 子 Agent 单轮输出额度确实更大时，调高 `chunking.output_reserve_tokens`，
+   条数上限就能跟着放宽。**先确认载体的输出上限是多少**——如果它被配得很小，
+   前两条都是在替一个配置错误买单。
+
+`verify_span.py --all` 的 `salvaged_from_truncated` 不为 0，就是有产物被截断了：
+写完的那些行会被保住，但这一片是不全的，**该压上限而不是加重试次数**。
+
 子 Agent 频繁失败（而不是偶发）时，先降 `concurrency.parallelism`，
-再考虑调低 `chunking.max_text_tokens` 让单元变小——**不要提高并发去"赶进度"**。
+再按上面的顺序压单元的输出量——**不要提高并发去"赶进度"**。
 
 ### 第 4.5 步：两条支线在做什么（错别字 / 范式）
 
@@ -540,8 +575,8 @@ workspace.py clean-temp --run-dir <run>
 | `glossary_scan.py` | 候选术语预筛 + 概念族聚类 | `--run-dir` | candidates / batches |
 | `import_glossary.py` | 术语表导入 + 自检 + 三层合并 | `--run-dir --authoritative --fallback` | entries / layers |
 | `chunk.py` | 分片（按 token） | `--run-dir` | chunks / single_pass / stale_chunks_cleared |
-| `prompt_pack.py build\|list` | 渲染每次调用的自包含 prompt；超 `max_prompt_chars` 以 8 终止并给建议值 | `--run-dir [--stage --chunk]` | written / max_chars / suggest_max_text_tokens |
-| `verify_span.py` | 闸门②③ | `--run-dir --chunk [--in --out --cap]` | 各闸门丢弃计数 |
+| `prompt_pack.py build\|list` | 渲染每次调用的自包含 prompt；**输入与输出两笔账**任一超了就以 8 终止并给建议值 | `--run-dir [--stage --chunk]` | written / max_chars / **est_output_tokens_worst** / suggest_max_text_tokens / suggest_max_issues_per_chunk |
+| `verify_span.py` | 闸门②③ | `--run-dir --chunk [--in --out --cap]` | 各闸门丢弃计数 / **salvaged_from_truncated**（不为 0 = 有产物被截断） |
 | `verify_pass2.py build\|merge\|consistency` | 闸门④盲测 A/B 脚手架（build 按批落盘，可并行复核） | `--run-dir [--arrangement]` | items / batches / pass / drop / 一致率 |
 | `filter_neverflag.py` | 不改清单硬过滤 | `--run-dir --chunk\|--all [--channel --file]` | dropped / by_rule |
 | `ledger.py build\|rebuild\|stats` | 台账 SQLite 索引 | `--run-dir` | stats |

@@ -2953,6 +2953,96 @@ sys.exit(1 if bad else 0)
 PYEOF
 check "有分页标记就逐段精确；负向对照：没有标记时退回推算并标为估算" "$?" 0
 
+echo "══ 32. 输出侧的账：只量输入的体检看不见它 ══"
+# 派活前的体检一直只量输入（prompt 多少字符）。实跑撞上的却是输出：
+# 子 Agent 单轮生成被「思考 + 最多 N 条问题明细」吃光，回复截断、产物没写成，
+# 载体报「ran out of room」。输入侧一个字没超，所以旧体检完全看不见。
+
+python3 - "$S" <<PYEOF
+import sys
+sys.path.insert(0, sys.argv[1])
+import prompt_pack as pp
+bad=[]
+# 发货默认值必须自洽：最坏输出装得进为输出预留的额度
+import yaml, pathlib
+cfg=yaml.safe_load(pathlib.Path(sys.argv[1]).parent.joinpath(
+    "assets/config.default.yaml").read_text(encoding="utf-8"))
+e=pp.estimate_output(cfg)
+print(f"    默认值：{e['cap']} 条 × 每条最坏 {e['per_issue']} token = {e['worst']}，"
+      f"预留 {e['reserve']}")
+if e["worst"] > e["reserve"]:
+    bad.append(f"默认配置不自洽：最坏输出 {e['worst']} > 预留 {e['reserve']}")
+# 负向对照：把条数上限调回 40，这道账必须立刻不平
+cfg2={**cfg, "chunking": {**cfg["chunking"], "max_issues_per_chunk": 40}}
+e2=pp.estimate_output(cfg2)
+if e2["worst"] <= e2["reserve"]:
+    bad.append("负向对照：40 条也算得通过，说明这道账没有咬合")
+if not (5 <= e2["fits"] < 40):
+    bad.append(f"建议值不可用：{e2['fits']}")
+for b in bad: print("   ",b)
+sys.exit(1 if bad else 0)
+PYEOF
+check "发货默认值的输出账自洽；负向对照：调回 40 条即不平" "$?" 0
+
+# 输出超了必须在派活之前以退出码 8 拦住，并给出可执行的建议值
+python3 "$S/workspace.py" reconfigure --run-dir "$RUN7" \
+        --set chunking.max_issues_per_chunk=40 --set chunking.output_reserve_tokens=8000 >/dev/null
+PO=$(python3 "$S/prompt_pack.py" build --run-dir "$RUN7" 2>/dev/null); RC=$?
+check "输出预算超限以退出码 8 终止（输入没超）" "$RC" 8
+check "错误指向的是输出不是输入" \
+  "$(echo "$PO" | python3 -c "import json,sys;print('输出' in json.load(sys.stdin)['error'])")" True
+SUG=$(echo "$PO" | jget "['suggest_max_issues_per_chunk']")
+ge "给出条数上限的建议值" "$SUG" 5
+python3 "$S/workspace.py" reconfigure --run-dir "$RUN7" \
+        --set chunking.max_issues_per_chunk="$SUG" >/dev/null
+python3 "$S/prompt_pack.py" build --run-dir "$RUN7" >/dev/null 2>&1
+check "照建议值改完即通过（建议值是可执行的）" "$?" 0
+python3 "$S/workspace.py" reconfigure --run-dir "$RUN7" \
+        --set chunking.max_issues_per_chunk=20 --set chunking.output_reserve_tokens=10000 >/dev/null
+
+# 产物被截断时保住写完的那些行。以前是整片删掉——而那一片重跑还会撞同一堵墙
+python3 - "$S" "$RUN2" <<PYEOF
+import json,pathlib,subprocess,sys
+S,run=sys.argv[1],pathlib.Path(sys.argv[2])
+rows=[json.loads(l) for l in open(run/"work"/"paragraphs.jsonl",encoding="utf-8")]
+p=next(r for r in rows if len(r["text"])>20)
+mk=lambda o: json.dumps({"pid":p["pid"],"category":"A2","original_text":o,
+    "suggested_text":o+"。","evidence":"表述可优化","severity":"High"},ensure_ascii=False)
+d=run/"work"/"issues"; d.mkdir(parents=True,exist_ok=True)
+for f in d.glob("issues-*"): f.unlink()
+raw=d/"issues-0001.raw.jsonl"
+raw.write_text(mk(p["text"][:12])+"\n"+mk(p["text"][2:14])+"\n"+'{"pid":"p-0000',encoding="utf-8")
+out=json.loads(subprocess.run([sys.executable,f"{S}/verify_span.py","--run-dir",str(run),
+                               "--all","--channel","main"],capture_output=True,text=True).stdout)
+bad=[]
+if not raw.exists(): bad.append("截断的原始产物被删了——那一片的已完成部分就此丢失")
+if out.get("salvaged_from_truncated",0) < 1: bad.append(f"没有抢回任何条目：{out}")
+if out.get("unparsable",0) < 1: bad.append("截断没有被报出来（会被当成正常完成）")
+print(f"    截断片：抢回 {out.get('salvaged_from_truncated')} 条，报出 unparsable "
+      f"{out.get('unparsable')}，原始产物保留")
+for b in bad: print("   ",b)
+sys.exit(1 if bad else 0)
+PYEOF
+check "产物截断时保住写完的行并报数（不再整片丢弃）" "$?" 0
+
+# 负向对照：整份都不是 JSONL 时仍然只作废这一片，不能拖垮整轮
+python3 - "$S" "$RUN2" <<PYEOF
+import json,pathlib,subprocess,sys
+S,run=sys.argv[1],pathlib.Path(sys.argv[2])
+raw=run/"work"/"issues"/"issues-0001.raw.jsonl"
+raw.write_text("这不是 JSONL，是模型的一段自然语言回话。\n还有第二行。\n",encoding="utf-8")
+r=subprocess.run([sys.executable,f"{S}/verify_span.py","--run-dir",str(run),
+                  "--all","--channel","main"],capture_output=True,text=True)
+bad=[]
+if r.returncode != 0: bad.append(f"一个坏文件让整轮过闸退出了（exit {r.returncode}）")
+else:
+    out=json.loads(r.stdout)
+    if out.get("unparsable",0) < 1: bad.append("整份不可解析没有被报出来")
+for b in bad: print("   ",b)
+sys.exit(1 if bad else 0)
+PYEOF
+check "负向对照：整份不可解析时只作废这一片，不拖垮整轮" "$?" 0
+
 echo
 printf '通过 \033[32m%d\033[0m，失败 \033[31m%d\033[0m\n' "$PASS" "$FAIL"
 [ "$FAIL" -eq 0 ]

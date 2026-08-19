@@ -27,6 +27,8 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
+import tokenizer as tk  # noqa: E402
+
 from _common import (  # noqa: E402
     EX, atomic_write_json, atomic_write_text, die, emit, read_json, run_cli,
 )
@@ -233,8 +235,22 @@ def build(run_dir: Path, cfg: dict, stages: list[str], chunk_id: str | None) -> 
     atomic_write_json(idx_path, prev)
 
     mx = max(sizes) if sizes else 0
+    # ── 输出侧的账 ──
+    # 派活前的体检一直只量**输入**（prompt 有多少字符）。真实运行里撞上的却是
+    # 输出：子 Agent 单轮的生成预算被「思考 + 最多 N 条问题明细」耗尽，
+    # 回复被截断在半路——产物没写成，harness 报的是「ran out of room」。
+    # 输入侧一个字都没超，所以旧体检看不见它。
+    #
+    # 这两个数从来没有对过账：`max_issues_per_chunk` 说一片最多报几条，
+    # `output_reserve_tokens` 说切分时为输出留了多少额度。默认 40 条 × 最坏一条
+    # （跨度上限 120 字 ×2 + evidence 25 + 键名）≈ 12,760 token，而预留是 8,000。
+    # **预留额度是记在切分账上的，从来没有人拿它去校验模型真要吐多少。**
+    est = estimate_output(cfg)
+    res_out = {"est_output_tokens_worst": est["worst"], "est_output_tokens_typical": est["typical"],
+               "output_reserve_tokens": est["reserve"], "max_issues_per_chunk": est["cap"]}
+
     over = [x for x in sizes if limit and x > limit]
-    res = {"dir": str(pdir), "written": written, "max_chars": mx,
+    res = {"dir": str(pdir), "written": written, "max_chars": mx, **res_out,
            "avg_chars": round(sum(sizes) / len(sizes)) if sizes else 0,
            "max_unit": biggest[0], "limit": limit, "over_limit": len(over),
            "note": "子 Agent 只读 prompt 与写 output 两个文件，不要再读 references/"}
@@ -272,7 +288,49 @@ def build(run_dir: Path, cfg: dict, stages: list[str], chunk_id: str | None) -> 
             f"&& prompt_pack.py build --run-dir <run>\n"
             f"（子 Agent 窗口确实够大时，改 chunking.max_prompt_chars 放宽本项）",
             payload=res)
+
+    if est["worst"] > est["reserve"]:
+        # 输入过得去、输出过不去。**这类失败重试是无效的**——同一个 prompt
+        # 会再撞一次，表现是"某一片挂了六次才偶然成功"（思考长度是随机的）。
+        # 唯一有效的动作是把这一片最坏能吐多少压下来。
+        res["suggest_max_issues_per_chunk"] = est["fits"]
+        die(EX.VALIDATE,
+            f"最坏输出约 {est['worst']} token，超过为输出预留的 {est['reserve']} token"
+            f"（{est['cap']} 条 × 每条最坏 {est['per_issue']} token）",
+            f"输入没超，超的是输出：子 Agent 一轮吐不完就会被截断，产物写不成，"
+            f"而重试无效（同一个 prompt 会再撞一次）。\n"
+            f"先压条数上限——它是最直接的杠杆，且不增加派活次数：\n"
+            f"  workspace.py reconfigure --run-dir <run> "
+            f"--set chunking.max_issues_per_chunk={est['fits']}\n"
+            f"  prompt_pack.py build --run-dir <run>\n"
+            f"（压完还失败，再考虑调小 chunking.max_text_tokens；"
+            f"子 Agent 单轮输出额度确实够大时，改 chunking.output_reserve_tokens 放宽本项）",
+            payload=res)
     return res
+
+
+def estimate_output(cfg: dict) -> dict:
+    """一片审查最坏要吐多少 token。
+
+    只数**结构化产出**：条数上限 × 每条的字段上限。思考 token 不在这里估——
+    它随模型与题目变化，估不准；能确定的是"结构化部分至少要占掉这么多"，
+    留给思考的就是预留额度减去它。所以这道账要留够余量，而不是刚好卡上。
+    """
+    ch = cfg.get("chunking") or {}
+    ver = cfg.get("verification") or {}
+    cap = int(ch.get("max_issues_per_chunk") or 40)
+    reserve = int(ch.get("output_reserve_tokens") or 8000)
+    span = int(ver.get("max_span_chars") or 120)
+    # 一条记录：original_text + suggested_text 各到跨度上限，evidence 25 字，
+    # 加上 pid/category/rule_id/severity 与 JSON 的键名标点（实测约 90 字符）
+    worst_chars = span * 2 + 25 + 90
+    typ_chars = min(span, 25) * 2 + 20 + 90
+    per_issue = tk.count("必" * worst_chars, 1.0)
+    return {"cap": cap, "reserve": reserve, "per_issue": per_issue,
+            "worst": per_issue * cap,
+            "typical": tk.count("必" * typ_chars, 1.0) * cap,
+            # 能装下的条数上限（留 20% 余量给思考与格式波动）
+            "fits": max(5, int(reserve * 0.8 // max(1, per_issue)))}
 
 
 def listing(run_dir: Path, stages: list[str]) -> dict:
