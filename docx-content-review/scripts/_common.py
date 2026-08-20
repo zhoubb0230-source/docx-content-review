@@ -343,6 +343,36 @@ def conflict_admitted(candidate: dict, verdict: dict | None) -> tuple[bool, str]
     return False, "未经 Pass 4 裁定，不进交付物"
 
 
+def issue_admitted(rec: dict, cfg: dict | None = None) -> tuple[bool, str]:
+    """闸门④裁定 → 该问题是否准入交付物。**报告、批注、修订三处必须用同一份策略。**
+
+    与 `conflict_admitted` 同形状，起因也同：三处调用点各自判断，于是判法不一致。
+    实测后果就是用户看到的那一幕——闸门④淘汰的错别字**报告里没有、文档里却有一条
+    批注**：`report.py` 早就写着 `result == "drop" → continue`，
+    `apply_comments.py` 却根本没看 `verify`，把淘汰项当成"计划了修订却没落笔"，
+    照常出普通批注。同一类 A1，通过的那条带修订，被淘汰的那条只有批注，
+    抬头都写着「检测规则 A1」，从文档上看不出这两者的区别在哪。
+
+    `淘汰` 就是淘汰（spec §8 闸门④判定表），不是降级为批注：模型在盲测里
+    说了"原文没问题"，再挂一条批注等于把被否掉的判断重新塞回交付物。
+
+    唯一的例外是 `verification.enable_second_pass: false`——那是用户显式关掉了
+    这道闸门，此时按各自的 `action` 原样保留（与 `apply_revisions` 的落笔门槛一致）。
+    """
+    second = True if cfg is None else bool(
+        (cfg.get("verification") or {}).get("enable_second_pass", True))
+    if not second:
+        return True, ""
+    v = rec.get("verify")
+    result = (v.get("result") if isinstance(v, dict) else v) or rec.get("verify_result")
+    if result == "pass":
+        return True, ""
+    if result == "drop":
+        note = (v.get("note") if isinstance(v, dict) else "") or ""
+        return False, f"闸门④淘汰（{note}）" if note else "闸门④淘汰"
+    return False, "未经闸门④复核，不进交付物"
+
+
 def rule_label(rule: str) -> str:
     """规则号 → 面向读者的中文标签。未登记的规则原样返回。"""
     return CATEGORY_LABELS.get(rule) or LOGIC_GROUP_LABELS.get(rule) or rule

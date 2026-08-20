@@ -23,7 +23,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import ooxml as ox  # noqa: E402
 from _common import (  # noqa: E402
-    conflict_admitted, EX, atomic_write_json, die, emit, read_json, read_jsonl, run_cli, version_header,
+    conflict_admitted, issue_admitted, EX, atomic_write_json, die, emit, read_json, read_jsonl, run_cli, version_header,
 )
 from workspace import (  # noqa: E402
     Heartbeat, guard_write_path, lease_verify, load_run_config, resolve_path,
@@ -38,15 +38,18 @@ def build_plan(run_dir: Path, cfg: dict) -> dict:
     out_cfg = cfg.get("output") or {}
     max_rev = int(out_cfg.get("max_revisions") or 2000)
 
-    patches, demoted = [], []
+    patches, demoted, eliminated = [], [], []
     for rec in read_jsonl(resolve_path(run_dir, "issues_verified")):
         cat = rec.get("category") or ""
         sugg = (rec.get("suggested_text") or "").strip()
-        verdict = (rec.get("verify") or {}).get("result") or rec.get("verify_result")
         if not sugg or cat not in A_CLASSES:
             continue
-        if (cfg.get("verification") or {}).get("enable_second_pass", True) and verdict != "pass":
-            demoted.append({"id": rec.get("id"), "reason": f"二次复核未通过（{verdict}）"})
+        ok, why = issue_admitted(rec, cfg)
+        if not ok:
+            # **淘汰不是降级。** 这里记的是"没生成补丁"的账，
+            # `demoted_to_comment` 只用于超限降级——apply_comments 拿它决定
+            # 哪些 report_only 仍要出批注，把淘汰项混进去等于让它们绕过闸门④。
+            eliminated.append({"id": rec.get("id"), "reason": why})
             continue
         patches.append({
             "patch_id": rec.get("id") or f"P-{len(patches)+1:05d}",
@@ -86,11 +89,13 @@ def build_plan(run_dir: Path, cfg: dict) -> dict:
     plan = {**version_header(), "patches": patches,
             "demoted_to_comment": demoted + [{"id": p["patch_id"], "reason": "超过 max_revisions 上限"}
                                              for p in overflow],
+            "eliminated": eliminated,
             "max_revisions": max_rev, "overflow": len(overflow)}
     path = resolve_path(run_dir, "patchlist")
     guard_write_path(path, run_dir)
     atomic_write_json(path, plan)
     return {"patches": len(patches), "demoted": len(plan["demoted_to_comment"]),
+            "eliminated": len(eliminated),
             "overflow": len(overflow), "path": str(path)}
 
 
@@ -112,6 +117,12 @@ def apply_plan(run_dir: Path, cfg: dict) -> dict:
     paras = list(root.iter(ox.q("p")))
     by_pid = {f"p-{i:06d}": p for i, p in enumerate(paras, 1)}
     rid = ox.max_revision_id(root) + 1000
+
+    # **同段多处必须从后往前落笔。** 序号是按原始段落文本算的，而每落一笔，
+    # 被替换的那一处就进了 `w:del`、不再参与定位——先改第 0 处，第 1 处就变成了
+    # 「该段共 1 处，指定的第 2 处不存在」，后面几处全数落空。
+    # 倒序落笔时前面各处的序号不受影响（稳定排序，其余顺序原样保留）。
+    patches = sorted(patches, key=lambda x: -(x.get("occurrence") or 0))
 
     applied, failed, provenance = [], [], []
     for patch in patches:
@@ -137,6 +148,12 @@ def apply_plan(run_dir: Path, cfg: dict) -> dict:
         # 撑宽跨度换唯一性的代价是修订与批注圈住一大片，评审人看不出改了什么。
         nth = patch.get("occurrence")
         nth = int(nth) if isinstance(nth, int) or (isinstance(nth, str) and nth.isdigit()) else None
+        # A1 的判定对象是**字串本身**，不是位置：同一段里同形的每一处都是同一个错，
+        # 「改哪一处」不成疑问。缺序号时按第 0 处落笔，其余各处由
+        # `typo_scan.py propagate` 补成独立条目（各自过闸门④）。
+        # 其余类别照旧——「实测值为 200ms」改哪一处取决于判定，不取决于 find。
+        if occ > 1 and not every and nth is None and patch.get("category") == "A1":
+            nth = 0
         if occ > 1 and not every and nth is None:
             failed.append({**patch, "reason": f"原文在该段落中出现 {occ} 次，无法唯一定位，未落笔"})
             continue

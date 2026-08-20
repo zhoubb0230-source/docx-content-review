@@ -311,10 +311,19 @@ verify_span.py --run-dir <run> --all --channel main && \
 filter_neverflag.py --run-dir <run> --all --channel main && \
 typo_scan.py merge --run-dir <run> && \
 verify_span.py --run-dir <run> --all --channel typos && \
-filter_neverflag.py --run-dir <run> --all --channel typos
+filter_neverflag.py --run-dir <run> --all --channel typos && \
+typo_scan.py propagate --run-dir <run> && \
+verify_span.py --run-dir <run> --all --channel propagated && \
+filter_neverflag.py --run-dir <run> --all --channel propagated
 ```
 
-（范式支线开启时，把最后三条换成 `scan_patterns.py merge` + `--channel patterns` 的两条。）
+（范式支线开启时，再加一组 `scan_patterns.py merge` + `--channel patterns` 的两条。）
+
+**最后那三条是同形扩散，不能省。** 一处错字被确认之后，全文其余同形之处
+（`propagate` 的返回给出条数）一并成条目。少了它，用户看到的是
+「第一处改了，后面几处原样留着」——词表扫不到的写法（英文拼写、臆造词）
+只有主审查偶然报的那一处，而"全文同一个写法"这件事只有脚本做得了。
+扩散出来的条目**不直接落笔**：它们照常进闸门④，逐处盲测。
 
 `metrics.py bump --run-dir <run> --pass pass1_review`（以及 `--pass typo` / `--pass pattern`）
 每波记一次即可。`--input-tokens` / `--output-tokens` 可选：平台报得出就带上，
@@ -398,6 +407,13 @@ filter_neverflag.py --run-dir <run> --all --channel typos
 `typo_scan.py scan` 的返回里带每片的候选数，**候选为 0 的片不会生成单元**，
 不需要你判断。
 
+**一处确认，全文同形之处一起改**（`typo_scan.py propagate`，收口的最后一步）。
+两条通道各有各的盲区：词表扫不到词表里没有的写法，主审查逐片读、在哪一片
+注意到就只报哪一片。「全文同一个写法出现在哪些地方」是脚本最擅长、模型最不擅长的事，
+所以由脚本来做：已确认的 A1 逐条拿去全文找同形之处，避开已有条目占住的位置、
+避开术语表与白名单，其余各处成为新条目，**逐处进闸门④盲测**后才落笔。
+只扩散 A1——语病与歧义的判定依赖上下文，同形不等于同错。
+
 **错别字**（`typo_check.enabled` 默认开）：模型对错别字有鲁棒性，让它自己找先天不利，
 所以退化成二选一——A 原字正确 / B 应改 / C 都不对。裁定按 `tid` 回填，
 `typo_scan.py merge` 只采纳 B。
@@ -472,6 +488,11 @@ verify_pass2.py merge --run-dir <run>            # 判定表 → work/issues-ver
 
 **漏跑一批 = 那批整批淘汰**（`missing_verdict` 会报数）。看到这个数不为 0，
 补跑缺的那几批再 merge，不要放着不管——它是"少了一批复核"，不是"这批没问题"。
+
+**淘汰就是淘汰：不进报告，也不进文档。** 被这道闸门淘汰的条目既不落修订，
+也不出批注（`apply_comments.py plan` 的 `eliminated` 报数，与报告口径一致）。
+所以用户在文档里看到的每一条 A1 批注，报告里都能查到对应的一行；
+反过来，「查出来了却什么都没有」正是被这道闸门否掉的那些——它们不是漏改。
 
 > 需要测模型的位置偏好时（M2 验收项）：`build --arrangement mirror` 再复核一轮，
 > 然后 `verify_pass2.py consistency --run-dir <run>` 给出两种排列的判定一致率。
@@ -590,7 +611,7 @@ workspace.py clean-temp --run-dir <run>
 | `import_decisions.py import\|apply\|show` | 审查记忆 | `--run-dir` | hits |
 | `report.py` | report.md + issues.xlsx（写 run/output/） | `--run-dir` | 路径 / 计数 / artifacts |
 | `diagnose.py` | **不含正文**的诊断包，用于把现场反馈给维护者（自带泄漏自检） | `--run-dir [--format md]` | 结构指纹 / 漏斗 / 台账 / 词表条目分布 |
-| `typo_scan.py scan\|merge` | 错别字候选（支线，默认开） | `--run-dir [--chunk]` | candidates |
+| `typo_scan.py scan\|merge\|propagate` | 错别字候选（支线，默认开）；`propagate` = 已确认的错字扩散到全文同形之处（收口最后一步） | `--run-dir [--chunk]` | candidates / pairs / skipped_covered |
 | `scan_patterns.py scan\|merge\|lint` | 范式场景定位与裁定合并（支线，默认关） | `--run-dir [--chunk --patterns]` | rules / candidates |
 
 **退出码**：0 成功 / 1 失败 / 2 参数错 / 3 环境缺失 / 4 写路径越界 / 5 磁盘不足 /

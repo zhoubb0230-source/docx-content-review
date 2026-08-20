@@ -74,9 +74,17 @@ def _scope(cfg: dict, table: dict) -> set:
 
 
 def item_id(rec: dict) -> str:
-    """稳定标识：同一条问题在两次排列、两次运行里必须得到同一个 id。"""
+    """稳定标识：同一条问题在两次排列、两次运行里必须得到同一个 id。
+
+    **段内序号也是标识的一部分。** 同一段里同一个错字的第一处与第二处是两条
+    独立的判定（各自问过模型、各自落笔），键里不带序号，`collect` 的
+    `seen` 就会把后面几处当成"重叠区产生的同一条"丢掉——用户看到的是
+    「第一处改了，后面几处原样留着」。没有序号的记录（主审查通道）标识不变。
+    """
+    occ = rec.get("occurrence")
     key = f"{rec.get('chunk_id')}|{rec.get('pid')}|{rec.get('category')}|" \
-          f"{normalize_ws(rec.get('original_text') or '')}"
+          f"{normalize_ws(rec.get('original_text') or '')}" \
+          + (f"|#{occ}" if isinstance(occ, int) else "")
     return sha256_text(key)[:16]
 
 

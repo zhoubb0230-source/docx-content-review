@@ -327,7 +327,8 @@ def main(argv: list[str]) -> int:
     ap.add_argument("--run-dir")
     ap.add_argument("--chunk")
     ap.add_argument("--all", action="store_true")
-    ap.add_argument("--channel", choices=["main", "typos", "patterns"], default="main",
+    ap.add_argument("--channel", choices=["main", "typos", "patterns", "propagated"],
+                    default="main",
                     help="--all 时决定扫哪一条通道的产物")
     ap.add_argument("--file", help="直接指定要过滤的 issues 文件；"
                                    "侧通道（错别字/范式）用它指向自己的产物")
@@ -361,7 +362,8 @@ def main(argv: list[str]) -> int:
     groups, fallback = _alias_groups(glossary), _fallback_terms(glossary)
 
     idir = resolve_path(run_dir, "issues")
-    suffix = {"main": "", "typos": ".typos", "patterns": ".patterns"}[args.channel]
+    suffix = {"main": "", "typos": ".typos", "patterns": ".patterns",
+              "propagated": ".propagated"}[args.channel]
     ids = []
     if args.all:
         # 通道决定看哪一批文件：主通道 issues-<c>.jsonl，侧通道 issues-<c>.<通道>.jsonl

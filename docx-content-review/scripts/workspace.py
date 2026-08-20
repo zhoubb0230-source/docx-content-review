@@ -1281,7 +1281,9 @@ def cmd_config(args) -> int:
 RECONFIG_IMPACT = {
     "chunking": "重跑第 3 步（chunk.py → 候选扫描 → prompt_pack.py build）；"
                 "切法变了的分片，旧产物会被自动作废并重审",
-    "typo_check": "重跑 typo_scan.py scan + prompt_pack.py build",
+    "typo_check": "重跑 typo_scan.py scan + prompt_pack.py build；"
+                  "只改扩散相关项（propagate_confirmed / max_propagated*）时，"
+                  "重跑 typo_scan.py propagate + --channel propagated 的两道闸门即可",
     "pattern_review": "重跑 scan_patterns.py scan + prompt_pack.py build",
     "strictness": "重跑闸门②③（verify_span.py --all / filter_neverflag.py --all）与闸门④ build",
     "verification": "重跑闸门②③与闸门④ build",

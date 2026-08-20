@@ -1497,3 +1497,78 @@ Pass 1 有个别分片反复失败（一片挂六次才偶然成功），Pass 2�
 
 - **影响**：`scripts/prompt_pack.py`、`scripts/verify_span.py`、`scripts/_common.py`、
   `assets/config.default.yaml`、`SKILL.md`、`tests/run_regression.sh` 第 32 节。
+
+## ADR-052　一处判定要落到哪些位置：同形扩散与"能不能进交付物"的准入口径
+
+- **日期**：2026-08-20
+- **来源**：用户跑完一轮真实文档后的两条反馈：
+  ①「单词拼写错误被检查出来了，但后面其他使用该单词的地方没有修订和批注，比如 `sporsor`」；
+  ②「有些错别字识别出来后没有修订，有些有修订，批注都写着检测规则 A1，为什么不统一」。
+
+两条看起来是两个功能，实际是同一段流程的两端：**一处判定成立之后，它该落到哪些位置。**
+①是覆盖面不够，②是准入口径不一致。三个缺陷各自独立，但叠加起来正好是用户看到的现象。
+
+### 缺陷一：逐处出的条目被去重键折叠掉（同段第二处起）
+
+错别字通道按「段内第几处」逐处出候选，每一处都单独问过模型（各有各的 `tid` 与裁定）。
+但两处去重把它们当成重复项：
+
+- `verify_span.process` 的分片内去重键 `(pid, category, original_text)`；
+- `verify_pass2.item_id`（`collect` 据此 `seen` 去重）。
+
+于是一段里两处「布署」，过闸只剩一条——**既不落修订、也不出批注，报告里同样没有**。
+用户看到的就是「改了第一处，后面原样留着」。
+
+**回归第 31 节那句断言（`applied ≥ 2`）一直是绿的**：构造是"一段一处 + 一段两处"，
+折叠掉一条之后恰好还剩 2。又一次印证 ADR-048 那句——一条断言长期为真，
+可能是因为规则对，也可能是因为规则错得恰好让它为真。现已改成精确的 3。
+
+### 缺陷二：词表扫不到的写法只有"偶然发现的那一处"
+
+`sporsor` 这类英文拼写、以及行业内的臆造词，`common-typos.txt` 里不会有，
+错别字通道一个候选都出不了；它只能由主审查通道偶然报出来，而主审查逐片读，
+**在哪一片注意到就只报哪一片**。两条通道都没有"全文同一个写法"的视角，
+而这恰恰是脚本最擅长、模型最不擅长的事。
+
+- **决策**：新增 `typo_scan.py propagate`（收口的最后一步，闸门④之前）：
+  把已过闸的 A1 逐条拿去全文找同形之处，避开已有条目占住的字符区间、
+  避开白名单与术语表，其余各处成为 `issues-<chunk>.propagated.jsonl`，
+  照常过闸门②③，**逐处进闸门④盲测**后才落笔。
+- **只扩散 A1**：它的判定对象是字串本身。A2–A8 与 B 类依赖上下文，
+  同形不等于同错，扩散过去就是成批误报。
+- **不跳过 LLM**：同一个字串在不同上下文里可能一处是错一处是对（「帐篷」与「帐号」），
+  位置的判断权仍在模型手里，脚本只负责把该问的地方都问到。这与
+  「脚本候选不得直接生成修订」是同一条约束。
+- **备选**：扩表。扩表仍是提召回的唯一杠杆，但它管不了这一类——
+  英文拼写与臆造词是枚举不完的，而"这一份文档里已经确认过的那个错"是确定的。
+
+### 缺陷三：闸门④淘汰的条目照样进了文档批注
+
+`report.py` 早就写着 `result == "drop" → continue`，`apply_comments.py` 却根本没看
+`verify`，把淘汰项当成"计划了修订却没落笔"照常出普通批注。后果是
+**报告里没有的条目在文档里有**：同一类 A1，通过的那条带修订，被淘汰的那条只有批注，
+抬头都写着「检测规则 A1」，从文档上看不出这两者的区别在哪——正是反馈②的现象。
+
+- **决策**：与 `conflict_admitted` 同形状，新增 `_common.issue_admitted(rec, cfg)`，
+  report / apply_comments / apply_revisions 三处只准调用它。
+  淘汰就是淘汰（spec §8 闸门④判定表），不是降级为批注：模型在盲测里说了
+  "原文没问题"，再挂一条批注等于把被否掉的判断重新塞回交付物。
+  `apply_comments plan` 的 `eliminated` 报数，与报告口径一致。
+  唯一例外是 `verification.enable_second_pass: false`——用户显式关掉了这道闸门。
+
+### 顺带修掉的两处
+
+- **同段多处必须从后往前落笔**：序号按原始段落文本算，而每落一笔被替换的那一处
+  就进了 `w:del`、不再参与定位——先改第 0 处，第 1 处立刻变成
+  「该段共 1 处，指定的第 2 处不存在」。`apply_plan` 现在按 `occurrence` 降序落笔。
+  这个缺陷在缺陷一存在时永远碰不到：同段第二处根本活不到回写。
+- **A1 缺序号且同段多处时按第 0 处落笔**：A1 的判定对象是字串本身，
+  "改哪一处"不成疑问；其余各处由 propagate 补成独立条目。其它类别照旧拒绝
+  （「实测值为 200ms」改哪一处取决于判定，不取决于 `find`）。
+
+- **影响**：`scripts/_common.py`（`issue_admitted`）、`scripts/typo_scan.py`（`propagate`
+  与 `_protected_forms` / `_shielded` 提取）、`scripts/verify_span.py`（`_dedup_key`、
+  新通道）、`scripts/verify_pass2.py`（`item_id`）、`scripts/apply_revisions.py`、
+  `scripts/apply_comments.py`、`scripts/report.py`、`scripts/filter_neverflag.py`、
+  `assets/config.default.yaml`、`SKILL.md`、`references/{schemas,ooxml,taxonomy}.md`、
+  `tests/run_regression.sh` 第 31、33 节。

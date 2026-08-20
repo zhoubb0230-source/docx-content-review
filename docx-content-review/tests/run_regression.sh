@@ -2856,7 +2856,10 @@ p=pathlib.Path(sys.argv[1],"work","issues","issues-0001.typos.jsonl")
 print(sum(1 for _ in open(p,encoding="utf-8")))
 PYEOF
 )
-ge "两字跨度过得了闸门②（A1 的下限独立于 min_span_chars）" "$KEPT" 2
+# **三条候选就该留三条。** 这里以前写的是 `ge 2`，而实际只留了两条——
+# 闸门的分片内去重把同段第二处折叠掉了，断言恰好被"两个段落各一条"盖住。
+# 一条断言长期为真，可能是因为规则对，也可能是因为规则错得恰好让它为真。
+check "同段两处都过得了闸门②（去重键必须带段内序号）" "$KEPT" 3
 
 python3 "$S/verify_pass2.py" build --run-dir "$RUN12" >/dev/null
 python3 - "$RUN12" <<PYEOF
@@ -2872,7 +2875,7 @@ PYEOF
 python3 "$S/verify_pass2.py" merge --run-dir "$RUN12" >/dev/null
 python3 "$S/apply_revisions.py" plan  --run-dir "$RUN12" --session sp --generation 1 >/dev/null
 AP=$(python3 "$S/apply_revisions.py" apply --run-dir "$RUN12" --session sp --generation 1)
-ge "同段两处各自落笔（靠序号消歧，不再整条拒绝）" "$(echo "$AP" | jget "['applied']")" 2
+check "同段两处各自落笔（靠序号消歧，不再整条拒绝）" "$(echo "$AP" | jget "['applied']")" 3
 check "落笔没有失败项" "$(echo "$AP" | jget "['failed']")" 0
 
 python3 "$S/apply_comments.py" plan  --run-dir "$RUN12" --session sp --generation 1 >/dev/null
@@ -3042,6 +3045,183 @@ for b in bad: print("   ",b)
 sys.exit(1 if bad else 0)
 PYEOF
 check "负向对照：整份不可解析时只作废这一片，不拖垮整轮" "$?" 0
+
+echo "══ 33. 同一个错字的每一处：全文扩散与准入口径 ══"
+# 现场反馈的两条，根子都在「一处判定 → 落到哪些位置」这一段：
+#   ① 一个拼错的单词被查出来了，后面其它使用该单词的地方既没修订也没批注；
+#   ② 同样是错别字（批注都写着 A1），有的落了修订，有的只有批注，看不出区别在哪。
+# ① 是覆盖面：词表扫不到的写法（英文拼写、臆造词）只有主审查偶然报的那一处；
+# ② 是准入口径：闸门④淘汰的条目在报告里没有、在文档里却有一条批注。
+
+python3 - "$WORK" <<'PYEOF'
+import sys
+try:
+    from docx import Document
+except ImportError:
+    sys.exit(9)
+d=Document(); d.add_heading("1 总则", level=1)
+d.add_paragraph("本项目由 sporsor 提供资金支持，接入层负责协议转换与鉴权。")
+d.add_paragraph("平台已完成布署并通过验收，运行状态良好。一期布署完成后进入试运行。")
+d.add_paragraph("sporsor 的权利与义务由第 3 章约定，双方另行签署补充协议。")
+d.add_paragraph("变更 sporsor 需经双方书面同意，且 sporsor 不得单方撤资。")
+import pathlib; pathlib.Path(sys.argv[1],"spread").mkdir(parents=True,exist_ok=True)
+d.save(str(pathlib.Path(sys.argv[1],"spread","spread.docx")))
+PYEOF
+if [ $? -eq 9 ]; then
+  echo "  （跳过：本机无 python-docx，无法生成本节 fixture）"
+else
+RUN13=$(python3 "$S/workspace.py" init --source "$WORK/spread/spread.docx" \
+        --output-dir "$DELIVER" --temp-dir "$TEMP" | jget "['run_dir']")
+python3 "$S/workspace.py" lease acquire --doc-dir "$(dirname "$RUN13")" --session sd \
+        --runid "$(basename "$RUN13")" --stage pass-1 >/dev/null
+for c in "unpack.py run" "extract.py" "chunk.py" "typo_scan.py scan"; do
+  python3 $S/$c --run-dir "$RUN13" >/dev/null
+done
+# 模拟 Pass 1：主审查只在第一处发现 sporsor（模型逐片读，看到哪片报哪片）；
+# 错别字通道对「布署」的两处各答一次 B。
+python3 - "$RUN13" <<'PYEOF'
+import json,pathlib,sys
+run=pathlib.Path(sys.argv[1]); t=run/"work"/"typos"
+for f in sorted(t.glob("typos-g*.json")):
+    items=json.load(open(f,encoding="utf-8"))["items"]
+    (t/f"{f.stem}.verdicts.jsonl").write_text("".join(
+        json.dumps({"tid":i["tid"],"verdict":"B"},ensure_ascii=False)+"\n" for i in items),
+        encoding="utf-8")
+raw=run/"work"/"issues"/"issues-0001.raw.jsonl"; raw.parent.mkdir(parents=True,exist_ok=True)
+raw.write_text(json.dumps({"pid":"p-000002","category":"A1","severity":"High",
+  "original_text":"sporsor","suggested_text":"sponsor","evidence":"英文拼写错误"},
+  ensure_ascii=False)+"\n",encoding="utf-8")
+PYEOF
+python3 "$S/verify_span.py" --run-dir "$RUN13" --all --channel main >/dev/null
+python3 "$S/filter_neverflag.py" --run-dir "$RUN13" --all --channel main >/dev/null
+python3 "$S/typo_scan.py" merge --run-dir "$RUN13" >/dev/null
+python3 "$S/verify_span.py" --run-dir "$RUN13" --all --channel typos >/dev/null
+python3 "$S/filter_neverflag.py" --run-dir "$RUN13" --all --channel typos >/dev/null
+
+PR=$(python3 "$S/typo_scan.py" propagate --run-dir "$RUN13")
+check "扩散出其余三处（第 4、5 段共三处 sporsor）" "$(echo "$PR" | jget "['candidates']")" 3
+check "已经有条目管着的位置不重复生成" "$(echo "$PR" | jget "['skipped_covered']")" 3
+python3 "$S/verify_span.py" --run-dir "$RUN13" --all --channel propagated >/dev/null
+python3 "$S/filter_neverflag.py" --run-dir "$RUN13" --all --channel propagated >/dev/null
+
+# 幂等：再跑一次结果必须一致（重复执行是断点续跑的前提）
+PR2=$(python3 "$S/typo_scan.py" propagate --run-dir "$RUN13")
+check "propagate 幂等（重复执行条数不变）" "$(echo "$PR2" | jget "['candidates']")" 3
+python3 "$S/verify_span.py" --run-dir "$RUN13" --all --channel propagated >/dev/null
+python3 "$S/filter_neverflag.py" --run-dir "$RUN13" --all --channel propagated >/dev/null
+
+# 负向对照一：扩散只认 A1。语病/歧义的判定依赖上下文，同形不等于同错。
+python3 - "$S" "$RUN13" <<'PYEOF'
+import json,pathlib,subprocess,sys
+S,run=sys.argv[1],pathlib.Path(sys.argv[2])
+main=run/"work"/"issues"/"issues-0001.jsonl"
+keep=main.read_text(encoding="utf-8")
+rec=json.loads(keep.splitlines()[0])
+main.write_text(json.dumps({**rec,"category":"A5","rule_id":"A5"},ensure_ascii=False)+"\n",
+                encoding="utf-8")
+out=json.loads(subprocess.run([sys.executable,f"{S}/typo_scan.py","propagate",
+                               "--run-dir",str(run)],capture_output=True,text=True).stdout)
+main.write_text(keep,encoding="utf-8")
+subprocess.run([sys.executable,f"{S}/typo_scan.py","propagate","--run-dir",str(run)],
+               capture_output=True)
+sys.exit(0 if out["candidates"]==0 else 1)
+PYEOF
+check "负向对照：非 A1 的判定不扩散（同形不等于同错）" "$?" 0
+
+# 负向对照二：用户术语表登记的写法不扩散（与 scan 同一份判据）
+python3 - "$S" "$RUN13" <<'PYEOF'
+import json,pathlib,subprocess,sys
+S,run=sys.argv[1],pathlib.Path(sys.argv[2])
+terms=run/"work"/"terms.txt"; terms.write_text("sporsor\n",encoding="utf-8")
+subprocess.run([sys.executable,f"{S}/import_glossary.py","--run-dir",str(run),
+                "--fallback",str(terms)],capture_output=True)
+out=json.loads(subprocess.run([sys.executable,f"{S}/typo_scan.py","propagate",
+                               "--run-dir",str(run)],capture_output=True,text=True).stdout)
+print(f"    登记为术语后：扩散 {out['candidates']} 条，被术语表挡下 {out['skipped_shielded']} 处")
+sys.exit(0 if out["candidates"]==0 and out["skipped_shielded"]>0 else 1)
+PYEOF
+check "负向对照：术语表登记的写法不扩散" "$?" 0
+# 恢复：把术语表清空，后面的断言仍按扩散三条来
+python3 - "$S" "$RUN13" <<'PYEOF'
+import pathlib,subprocess,sys
+S,run=sys.argv[1],pathlib.Path(sys.argv[2])
+(run/"work"/"terms.txt").write_text("# 空\n",encoding="utf-8")
+subprocess.run([sys.executable,f"{S}/import_glossary.py","--run-dir",str(run),
+                "--fallback",str(run/"work"/"terms.txt")],capture_output=True)
+for c in ("propagate",): subprocess.run([sys.executable,f"{S}/typo_scan.py",c,
+                                         "--run-dir",str(run)],capture_output=True)
+subprocess.run([sys.executable,f"{S}/verify_span.py","--run-dir",str(run),"--all",
+                "--channel","propagated"],capture_output=True)
+subprocess.run([sys.executable,f"{S}/filter_neverflag.py","--run-dir",str(run),"--all",
+                "--channel","propagated"],capture_output=True)
+PYEOF
+
+# 闸门④：六条待复核（sporsor 四处 + 布署两处），其中第 4 段那条模拟被淘汰
+python3 "$S/verify_pass2.py" build --run-dir "$RUN13" >/dev/null
+python3 - "$S" "$RUN13" <<'PYEOF'
+import json,pathlib,sys
+sys.path.insert(0, sys.argv[1])
+from verify_pass2 import item_id
+run=pathlib.Path(sys.argv[2]); vd=run/"work"/"verify"
+key=json.loads((vd/"pass2-primary.key.json").read_text(encoding="utf-8"))["key"]
+# 指定「第 4 段那一处」被淘汰：id 由记录本身派生，不依赖它排在第几批第几条
+doomed=item_id({"chunk_id":"0001","pid":"p-000004","category":"A1",
+                "original_text":"sporsor","occurrence":0})
+n=0
+for f in sorted(vd.glob("pass2-primary.v[0-9][0-9].json")):
+    items=json.loads(f.read_text(encoding="utf-8"))["items"]; lines=[]
+    for i in items:
+        n+=1
+        ans="两者都没有" if i["id"]==doomed else key[i["id"]]["orig_side"]
+        lines.append(json.dumps({"id":i["id"],"answer":ans},ensure_ascii=False))
+    (vd/f"{f.stem}.verdicts.jsonl").write_text("\n".join(lines)+"\n",encoding="utf-8")
+print(f"    闸门④待复核 {n} 条（第 4 段那一处模拟淘汰）")
+sys.exit(0 if n==6 and doomed in key else 1)
+PYEOF
+check "六处各自成条目进闸门④（同段两处不再折叠成一条）" "$?" 0
+python3 "$S/verify_pass2.py" merge --run-dir "$RUN13" >/dev/null
+python3 "$S/apply_revisions.py" plan --run-dir "$RUN13" --session sd --generation 1 >/dev/null
+AR=$(python3 "$S/apply_revisions.py" apply --run-dir "$RUN13" --session sd --generation 1)
+check "五处落笔（同段多处从后往前落，序号不会因前一笔失效）" \
+      "$(echo "$AR" | jget "['applied']")" 5
+check "落笔没有失败项" "$(echo "$AR" | jget "['failed']")" 0
+
+AC=$(python3 "$S/apply_comments.py" plan --run-dir "$RUN13" --session sd --generation 1)
+check "闸门④淘汰的条目不进文档（报告里没有，文档里也不能有）" \
+      "$(echo "$AC" | jget "['eliminated_total']")" 1
+check "批注数与落笔数一致（每处修订一条理由批注，没有多出来的孤儿批注）" \
+      "$(echo "$AC" | jget "['comments']")" 5
+python3 "$S/apply_comments.py" apply --run-dir "$RUN13" --session sd --generation 1 >/dev/null
+RP=$(python3 "$S/report.py" --run-dir "$RUN13")
+check "报告条数与文档里的批注数一致（同一份准入口径）" "$(echo "$RP" | jget "['rows']")" 5
+VD=$(python3 "$S/validate_docx.py" --run-dir "$RUN13")
+check "回写四项校验通过" "$(echo "$VD" | jget "['pass']")" True
+
+python3 - "$RUN13" <<'PYEOF'
+import pathlib,sys
+from lxml import etree
+W="{http://schemas.openxmlformats.org/wordprocessingml/2006/main}"
+root=etree.parse(str(pathlib.Path(sys.argv[1],"work","unpacked","word","document.xml"))).getroot()
+bad=[]
+for i,p in enumerate(root.iter(W+"p"),1):
+    live="".join(t.text or "" for t in p.iter(W+"t")
+                 if not any(a.tag in (W+"del",) for a in t.iterancestors()))
+    dele="".join(t.text or "" for t in p.iter(W+"delText"))
+    if i==5 and ("sporsor" in live or dele.count("sporsor")!=2):
+        bad.append(f"第 5 段两处都该落笔：live={live!r} del={dele!r}")
+    if i==4 and dele:
+        bad.append(f"第 4 段被闸门④淘汰，不该有任何修订：del={dele!r}")
+for b in bad: print("   ",b)
+sys.exit(1 if bad else 0)
+PYEOF
+check "同段两处都改到了；被淘汰的那一处原样未动" "$?" 0
+
+# 负向对照：关掉扩散开关，行为退回原样（这条通道是可关的，不是硬编码进流程的）
+python3 "$S/workspace.py" reconfigure --run-dir "$RUN13" \
+        --set typo_check.propagate_confirmed=false >/dev/null
+OFF=$(python3 "$S/typo_scan.py" propagate --run-dir "$RUN13")
+check "负向对照：关掉开关即不扩散" "$(echo "$OFF" | jget "['candidates']")" 0
+fi
 
 echo
 printf '通过 \033[32m%d\033[0m，失败 \033[31m%d\033[0m\n' "$PASS" "$FAIL"

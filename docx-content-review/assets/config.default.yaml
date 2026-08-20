@@ -84,6 +84,13 @@ typo_check:
   # 这条通道的候选量是三条里最大的，50 是实测能稳住的上限。
   batch_size: 50
   require_llm_adjudication: true # 脚本候选不得直接生成修订
+  # 同形扩散：一处错字被确认之后，全文其余同形之处一并成条目（typo_scan.py propagate）。
+  # 词表扫不到的写法（英文拼写、臆造词）只会被主审查在某一片偶然发现，
+  # 其余各处无人管——用户看到的是「改了第一处，后面几处原样留着」。
+  # 扩散出来的条目照常过闸门②③，并逐条进闸门④盲测，不直接落笔。
+  propagate_confirmed: true
+  max_propagated: 500           # 全文扩散总量上限（防止一个高频写法撑爆闸门④）
+  max_propagated_per_chunk: 200 # 扩散通道的单片配额，与错别字通道各自独立
   # 未登录词检测（切词后查不到的词即可疑）需 5 万词级词表才有信噪比，
   # 内置词表远未达到该规模，故不启用。召回率上限 = common-typos.txt 的覆盖范围。
   oov_detection: false

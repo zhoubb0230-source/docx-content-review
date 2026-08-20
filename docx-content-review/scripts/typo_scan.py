@@ -13,9 +13,10 @@
 **脚本候选不得直接生成修订**（混淆集方法误报率高，LLM 裁定不可省略）。
 
 子命令
-  scan   扫描候选 → work/typos/typos-<chunk>.json（含供 LLM 裁定的分批 payload）
-  merge  合并裁定结果 → work/issues/issues-<chunk>.typos.jsonl，类别记为 A1
-  lint   只自检词表，不需要 run 目录（扩表后必跑）
+  scan       扫描候选 → work/typos/typos-<chunk>.json（含供 LLM 裁定的分批 payload）
+  merge      合并裁定结果 → work/issues/issues-<chunk>.typos.jsonl，类别记为 A1
+  propagate  已确认的错字扩散到全文其余同形之处 → issues-<chunk>.propagated.jsonl
+  lint       只自检词表，不需要 run 目录（扩表后必跑）
 
 **召回率上限 = common-typos.txt 的覆盖范围。** 未登录词检测（切词后查不到的词即可疑）
 能突破这个上限，但需 5 万词级词表才有信噪比，内置词表远未达到该规模，故不启用
@@ -140,27 +141,12 @@ def scan(run_dir: Path, cfg: dict, chunk_id: str | None) -> dict:
     whitelist = _load_list("typo-whitelist.txt")
     glossary = read_json(resolve_path(run_dir, "glossary_merged"), {}) or {}
 
-    forbidden: list[tuple[str, str, str]] = []
     # 用户术语表里的写法**也是白名单**。行业术语（半导体装备、医疗器械这类）
     # 的用字与通用错词表天然会撞：只要术语里含着某条左串，这个词每出现一次
     # 就产出一个注定要被否掉的候选——既是噪音，也白白消耗一次裁定调用。
     # 以前术语表只在闸门③（N7）起作用，那已经是模型答完之后了。
-    protected: set[str] = set()
-    banned: set[str] = set()
-    for e in glossary.get("entries", []):
-        pref = e.get("preferred") or e.get("key")
-        for f in (e.get("forbidden") or []):
-            form = f.get("form") if isinstance(f, dict) else f
-            if form:
-                banned.add(form)
-            if form and pref and levenshtein(form, pref, cap=2) <= 2:
-                forbidden.append((form, pref, "术语表登记的禁用写法"))
-        for w in (pref, e.get("key"), *(e.get("variants") or [])):
-            w = (w or "").strip() if isinstance(w, str) else ""
-            if w:
-                protected.add(w)
-    # 登记为禁用的写法不受保护——那正是要挑出来的
-    protected -= banned
+    # （登记为禁用的写法不受保护——那正是要挑出来的，见 `_protected_forms`。）
+    protected, forbidden = _protected_forms(glossary)
 
     idx = read_json(resolve_path(run_dir, "chunk_index"), {}) or {}
     chunks = [c for c in idx.get("chunks", []) if not chunk_id or c["chunk_id"] == chunk_id]
@@ -182,13 +168,9 @@ def scan(run_dir: Path, cfg: dict, chunk_id: str | None) -> dict:
             for wrong, right, why in typos + forbidden:
                 if wrong not in text:
                     continue
-                # 白名单命中即跳过：「帐篷」不应被改为「账篷」
-                if any(w in text and wrong in w for w in whitelist):
-                    continue
-                if wrong in whitelist:
-                    continue
-                # 术语表同理：左串落在用户登记的术语里就不生成候选
-                if any(w in text and wrong in w for w in protected):
+                # 白名单命中即跳过：「帐篷」不应被改为「账篷」。
+                # 术语表同理：左串落在用户登记的术语里就不生成候选。
+                if _shielded(text, wrong, whitelist, protected):
                     continue
                 for m in re.finditer(re.escape(wrong), text):
                     lo, hi = _unique_window(text, m.start(), m.end())
@@ -272,6 +254,149 @@ def scan(run_dir: Path, cfg: dict, chunk_id: str | None) -> dict:
             "results": [r for r in results if r.get("candidates") or r.get("truncated")]}
 
 
+def _protected_forms(glossary: dict) -> tuple[set[str], list[tuple[str, str, str]]]:
+    """术语表里的受保护写法与登记的禁用写法。scan 与 propagate 共用同一份判据——
+    两处各写一遍的下场是：候选阶段跳过了的写法，扩散阶段又原样捡回来。"""
+    forbidden: list[tuple[str, str, str]] = []
+    protected: set[str] = set()
+    banned: set[str] = set()
+    for e in (glossary or {}).get("entries", []):
+        pref = e.get("preferred") or e.get("key")
+        for f in (e.get("forbidden") or []):
+            form = f.get("form") if isinstance(f, dict) else f
+            if form:
+                banned.add(form)
+            if form and pref and levenshtein(form, pref, cap=2) <= 2:
+                forbidden.append((form, pref, "术语表登记的禁用写法"))
+        for w in (pref, e.get("key"), *(e.get("variants") or [])):
+            w = (w or "").strip() if isinstance(w, str) else ""
+            if w:
+                protected.add(w)
+    return protected - banned, forbidden
+
+
+def _shielded(text: str, wrong: str, whitelist: set[str], protected: set[str]) -> bool:
+    """这一段里的这个写法是不是被白名单/术语表罩住了（与 scan 的判据逐字相同）。"""
+    if wrong in whitelist:
+        return True
+    return any(w in text and wrong in w for w in whitelist | protected)
+
+
+def propagate(run_dir: Path, cfg: dict) -> dict:
+    """**同形扩散**：一处错字被确认之后，全文其余同形之处一并成条目。
+
+    现场反馈的那一幕：`sporsor` 在第一处被查出来并落了修订，后面三处原样留着，
+    既没有修订也没有批注——评审人只能自己去全文搜一遍。
+
+    根因不是漏检，是**通道的覆盖面**：错别字通道按词表扫，词表里没有的写法
+    （英文拼写、行业内的臆造词）它一个候选都出不了；主审查通道由模型逐片读，
+    模型在哪一片注意到就只报哪一片。两条通道都没有"全文同一个写法"的视角，
+    而这恰恰是脚本最擅长、模型最不擅长的事。
+
+    扩散出来的条目**不直接落笔**：它们与其它候选一样过闸门②③，然后逐条进闸门④
+    的盲测——同一个字串在不同上下文里可能一个是错、一个是对（「帐篷」与「帐号」），
+    位置的判断权仍在模型手里，脚本只负责把该问的地方都问到。
+    因此本步必须跑在第 4 步收口之后、闸门④ build 之前。
+
+    只扩散 A1：它的判定对象是字串本身。其余类别（语病、歧义、数值单位）
+    的判定依赖上下文，同形不等于同错，扩散过去就是成批误报。
+    """
+    tc = cfg.get("typo_check") or {}
+    if not tc.get("propagate_confirmed", True):
+        return {"enabled": False, "candidates": 0,
+                "note": "typo_check.propagate_confirmed=false"}
+
+    idir = resolve_path(run_dir, "issues")
+    paras = {p["pid"]: p for p in read_jsonl(resolve_path(run_dir, "paragraphs"))}
+    idx = read_json(resolve_path(run_dir, "chunk_index"), {}) or {}
+    pid_chunk: dict[str, str] = {}
+    for c in idx.get("chunks", []):
+        for pid in c.get("review_pids") or c.get("pids") or []:
+            pid_chunk.setdefault(pid, c["chunk_id"])
+
+    glossary = read_json(resolve_path(run_dir, "glossary_merged"), {}) or {}
+    whitelist = _load_list("typo-whitelist.txt")
+    protected, _ = _protected_forms(glossary)
+    min_len = int(tc.get("min_span_chars") or 2)
+    cap = int(tc.get("max_propagated") or 500)
+
+    # 已确认的错字对 + 已被占住的字符区间。**区间要按字符算**：
+    # 同一段里既有的条目改的是哪几个字，扩散就不能再碰那几个字，
+    # 否则两条补丁落在同一处，回写时后一条找不到原文（前一条已经进了 w:del）。
+    pairs: dict[tuple[str, str], str] = {}
+    taken: dict[str, list[tuple[int, int]]] = {}
+    for path in sorted(idir.glob("issues-*.jsonl")):
+        if path.name.endswith(".raw.jsonl") or path.name.endswith(".propagated.jsonl"):
+            continue
+        for rec in read_jsonl(path):
+            orig = (rec.get("original_text") or "").strip()
+            pid = rec.get("pid") or ""
+            text = (paras.get(pid) or {}).get("text") or ""
+            if orig and text:
+                occ = rec.get("occurrence")
+                start = -1
+                for _ in range(max(0, occ if isinstance(occ, int) else 0) + 1):
+                    start = text.find(orig, start + 1)
+                    if start < 0:
+                        break
+                if start >= 0:
+                    taken.setdefault(pid, []).append((start, start + len(orig)))
+            sugg = (rec.get("suggested_text") or "").strip()
+            if (rec.get("category") or "") != "A1" or not sugg or sugg == orig:
+                continue
+            if len(orig) < min_len:
+                continue
+            pairs.setdefault((orig, sugg), (rec.get("evidence") or "错别字"))
+
+    rows: dict[str, list[dict]] = {}
+    total = skipped_shielded = skipped_taken = 0
+    truncated = False
+    for (wrong, right), why in sorted(pairs.items()):
+        for pid, para in paras.items():
+            cid = pid_chunk.get(pid)
+            if not cid or para.get("is_code") or wrong not in para["text"]:
+                continue
+            text = para["text"]
+            if _shielded(text, wrong, whitelist, protected):
+                skipped_shielded += 1
+                continue
+            for m in re.finditer(re.escape(wrong), text):
+                span = (m.start(), m.end())
+                if any(a < span[1] and span[0] < b for a, b in taken.get(pid, [])):
+                    skipped_taken += 1          # 这几个字已经有条目管了
+                    continue
+                if total >= cap:
+                    truncated = True
+                    break
+                taken.setdefault(pid, []).append(span)
+                rows.setdefault(cid, []).append({
+                    "chunk_id": cid, "pid": pid, "category": "A1", "rule_id": "A1",
+                    "severity": "High",
+                    "original_text": wrong, "suggested_text": right,
+                    "occurrence": text.count(wrong, 0, m.start()),
+                    "evidence": (why or "错别字")[:25],
+                    "source": "typo_propagate", "action": "revision",
+                })
+                total += 1
+            if truncated:
+                break
+        if truncated:
+            break
+
+    # 幂等：每次重跑都从头生成，旧产物先清掉（否则上一轮多出来的条目会赖着不走）
+    for old in idir.glob("issues-*.propagated.jsonl"):
+        old.unlink()
+    for cid, items in rows.items():
+        out = idir / f"issues-{cid}.propagated.jsonl"
+        guard_write_path(out, run_dir)
+        atomic_write_jsonl(out, items)
+    return {"enabled": True, "pairs": len(pairs), "candidates": total,
+            "chunks": len(rows), "truncated": truncated,
+            "skipped_shielded": skipped_shielded, "skipped_covered": skipped_taken,
+            "note": "需再过 verify_span.py / filter_neverflag.py 的 --channel propagated；"
+                    "扩散出来的条目照常进闸门④，不直接落笔"}
+
+
 def merge(run_dir: Path, cfg: dict, chunk_id: str) -> dict:
     """把 LLM 裁定结果并入该片的 issues。裁定为 A（原字正确）或「都不对」的一律丢弃。"""
     tc = cfg.get("typo_check") or {}
@@ -332,6 +457,10 @@ def main(argv: list[str]) -> int:
     p.add_argument("--run-dir", required=True)
     p.add_argument("--chunk", help="不给 = 合并全部分片（阶段化流程用这个）")
     p.add_argument("--config")
+    p = sub.add_parser("propagate",
+                       help="已确认的错字扩散到全文其余同形之处（收口之后、闸门④之前跑）")
+    p.add_argument("--run-dir", required=True)
+    p.add_argument("--config")
     p = sub.add_parser("lint", help="自检词表，不需要 run 目录")
     # 允许指向别处的词表：技能目录在运行期只读，负向对照不该去改它
     p.add_argument("--typos", help="错词表路径；默认用内置的")
@@ -345,6 +474,8 @@ def main(argv: list[str]) -> int:
     cfg = load_run_config(run_dir, args.config)
     if args.cmd == "scan":
         emit({"ok": True, **scan(run_dir, cfg, args.chunk)})
+    elif args.cmd == "propagate":
+        emit({"ok": True, **propagate(run_dir, cfg)})
     elif args.chunk:
         emit({"ok": True, **merge(run_dir, cfg, args.chunk)})
     else:

@@ -152,6 +152,22 @@ def fallback_gate(orig: str, sugg: str, cfg: dict) -> tuple[bool, str]:
 
 
 # --------------------------------------------------------------------------
+def _dedup_key(r: dict) -> tuple:
+    """去重键。**段内序号是键的一部分，不能省。**
+
+    错别字通道按"段内第几处"逐处出候选，每一处都单独问过模型（各有各的 tid
+    与裁定）。键里不带序号，同一段里的第二处、第三处就会在这里被当成重复项
+    折叠掉——既不落修订也不出批注，报告里同样没有，用户看到的是
+    「同一个错字改了第一处、后面几处原样留着」。
+    实测：一段里两处「布署」，三条候选过闸只剩两条，丢掉的那条无处可查。
+
+    没有序号的记录（主审查通道）保持原样：它们本来就是一段一条。
+    """
+    occ = r.get("occurrence")
+    return (r["pid"], r["category"], normalize_ws(r.get("original_text") or ""),
+            occ if isinstance(occ, int) else None)
+
+
 def severity_rank(s: str) -> int:
     return SEVERITIES.index(s) if s in SEVERITIES else len(SEVERITIES)
 
@@ -326,11 +342,10 @@ def process(run_dir: Path, chunk_id: str, raw_path: Path, cfg: dict,
         # 不是为了反过来让它独占。cap 小于席位数时（如 --cap 1）必须让位给高严重度项。
         reserved = min(len(b_items), floor, cap // 2)
         head = [r for r in kept if r["category"] not in B_CLASSES][:cap - reserved]
-        # 去重键必须带上原文，与下面的分片内去重同源。只用 (pid, category) 会把
-        # 同一段落里同一类别的**不同**问题折叠成一条——回填时被当成"已选过"跳过，
+        # 去重键必须带上原文与段内序号，与下面的分片内去重同源。只用 (pid, category)
+        # 会把同一段落里同一类别的**不同**问题折叠成一条——回填时被当成"已选过"跳过，
         # 于是配额没用满、真问题却被丢掉（实测 cap=3 只保留 2 条）。
-        def key(r):
-            return (r["pid"], r["category"], normalize_ws(r["original_text"]))
+        key = _dedup_key
         picked = head + b_items[:reserved]
         picked_keys = {key(r) for r in picked}
         for r in kept:
@@ -350,7 +365,7 @@ def process(run_dir: Path, chunk_id: str, raw_path: Path, cfg: dict,
     seen = set()
     dedup = []
     for r in kept:
-        key = (r["pid"], r["category"], normalize_ws(r["original_text"]))
+        key = _dedup_key(r)
         if key in seen:
             continue
         seen.add(key)
@@ -380,6 +395,10 @@ CHANNELS = {
                  ("typo_check", "max_typos_per_chunk", 200)),
     "patterns": ("issues-{c}.patterns.jsonl", "issues-{c}.patterns.jsonl",
                  ("pattern_review", "max_pattern_issues_per_chunk", 40)),
+    # 同形扩散通道（typo_scan.py propagate）：已确认的错字在全文其余各处的落点。
+    # 与错别字通道同类别（A1）但必须各成一档产物——写回同一个文件会互相覆盖。
+    "propagated": ("issues-{c}.propagated.jsonl", "issues-{c}.propagated.jsonl",
+                   ("typo_check", "max_propagated_per_chunk", 200)),
 }
 
 

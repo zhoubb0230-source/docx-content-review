@@ -23,7 +23,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from _common import (  # noqa: E402
-    conflict_admitted, EX, atomic_write_text, emit, now_iso, read_json, read_jsonl, rule_label, run_cli,
+    conflict_admitted, issue_admitted, EX, atomic_write_text, emit, now_iso, read_json, read_jsonl, rule_label, run_cli,
     version_header, page_ref,
 )
 from workspace import (  # noqa: E402
@@ -55,8 +55,8 @@ def priority_score(rec: dict) -> float:
 def load_rows(run_dir: Path, cfg: dict) -> list[dict]:
     rows = []
     for r in read_jsonl(resolve_path(run_dir, "issues_verified")):
-        if (r.get("verify") or {}).get("result") == "drop":
-            continue
+        if not issue_admitted(r, cfg)[0]:
+            continue                       # 与 apply_comments 同一份准入策略
         rows.append({
             "id": r.get("id") or f"I-{len(rows)+1:05d}",
             "severity": r.get("severity") or "Medium",

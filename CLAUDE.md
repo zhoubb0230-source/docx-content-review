@@ -67,6 +67,8 @@
 | **新增一条范式规则** | `assets/patterns/*.yaml`（**不改代码**），或用户自带的包 | `references/patterns.md` 的正反例约定 |
 | 范式的场景定位逻辑、规则包校验 | `scripts/scan_patterns.py` | `references/patterns.md` + `prompts/pass1-pattern.md` |
 | 错别字通道 | `scripts/typo_scan.py` + `assets/dict/` | `prompts/pass1-typo.md` |
+| **同形扩散**（已确认的错字落到全文其余同处） | `scripts/typo_scan.py` 的 `propagate` | `SKILL.md` 第 4 步收口 + 回归第 33 节 |
+| **"能不能进交付物"的判定** | `scripts/_common.py` 的 `issue_admitted` / `conflict_admitted` | 三处调用点（report / apply_comments / apply_revisions）**只准调用它，不准各写一遍** |
 | **扩充错别字词表**（提召回的唯一杠杆） | `assets/dict/common-typos.txt` | 白名单进 `typo-whitelist.txt`；**误报句进 `typo-traps.txt`** |
 | 诊断包收哪些项、泄漏自检 | `scripts/diagnose.py` | 回归第 30 节；**加一项必须问它会不会带出正文** |
 | 默认配置 | `assets/config.default.yaml` | `docs/SPEC.md` §16 |
@@ -191,6 +193,24 @@ L15 在流水式图号的文档上就是这么满屏误报的。
 第 29 节加上之后，回归里 L29/L30 的"检出"立刻变红——那两条一直是靠缺陷通过的，
 `logic-injection` fixture 的证据侧本来就是空的。改规则时先问：
 **这条断言现在通过，是因为什么？**
+
+### 「一处判定」与「落到哪些位置」是两件事
+
+ADR-052 的两条现场反馈都断在这里，形状不同但同源：
+
+| 反馈 | 断在哪 |
+|---|---|
+| 拼错的单词只改了第一处，后面几处原样留着 | **覆盖面**：词表扫不到的写法只有主审查偶然报的那一处；同段第二处还被去重键折叠掉了 |
+| 同样是 A1，有的落修订、有的只有批注 | **准入口径**：闸门④淘汰的条目报告里没有、文档里却有一条批注 |
+
+两条守则：
+
+1. **凡按 `(pid, category, original_text)` 做去重的地方，键里必须带 `occurrence`。**
+   逐处出条目的通道（错别字、扩散）在这里最容易整段丢数据，而丢了不报错——
+   回归第 31 节那句 `ge 2` 恰好被"两个段落各一条"盖住，跑了很久都是绿的。
+2. **凡"必须通过 X 才能进交付物"的规则，写成一个准入函数。** `issue_admitted`
+   与 `conflict_admitted` 同形状：三处调用点各写一遍的下场就是判法不一致，
+   而不一致的表现是用户看到的文档与报告对不上，脚本这边一个错都不报。
 
 ### 加校验时必须同时加负向对照
 

@@ -83,6 +83,21 @@ facts schema、术语表摘要、分片正文、候选题面，全部已经拼�
 在上表基础上补 `chunk_id` / `rule_id` / `heading_path` / `page_hint` / `in_table` /
 `is_code` / `gate_note` / `gates` / `action`。`action` ∈ `revision` / `comment` / `report_only`。
 
+侧通道各写各的文件，**不与主通道同名**（写回同一个文件会互相覆盖）：
+
+| 文件 | 谁产出 | 说明 |
+|---|---|---|
+| `issues-<chunk>.jsonl` | 主审查通道 | Pass 1 的 raw 过闸后 |
+| `issues-<chunk>.typos.jsonl` | `typo_scan.py merge` | 词表候选 + 模型裁定 B |
+| `issues-<chunk>.patterns.jsonl` | `scan_patterns.py merge` | P 类范式 |
+| `issues-<chunk>.propagated.jsonl` | `typo_scan.py propagate` | 已确认的 A1 在全文其余同形之处 |
+
+`occurrence`（整数，0 起）= **段内第几处**。错别字与扩散通道逐处出条目，
+每一处都单独进闸门④、单独落笔。**这个字段一路带到回写，中途丢了就等于
+把"改哪一处"的依据丢在半路**；同理，任何按 `(pid, category, original_text)`
+去重的地方都必须把它算进键里，否则同段第二处会被当成重复项折叠掉——
+既不修订也不批注，报告里也查不到。
+
 ## issues-verified.jsonl（Pass 2 后）
 
 再补：
@@ -96,6 +111,12 @@ facts schema、术语表摘要、分片正文、候选题面，全部已经拼�
 **不复核不等于淘汰**：这些条目 `result` 恒为 `pass`，按各自的 `action` 决定去向。
 这个文件是 report / apply_comments / apply_revisions / metrics 四处的唯一入口，
 被它漏掉的类别在报告里也会一并消失。
+
+**`result: drop` 是淘汰，不是降级为批注。** 四处调用点一律走
+`_common.issue_admitted(rec, cfg)` 这一个准入函数：不进报告，也不进文档。
+早先 `apply_comments` 根本没看这个字段，把淘汰项当成"计划了修订却没落笔"
+照常出批注——于是报告里没有的条目在文档里有，同一类 A1 有的带修订、
+有的只有批注，从文档上看不出区别在哪。
 
 ---
 

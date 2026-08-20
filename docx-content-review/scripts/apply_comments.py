@@ -31,7 +31,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import ooxml as ox  # noqa: E402
 from _common import (  # noqa: E402
-    conflict_admitted, EX, SEVERITY_PREFIX, atomic_write_json, die, emit, read_json, read_jsonl, rule_label,
+    conflict_admitted, issue_admitted, EX, SEVERITY_PREFIX, atomic_write_json, die, emit, read_json, read_jsonl, rule_label,
     run_cli, version_header, warn, page_ref,
 )
 from workspace import (  # noqa: E402
@@ -173,6 +173,7 @@ def build_plan(run_dir: Path, cfg: dict) -> dict:
 
     # 本步在 apply_revisions.py apply 之后跑（SKILL.md 第 8 步），因此溯源记录已存在。
     # 缺失时（只跑了 plan 就来做批注）退回「按计划都落笔了」，保持旧行为。
+    eliminated: dict[str, int] = {}
     prov = read_json(resolve_path(run_dir, "work") / "revision-provenance.json", {}) or {}
     applied = set(prov.get("applied") or []) if prov else set(patch_by_id)
     rev_anchor = {p["patch_id"]: p for p in prov.get("provenance") or []}
@@ -202,6 +203,14 @@ def build_plan(run_dir: Path, cfg: dict) -> dict:
                 patch["pid"], patch, rec.get("severity") or "Medium",
                 _revision_reason(rule_label(cat), rec.get("rule_id") or cat,
                                  rec.get("evidence") or "", patch), iid))
+            continue
+        # **闸门④淘汰的不进文档。** 这里与 report.py 用同一个准入函数：
+        # 早先本步根本没看 `verify`，把淘汰项当成"计划了修订却没落笔"照常出批注，
+        # 于是报告里没有的条目在文档里有——同一类 A1，通过的带修订、淘汰的只有批注。
+        ok, why = issue_admitted(rec, cfg)
+        if not ok:
+            bucket = why.split("（")[0]          # 按原因归档，具体裁定语留给报告
+            eliminated[bucket] = eliminated.get(bucket, 0) + 1
             continue
         # 计划了修订却没落笔（定位失败）时不能静默消失，照常出普通批注
         if rec.get("action") == "report_only" and iid not in demoted:
@@ -309,7 +318,9 @@ def build_plan(run_dir: Path, cfg: dict) -> dict:
     guard_write_path(path, run_dir)
     atomic_write_json(path, {**version_header(), "comments": items})
     return {"comments": len(items), "path": str(path), "withheld": withheld,
-            "withheld_total": sum(withheld.values())}
+            "withheld_total": sum(withheld.values()),
+            # 闸门④淘汰的问题条目：报告里同样没有它们，两处口径必须一致
+            "eliminated": eliminated, "eliminated_total": sum(eliminated.values())}
 
 
 # --------------------------------------------------------------------------
